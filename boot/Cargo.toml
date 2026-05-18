@@ -1,0 +1,43 @@
+[package]
+name = "zboot-boot"
+description = "Custom EFI bundle init (initrd PID 1) — discover ZFS BEs, menu, kexec."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+fake-data = []
+
+[lib]
+name = "zboot_boot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zboot-boot"
+path = "src/main.rs"
+
+[dependencies]
+zboot-core = { path = "../core" }
+# Verb code shared with the userspace `zboot` binary. `default-features
+# = false` drops `cmd::{deploy, live, efi}` and the bundled
+# `zboot-boot.efi` bytes — the shell's chroot/cmdline/rollback/drop
+# verbs go through library calls instead of forking `/sbin/zboot`,
+# so no need to ship the CLI binary inside the initrd.
+zboot-cli = { path = "../cli", default-features = false }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+# `nix` exposes a safe wrapper around `reboot(2)` (RB_KEXEC) and
+# `getppid(2)` so the kexec module never needs an `unsafe` block —
+# important because the workspace forbids unsafe_code crate-wide.
+# Features: `reboot` for the actual handoff syscall.
+nix = { version = "0.29", default-features = false, features = ["reboot", "process", "mount", "kmod", "term", "poll"] }
+# `rustyline` powers the post-halt boot shell (`shell.rs`). `derive` gives
+# us the `Helper`/`Hinter`/`Validator`/`Highlighter` boilerplate via a
+# proc-macro; we still hand-roll `Completer` so verb/numeric/composite
+# completion can share state with the BootTarget snapshot.
+rustyline = { version = "14", features = ["derive"] }

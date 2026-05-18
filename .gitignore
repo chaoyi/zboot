@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+
+# boot/build.sh outputs — regenerated locally; the CLI's build.rs
+# embeds zboot-boot.efi at compile time, so the artifacts here aren't
+# part of distribution.
+boot/out/MANIFEST
+boot/out/cmdline.txt
+boot/out/initrd.img.zst
+boot/out/vmlinuz
+boot/out/zboot-boot.efi
+
+# TLC trace/states artifacts (regenerated on every model-check run).
+# spec/zboot.tla + spec/zboot.cfg + spec/README.md are the keepers.
+spec/states/
+spec/zboot_TTrace_*
