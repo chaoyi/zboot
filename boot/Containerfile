@@ -1,0 +1,112 @@
+# boot/Containerfile — build container for zboot-boot's kernel + initrd.
+#
+# Pinned debian trixie + the same OpenZFS tag the sim container uses,
+# plus rust 1.95 (matching rust-toolchain.toml) and kexec-tools.
+#
+# Usage:
+#   podman build -t zboot-boot-build -f boot/Containerfile boot/..
+#   podman run --rm \
+#       -v "$(pwd)":/work -w /work \
+#       zboot-boot-build \
+#       boot/build.sh
+#
+# Output lands in `boot/out/` on the host.
+#
+# Reuse story: this image overlaps with `sim/Containerfile` (debian
+# pin + OpenZFS) but adds rustc and kexec-tools. We don't share a base
+# image in M4.1 — sim/Containerfile is locked as M0.2's substrate
+# (CLAUDE.md: don't modify sim/Containerfile). When M4.2 lands EFI
+# packaging, factor a shared base if the duplication smells.
+#
+# Snapshot pin: matches sim/Containerfile so the kernel + zfs versions
+# the bootloader bundles match what the sim VM runs. Bumping requires
+# a coordinated change across both Containerfiles.
+
+ARG DEBIAN_SNAPSHOT=20260501T000000Z
+ARG SECURITY_SNAPSHOT=20260501T000000Z
+ARG OPENZFS_TAG=zfs-2.3.99
+ARG RUST_VERSION=1.95.0
+
+FROM debian:trixie-slim AS base
+
+ARG DEBIAN_SNAPSHOT
+ARG SECURITY_SNAPSHOT
+
+# Snapshot pin — same logic as sim/Containerfile.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; \
+    printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ trixie main contrib\n' "${DEBIAN_SNAPSHOT}" >  /etc/apt/sources.list; \
+    printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ trixie-updates main contrib\n' "${DEBIAN_SNAPSHOT}" >> /etc/apt/sources.list; \
+    printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s/ trixie-security main contrib\n' "${SECURITY_SNAPSHOT}" >> /etc/apt/sources.list; \
+    printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-zboot-boot
+
+# Tools needed to build zboot-boot's initrd + EFI bundle:
+# - linux-image-amd64: pinned kernel + matching modules tree
+# - zfsutils-linux: zfs/zpool userland (.so closure -> initrd)
+# - kexec-tools: the kexec(8) we shell out to from boot/src/kexec.rs
+# - cpio + zstd: pack the initrd
+# - busybox-static: /bin/sh + coreutils inside the initrd
+# - binutils: `objcopy` for the manual EFI-stub route (M4.2 fallback)
+# - systemd-ukify: `ukify build` — preferred EFI-bundle assembly route
+# - systemd-boot-efi: ships /usr/lib/systemd/boot/efi/linuxx64.efi.stub
+#                     used as the PE wrapper for both ukify and objcopy
+# - file + readelf: lddtree.sh sanity checks
+# - build-essential, curl, ca-certificates: rustup install path
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+        cpio \
+        zstd \
+        busybox-static \
+        kexec-tools \
+        zfsutils-linux \
+        zfs-dkms \
+        linux-image-amd64 \
+        linux-headers-amd64 \
+        dkms \
+        file \
+        binutils \
+        kmod \
+        udev \
+        coreutils \
+        findutils \
+        gawk \
+        sed \
+        grep \
+        systemd-ukify \
+        systemd-boot-efi \
+    && rm -rf /var/lib/apt/lists/*
+
+# Force DKMS to compile zfs.ko against the freshly-installed kernel.
+# Postinst skips the build in container build context (no running kernel
+# matches), so we drive it explicitly. Same fix as sim/Containerfile.
+RUN set -eux; \
+    KVER="$(ls /lib/modules | head -n1)"; \
+    test -d "/lib/modules/${KVER}/build"; \
+    dkms autoinstall -k "${KVER}"; \
+    find /lib/modules/"${KVER}" \( -name 'zfs.ko' -o -name 'zfs.ko.xz' -o -name 'zfs.ko.zst' \) \
+        | grep -q . \
+        || { echo "zfs.ko not found after dkms autoinstall" >&2; exit 1; }
+
+# ----- rust toolchain (pinned via ARG, default matches rust-toolchain.toml) ---
+ARG RUST_VERSION
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+RUN set -eux; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" \
+            --profile minimal \
+            --component clippy --component rustfmt; \
+    rustup target add x86_64-unknown-linux-musl; \
+    rustc --version
+
+# Install location for the host bind-mount checkout. The build script
+# lives under /work/boot/build.sh; podman run mounts the repo at /work.
+WORKDIR /work
+
+# Self-test default: --check prints the prereq report. The real
+# invocation is `podman run ... boot/build.sh` (no args).
+CMD ["boot/build.sh", "--check"]

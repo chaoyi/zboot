@@ -1,0 +1,39 @@
+[package]
+name = "zboot-cli"
+description = "Userspace CLI for zboot — manages BEs via ZFS clone/promote primitives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# The `zboot` userspace binary ALWAYS bundles `zboot-boot.efi` via
+# `include_bytes!` (default features enabled), so a single `zboot
+# deploy` is self-contained — that's the operator-facing contract.
+#
+# The verb code is also exposed as a library so `zboot-boot` (PID 1
+# in initrd) can call chroot/cmdline/rollback/drop directly instead
+# of forking `/sbin/zboot`. `zboot-boot` depends on this crate with
+# `default-features = false` to pull only the verb code without the
+# embed, breaking the embed→initrd→EFI feedback loop that previously
+# inflated the EFI bundle on each rebuild.
+[features]
+default = ["embed-efi"]
+embed-efi = []
+
+[lib]
+name = "zboot_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zboot"
+path = "src/main.rs"
+
+[dependencies]
+zboot-core = { path = "../core" }
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
