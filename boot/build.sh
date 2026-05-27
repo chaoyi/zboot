@@ -542,19 +542,29 @@ log "  wrote ${OUT_DIR}/vmlinuz (from ${KERNEL_SRC})"
 # The cmdline embedded here is the *bootloader's* cmdline, not the
 # chosen BE's. The BE's cmdline is built fresh by `kexec::handoff`
 # (`root=ZFS=<dataset> ro quiet`) and passed via `kexec --command-line=`,
-# never through this stub. We only put `console=tty0 console=ttyS0,115200`
-# here so QEMU's `-nographic` and a real-hardware monitor both surface
-# the boot log.  tty0 listed first so VGA is the primary console (printk
-# uses the fast tty0 path); ttyS0 is mirrored at an explicit baud — the
-# kernel's default for `console=ttyS0` with no baud is 9600, which paces
-# every printk through a 16-byte UART FIFO at ~960 B/s and stretches the
-# preinit modprobe phase to ~1s per line on real hardware with a SuperIO
-# UART present-but-unused.
+# never through this stub.
+#
+# Console ordering matters: when multiple `console=` are specified,
+# the kernel mirrors printk to all of them, but **the last one** becomes
+# `/dev/console` — which is where PID 1 (zboot-boot itself) writes its
+# menu and countdown.  Putting `tty0` last sends the interactive UI to
+# the monitor; serial stays mirrored for QEMU `-nographic` and headless
+# debug.  Reversed ordering ("tty0 first, ttyS0 last") sends the menu
+# to ttyS0 — invisible to a real-hardware operator with no cable.
+#
+# `ttyS0,115200` is explicit baud — `console=ttyS0` with no baud
+# defaults to 9600, which paces every printk through a 16-byte UART
+# FIFO at ~960 B/s and stretches the preinit modprobe phase to
+# ~1s per line on real hardware with a SuperIO UART present-but-unused.
+#
+# `quiet loglevel=3` keeps modprobe / driver-init noise from scrolling
+# the menu off the top during the 5s countdown.  Loglevel 3 = KERN_ERR;
+# warnings still surface but the firehose is gone.
 
 log "step 5: assembling EFI bundle"
 
 EFI_OUT="${OUT_DIR}/zboot-boot.efi"
-EFI_CMDLINE="${ZBOOT_BOOT_CMDLINE:-console=tty0 console=ttyS0,115200}"
+EFI_CMDLINE="${ZBOOT_BOOT_CMDLINE:-console=ttyS0,115200 console=tty0 quiet loglevel=3}"
 CMDLINE_FILE="${OUT_DIR}/cmdline.txt"
 printf '%s\n' "${EFI_CMDLINE}" > "${CMDLINE_FILE}"
 
