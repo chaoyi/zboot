@@ -1,0 +1,18 @@
+# zsnap policy definitions. This file is also compiled in as the standalone
+# defaults. Assignment lives only in the inherited `zsnap:policy` ZFS property.
+
+[policy.undo]                # active scratch: 1h of minute-resolution undo
+frequency = "1m"
+keep = { within = "1h" }
+
+[policy.guard]               # cheap broad `rm`/oops net
+frequency = "15m"
+keep = { within = "30m" }
+
+[policy.history]             # deep history: dense recent + sparse old (GFS)
+frequency = "5m"
+keep = { within = "2h", daily = 14, monthly = 12 }
+
+[policy.service]             # service state: hourly rollback + one week of days
+frequency = "1h"
+keep = { hourly = 24, daily = 7 }

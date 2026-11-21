@@ -1,0 +1,234 @@
+name: Native qualification
+on:
+  workflow_dispatch:
+    inputs:
+      run_vm:
+        description: Run all VM cases after the distribution and factory build
+        type: boolean
+        default: false
+      release_tag:
+        description: Publish the qualified build as this new release (vMAJOR.MINOR.PATCH; needs run_vm)
+        type: string
+        default: ''
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      handoff: ${{ steps.handoff.outputs.artifact-id }}
+    env:
+      CI_OUTPUT: /var/tmp/zfs-tools-qualification-build
+      ZBOOT_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate the release selection
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RUN_VM: ${{ inputs.run_vm }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'release_tag must be vMAJOR.MINOR.PATCH' >&2; exit 2; }
+          [[ "$RUN_VM" == true ]] || { echo 'a release needs run_vm: only a fully qualified build is published' >&2; exit 2; }
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "release or tag $RELEASE_TAG already exists" >&2; exit 2
+          fi
+      - name: Prepare disposable build runner
+        run: bash tests/ci/runner-setup.sh build
+      - name: Build pinned distribution and matching factory root
+        run: bash tests/ci/build.sh
+      - name: Plan complete case coverage
+        id: plan
+        run: echo "matrix=$(python3 tests/ci/qualification.py plan)" >> "$GITHUB_OUTPUT"
+      # The run's record: logs, build identity, hashes and package lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qualification-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CI_OUTPUT }}/*.log
+            ${{ env.CI_OUTPUT }}/*.json
+            ${{ env.CI_OUTPUT }}/*.jsonl
+            ${{ env.CI_OUTPUT }}/*.sha256
+            ${{ env.CI_OUTPUT }}/*.packages
+          if-no-files-found: error
+          retention-days: 14
+      # The VM shards' inputs (about 1.5 GB), and a release's assets. The
+      # cleanup job deletes it when the run ends; the one-day retention bounds
+      # a run that never does.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: handoff
+        if: ${{ inputs.run_vm }}
+        with:
+          name: qualification-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CI_OUTPUT }}/build.json
+            ${{ env.CI_OUTPUT }}/*.sha256
+            ${{ env.CI_OUTPUT }}/*.tar.zst
+            ${{ env.CI_OUTPUT }}/*.packages
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  native:
+    if: ${{ inputs.run_vm }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}
+    env:
+      ZBOOT_VM_ACCEL: kvm
+      ZBOOT_VM_MEMORY_MIB: ${{ contains(matrix.cases, 'RAM-BOOT') && '6144' || '4096' }}
+      CARGO_BUILD_JOBS: '2'
+      ZBOOT_ACCEPTANCE_STATE: /var/tmp/zfs-tools-acceptance
+      TMPDIR: /var/tmp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare disposable VM runner
+        run: bash tests/ci/runner-setup.sh vm
+      # RAM-BOOT inspects a zstd root tar using tarfile's Python 3.14 support.
+      # Native readers also stage this exact interpreter and its shared-library
+      # closure into their read-only guest fixture.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust toolchain
+        if: ${{ matrix.suite != 'acceptance' }}
+        run: |
+          rust_version=$(awk '$1 == "rust" {print $2}' dist/build.lock)
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup override set "$rust_version"
+          cargo fetch --locked
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qualification-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inputs
+      - name: Verify and unpack mode-preserving distribution
+        run: |
+          cd "$RUNNER_TEMP/inputs"
+          sha256sum --check distribution.tar.zst.sha256
+          tar --zstd -xf distribution.tar.zst
+          rm distribution.tar.zst
+      - name: Run selected native shard
+        run: python3 tests/ci/qualification.py run '${{ matrix.name }}' "$RUNNER_TEMP/inputs" "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qualification-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    if: ${{ always() && inputs.run_vm }}
+    needs: [build, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: qualification-result-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/results
+      - name: Require every case and both native proofs at one source/build
+        run: python3 tests/ci/qualification.py aggregate "$RUNNER_TEMP/results"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qualification-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/results/qualification.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Publish exactly the bytes every shard verified and qualified.
+  release:
+    if: ${{ inputs.release_tag != '' && needs.qualification.result == 'success' }}
+    needs: [build, qualification]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qualification-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inputs
+      - name: Verify the qualified distribution and stage its release assets
+        env:
+          SOURCE_OID: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/inputs"
+          sha256sum --check distribution.tar.zst.sha256
+          tar --zstd -xf distribution.tar.zst
+          (cd distribution && sha256sum --check SHA256SUMS)
+          python3 - <<'PY'
+          import json, os
+          build = json.load(open('build.json'))
+          if build['source_oid'] != os.environ['SOURCE_OID']:
+              raise SystemExit('the qualified build is not of the release commit')
+          open('version', 'w').write(build['version'] + '\n')
+          PY
+          mkdir "$RUNNER_TEMP/assets"
+          cp distribution/zboot_*_amd64.deb distribution/corresponding-source.tar.zst \
+              distribution/usr/lib/zboot/zboot.efi "$RUNNER_TEMP/assets/"
+          (cd "$RUNNER_TEMP/assets" && sha256sum zboot_*_amd64.deb zboot.efi corresponding-source.tar.zst > SHA256SUMS)
+          cat "$RUNNER_TEMP/assets/SHA256SUMS"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_OID: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/assets"
+          version=$(cat "$RUNNER_TEMP/inputs/version")
+          deb=$(ls zboot_*_amd64.deb)
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Built from \`$SOURCE_OID\` and qualified by every acceptance case and
+          both native proofs in [this run]($RUN_URL). \`zboot --version\`: \`$version\`.
+
+          | Asset | What |
+          |---|---|
+          | \`$deb\` | the Debian package: \`zboot\`, \`zsnap\`, their helpers and the UKI at \`/usr/lib/zboot/zboot.efi\` |
+          | \`zboot.efi\` | the zboot UKI by itself, for a rescue stick, an ESP or network boot |
+          | \`corresponding-source.tar.zst\` | matching sources of everything the UKI and package bundle: Debian source packages, vendored crates and this project's build inputs |
+          | \`SHA256SUMS\` | SHA-256 of the three files above |
+
+          The UKI is not signed; firmware must allow an unsigned loader. See
+          docs/BUILD.md for licenses and source access.
+          EOF
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_OID" \
+              --title "zboot ${RELEASE_TAG#v}" --notes-file "$RUNNER_TEMP/notes.md" \
+              "$deb" zboot.efi corresponding-source.tar.zst SHA256SUMS
+
+  cleanup:
+    if: ${{ always() && needs.build.outputs.handoff != '' }}
+    needs: [build, native, qualification, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the shards' input handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HANDOFF: ${{ needs.build.outputs.handoff }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$HANDOFF"

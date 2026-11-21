@@ -1,0 +1,19 @@
+# Factory roots with openssh-server generate only missing host key types.
+# Supplied keys stay; an empty machine-id is not ConditionFirstBoot.
+# Ordered before ssh.service only: Debian's ssh.socket (Accept=no) starts
+# ssh.service, and ordering this default-dependency unit before a socket
+# would close a cycle through sockets.target and basic.target.
+[Unit]
+Description=Generate missing SSH host keys
+Before=ssh.service
+ConditionPathExists=/usr/sbin/sshd
+ConditionPathExists=|!/etc/ssh/ssh_host_rsa_key
+ConditionPathExists=|!/etc/ssh/ssh_host_ecdsa_key
+ConditionPathExists=|!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=ssh.service

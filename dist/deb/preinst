@@ -1,0 +1,23 @@
+#!/bin/sh
+# Refuse to install or upgrade zboot while any zboot operation is pending on
+# an imported pool: a new zboot neither resumes nor abandons a record an
+# earlier one wrote, so it is finished or abandoned with the installed one
+# first (docs/RECOVERY.md, "Interrupted operations").
+set -eu
+case "${1:-}" in
+    install | upgrade) ;;
+    *) exit 0 ;;
+esac
+command -v zfs > /dev/null 2>&1 || exit 0
+# Without a loaded module no pool is imported, so nothing is pending here.
+listing=$(zfs get -H -p -o name,property,value -s local all 2> /dev/null) || exit 0
+pending=$(printf '%s\n' "$listing" | awk -F '\t' '
+    $2 == "zboot:operation" { print "  " $1 ": operation record" }')
+[ -z "$pending" ] && exit 0
+{
+    echo "zboot: not installing while zboot operations are pending:"
+    printf '%s\n' "$pending"
+    echo "Finish them with the installed zboot (zboot resume) or abandon them"
+    echo "(zboot abandon ID), then install again."
+} >&2
+exit 1

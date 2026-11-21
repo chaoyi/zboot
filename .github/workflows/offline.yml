@@ -1,0 +1,52 @@
+name: Offline gate
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+# A new revision supersedes the same branch/PR's old offline gate. Independent
+# branches keep their own gate, including manually dispatched runs.
+concurrency:
+  group: offline-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CHECK_JOBS: '2'
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '2'
+      # Fault-cut tests clone and compare large fake states. Optimize this test
+      # build while retaining the same assertions and checked arithmetic.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Prepare disposable runner
+        run: bash tests/ci/runner-setup.sh offline
+      - name: Install pinned Rust toolchain
+        run: |
+          rust_version=$(awk '$1 == "rust" {print $2}' dist/build.lock)
+          rustup toolchain install "$rust_version" --profile minimal --component rustfmt --component clippy
+          rustup override set "$rust_version"
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Run offline gate
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/offline-target
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          sh tests/check.sh 2>&1 | tee "$RUNNER_TEMP/offline.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: offline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/offline.log
+          if-no-files-found: error
+          retention-days: 14

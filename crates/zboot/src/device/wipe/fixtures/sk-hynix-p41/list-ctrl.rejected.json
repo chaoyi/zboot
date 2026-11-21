@@ -1,0 +1,4 @@
+{
+  "error": "Invalid Field in Command: A reserved coded value or an unsupported value in a defined field",
+  "type": "nvme"
+}

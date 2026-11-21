@@ -1,0 +1,9 @@
+# Each child process is announced before it runs, so `-v` shows every native
+# command (docs/CLI.md). Launch through `zfs_tools::engine::native::announced`,
+# whose `Announced` wrapper is the one place allowed to call these.
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "launch through engine::native::announced" },
+    { path = "std::process::Command::status", reason = "launch through engine::native::announced" },
+    { path = "std::process::Command::output", reason = "launch through engine::native::announced" },
+    { path = "std::os::unix::process::CommandExt::exec", reason = "launch through engine::native::announced" },
+]

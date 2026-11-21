@@ -1,0 +1,52 @@
+{
+  "output_version": {
+    "command": "zpool status",
+    "vers_major": 0,
+    "vers_minor": 1
+  },
+  "pools": {
+    "e2ecreatejournal": {
+      "error_count": "0",
+      "name": "e2ecreatejournal",
+      "pool_guid": "10417295360749274662",
+      "spa_version": "5000",
+      "state": "ONLINE",
+      "txg": "4",
+      "vdevs": {
+        "e2ecreatejournal": {
+          "alloc_space": "194K",
+          "checksum_errors": "0",
+          "class": "normal",
+          "def_space": "1.88G",
+          "guid": "10417295360749274662",
+          "name": "e2ecreatejournal",
+          "read_errors": "0",
+          "state": "ONLINE",
+          "total_space": "1.88G",
+          "vdev_type": "root",
+          "vdevs": {
+            "/dev/disk/by-id/virtio-ZFS-E2E-B-part1": {
+              "alloc_space": "194K",
+              "checksum_errors": "0",
+              "class": "normal",
+              "def_space": "1.88G",
+              "guid": "4984304436564300751",
+              "name": "/dev/disk/by-id/virtio-ZFS-E2E-B-part1",
+              "path": "/dev/disk/by-id/virtio-ZFS-E2E-B-part1",
+              "phys_space": "2.00G",
+              "read_errors": "0",
+              "rep_dev_size": "1.88G",
+              "slow_ios": "0",
+              "state": "ONLINE",
+              "total_space": "1.88G",
+              "vdev_type": "disk",
+              "write_errors": "0"
+            }
+          },
+          "write_errors": "0"
+        }
+      },
+      "zpl_version": "5"
+    }
+  }
+}

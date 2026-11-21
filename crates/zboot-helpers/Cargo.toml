@@ -1,0 +1,23 @@
+[package]
+name = "zboot-helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Internal dynamically linked helpers for zboot"
+autobins = false
+publish = false
+
+[[bin]]
+name = "zboot-probe-signatures"
+path = "src/bin/probe-signatures.rs"
+
+[[bin]]
+name = "zboot-change-key"
+path = "src/bin/change-key.rs"
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

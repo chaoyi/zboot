@@ -1,0 +1,26 @@
+#!/bin/sh
+# A portable pool stays read-only; all root writes belong to this boot's RAM.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1-}" in prereqs) prereqs; exit 0 ;; esac
+. /scripts/functions
+[ -n "${rootmnt-}" ] || { panic "zboot portable: root mount is unknown"; exit 1; }
+# udev may already have moved its tmpfs below the root and linked /dev to it.
+dev=/dev
+dev_in_root=no
+if [ -L "$dev" ] && [ "$(readlink "$dev")" = "$rootmnt/dev" ]; then
+    dev_in_root=yes
+fi
+base=/run/zboot-portable
+mkdir -p "$base/lower" "$base/ram" || { panic "zboot portable: staging directories"; exit 1; }
+mount --move "$rootmnt" "$base/lower" || { panic "zboot portable: preserve read-only root"; exit 1; }
+# No size override: the kernel's tmpfs default is half of physical RAM.
+mount -t tmpfs -o mode=0755 tmpfs "$base/ram" || { panic "zboot portable: RAM layer"; exit 1; }
+mkdir -p "$base/ram/upper" "$base/ram/work" || { panic "zboot portable: upper directories"; exit 1; }
+mount -t overlay overlay -o "lowerdir=$base/lower,upperdir=$base/ram/upper,workdir=$base/ram/work" "$rootmnt" || {
+    panic "zboot portable: could not install RAM root"; exit 1;
+}
+if [ "$dev_in_root" = yes ]; then
+    mkdir -p "$rootmnt/dev" || { panic "zboot portable: device directory"; exit 1; }
+    mount --move "$base/lower/dev" "$rootmnt/dev" || { panic "zboot portable: preserve udev mount"; exit 1; }
+fi
