@@ -1565,6 +1565,33 @@ mod tests {
     }
 
     #[test]
+    fn the_esp_acceptance_case_seeds_a_loader_zboot_owns() {
+        // ESP-NATIVE's automatic refresh only reaches ESPs whose loader is
+        // zboot's; a stale stub silently leaves every target alone.
+        let script = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/acceptance/guest/cases/ESP-NATIVE.sh"),
+        )
+        .unwrap();
+        let escaped = script
+            .lines()
+            .find_map(|line| line.strip_prefix("STUB='")?.strip_suffix('\''))
+            .expect("ESP-NATIVE defines STUB='...'");
+        let bytes: Vec<u8> = escaped
+            .split("\\0")
+            .skip(1)
+            .map(|octal| u8::from_str_radix(octal, 8).unwrap())
+            .collect();
+        let scratch = crate::factory::tests::Scratch::new();
+        let path = scratch.0.join("stub.efi");
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            loader_owner(&mut File::open(&path).unwrap()).unwrap(),
+            LoaderOwner::Zboot
+        );
+    }
+
+    #[test]
     fn an_external_esp_with_a_foreign_loader_is_refused() {
         let scratch = Scratch::new();
         let root = &scratch.0;
