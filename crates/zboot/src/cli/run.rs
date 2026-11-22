@@ -1,6 +1,6 @@
 use super::{
     access::{Access, Bindings, Env},
-    grammar::{Cli, Verb},
+    grammar::{Cli, DeployInto, Verb},
     names, pairs, provision, recovery, status, trees,
 };
 use crate::consent::{Envelope, Outcome};
@@ -85,39 +85,40 @@ pub(super) fn consent_to<P: serde::Serialize>(
     }
 }
 
-/// Preview a lossless change or bind execution to an earlier preview.
-/// Explicit confirmation checks the plan again under the writer lock.
-/// Ordinary execution uses the fresh locked plan and its token.
-pub(super) fn review<P: serde::Serialize>(
+/// A change that loses nothing, so it takes no `--confirm` and has no token.
+/// `--dry-run` plans and previews without the writer lock. Otherwise the plan
+/// is made once, under the lock, and returned to apply. In the UKI the pools
+/// that plan names are then reopened writable and it is made again on them;
+/// one that now names another pool is refused, to be run again.
+pub(super) fn lossless<P: serde::Serialize>(
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
     plan: impl Fn() -> Result<P, Box<dyn std::error::Error>>,
-    token: impl Fn(&P) -> std::io::Result<String>,
-    describe: impl Fn(&P, &str) -> String,
-) -> Result<Option<(P, String)>, Box<dyn std::error::Error>> {
+    describe: impl Fn(&P) -> String,
+) -> Result<Option<P>, Box<dyn std::error::Error>> {
     use std::io::Write;
-    let planned = plan()?;
-    let shown = token(&planned)?;
-    if let Some(given) = confirm.as_deref() {
-        crate::consent::unchanged(given, &shown)?;
-    }
     if dry_run {
+        let planned = plan()?;
         if json {
-            json_response(Envelope::new(Outcome::Preview, Some(shown), &planned))?;
+            json_response(Envelope::new(Outcome::Preview, None, &planned))?;
         } else {
-            write!(dialogue(false), "{}", describe(&planned, &shown))?;
+            write!(dialogue(false), "{}", describe(&planned))?;
             println!("Dry run; nothing changed.");
         }
         return Ok(None);
     }
-    writer_for_replan(&planned, &plan, confirm.is_some())?;
-    let fresh = plan()?;
-    let fresh_token = token(&fresh)?;
-    if confirm.is_some() {
-        crate::consent::unchanged(&shown, &fresh_token)?;
+    let locked = lock()?;
+    let planned = plan()?;
+    if !locked || !ACCESS.with_borrow(Access::reopens_plan) {
+        return Ok(Some(planned));
     }
-    Ok(Some((fresh, fresh_token)))
+    ACCESS.with_borrow_mut(|access| access.open(&planned))?;
+    let fresh = plan()?;
+    let added = super::access::unreviewed_pools(&planned, &fresh)?;
+    if let Some(refusal) = replan_refusal(&added, false) {
+        return Err(refusal);
+    }
+    Ok(Some(fresh))
 }
 
 /// When a command takes the writer lock.
@@ -126,9 +127,10 @@ enum LockAt {
     /// Never: it changes no pool, or runs for a session (the Menu, a chroot
     /// shell) and so must not hold the lock.
     Never,
-    /// A † verb: after the operator's answer (`consent_to`), or, on its paths
-    /// that need no answer, right before its engine plans again and acts. Its
-    /// preview, `--dry-run` and prompt run without the lock.
+    /// A changing verb: after the operator's answer (`consent_to`), or, on
+    /// its paths that need no answer, right before it plans under the lock
+    /// (`lossless`) or its engine plans again and acts. Its preview,
+    /// `--dry-run` and prompt run without the lock.
     AfterConsent,
 }
 
@@ -202,7 +204,7 @@ fn replan_refusal(added: &[String], confirmed: bool) -> Option<Box<dyn std::erro
     } else {
         Some(
             format!(
-                "the plan changed before the writer lock: it now also writes pool {}. Run the command again",
+                "the plan changed: it now also writes pool {}. Run the command again",
                 zfs_tools::engine::escape_display(&added.join(", "))
             )
             .into(),
@@ -268,13 +270,13 @@ fn close_access() -> Result<(), Box<dyn std::error::Error>> {
 
 pub(super) fn applied(
     json: bool,
-    token: String,
+    token: Option<String>,
     outcome: impl serde::Serialize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         json_response(crate::consent::Envelope::new(
             crate::consent::Outcome::Applied,
-            Some(token),
+            token,
             outcome,
         ))?;
     }
@@ -345,8 +347,8 @@ fn execute(
             json,
         } => recovery::restore(recovery::RestoreArgs {
             request: crate::restore::Request {
-                source: source.ok_or("restore source is missing")?,
-                disk: disk.ok_or("restore disk is missing")?,
+                source,
+                disk,
                 keep,
                 pool,
                 esp_bytes: esp,
@@ -369,10 +371,28 @@ fn execute(
             json,
         } => recovery::resume(id, true, dry_run, confirm, json)?,
         Verb::Deploy {
+            into: Some(DeployInto::Into(into)),
+            ..
+        } => {
+            let into = *into;
+            provision::deploy_into(
+                crate::deploy::into::Request {
+                    pool: into.pool,
+                    be: into
+                        .be
+                        .unwrap_or_else(|| crate::deploy::command::DEFAULT_BE.into()),
+                    tar: into.tar,
+                    overlays: into.overlay,
+                    hostname: into.hostname,
+                },
+                into.dry_run,
+                into.json,
+            )?
+        }
+        Verb::Deploy {
+            into: None,
             disk,
             image,
-            into,
-            size,
             portable,
             efi,
             tar,
@@ -390,20 +410,13 @@ fn execute(
             json,
         } => provision::deploy(
             crate::deploy::command::Args {
-                target: match (disk, image, into.clone()) {
-                    (Some(disk), None, None) => crate::deploy::command::Target::Disk { disk },
-                    (None, Some(file), None) => {
-                        crate::deploy::command::Target::Image { file, size }
-                    }
-                    (None, None, Some(pool)) => crate::deploy::command::Target::Into { pool },
+                target: match (disk, image) {
+                    (Some(disk), None) => crate::deploy::command::Target::Disk { disk },
+                    (None, Some(file)) => crate::deploy::command::Target::Image { file },
                     _ => return Err("deploy needs exactly one target".into()),
                 },
                 portable,
-                efi: if into.is_some() {
-                    std::path::PathBuf::new()
-                } else {
-                    efi.map(Ok).unwrap_or_else(crate::status::shipped_efi)?
-                },
+                efi: efi.map(Ok).unwrap_or_else(crate::status::shipped_efi)?,
                 factory: tar,
                 overlay,
                 be,
@@ -425,7 +438,6 @@ fn execute(
             mirror,
             snapshot,
             packages,
-            zfs_from_suite,
             json,
             ..
         } => provision::factory(
@@ -435,7 +447,6 @@ fn execute(
                 suite,
                 snapshot,
                 packages,
-                zfs_from_suite,
             },
             json,
         )?,
@@ -452,14 +463,12 @@ fn execute(
             confirm,
             json,
         )?,
-        Verb::Trace { cmdline, json } => status::trace(cmdline, json)?,
         Verb::Rename {
             source,
             destination,
             dry_run,
-            confirm,
             json,
-        } => trees::rename_command(source, destination, dry_run, confirm, json)?,
+        } => trees::rename_command(source, destination, dry_run, json)?,
         Verb::Rollback {
             target,
             dry_run,
@@ -478,7 +487,7 @@ fn execute(
             dry_run,
             confirm,
             json,
-        } => provision::wipe(disk.ok_or("wipe disk is missing")?, dry_run, confirm, json)?,
+        } => provision::wipe(disk, dry_run, confirm, json)?,
         Verb::Sync {
             source,
             destination,
@@ -490,35 +499,30 @@ fn execute(
         Verb::Default {
             dataset,
             dry_run,
-            confirm,
             json,
-        } => trees::default(dataset, dry_run, confirm, json)?,
+        } => trees::default(dataset, dry_run, json)?,
         Verb::Cmdline {
             dataset,
             set,
             clear,
             dry_run,
-            confirm,
             json,
         } => trees::cmdline(
             dataset.ok_or("no running boot environment")?,
             set,
             clear,
             dry_run,
-            confirm,
             json,
         )?,
         Verb::Fork {
             snapshot,
             destination,
             dry_run,
-            confirm,
             json,
         } => trees::fork_command(
             snapshot.ok_or("no running boot environment")?,
             destination,
             dry_run,
-            confirm,
             json,
         )?,
         Verb::Drop {
@@ -539,26 +543,23 @@ fn execute(
             key,
             esp,
             dry_run,
-            confirm,
             json,
             ..
         } => {
-            if let Some((planned, token)) = review(
+            if let Some(planned) = lossless(
                 dry_run,
-                confirm,
                 json,
                 || Ok(crate::reboot::plan(key.as_deref(), esp.as_deref())?),
-                crate::reboot::consent,
                 crate::reboot::describe,
             )? {
-                crate::reboot::apply(&planned, &token)?;
+                crate::reboot::apply(&planned)?;
                 if !json {
                     println!(
                         "Menu request written to {}; rebooting.",
                         zfs_tools::engine::escape_display(&planned.target.partition.path)
                     );
                 }
-                applied(json, token, &planned)?;
+                applied(json, None, &planned)?;
             }
         }
         Verb::Menu { no_autoboot } => crate::menu::start(no_autoboot)?,
@@ -573,15 +574,13 @@ fn execute(
             left,
             right,
             dry_run,
-            confirm,
             json,
-        } => pairs::pair(left, right, dry_run, confirm, json)?,
+        } => pairs::pair(left, right, dry_run, json)?,
         Verb::Snapshot {
             datasets,
             dry_run,
-            confirm,
             json,
-        } => trees::snapshot(datasets, dry_run, confirm, json)?,
+        } => trees::snapshot(datasets, dry_run, json)?,
         Verb::Status {
             datasets,
             snapshots,
@@ -597,7 +596,6 @@ fn execute(
 fn lock_at(command: &Verb) -> LockAt {
     match command {
         Verb::Status { .. }
-        | Verb::Trace { .. }
         | Verb::Chroot { .. }
         | Verb::Boot { .. }
         | Verb::Menu { .. }
@@ -615,6 +613,10 @@ fn lock_at(command: &Verb) -> LockAt {
 
 fn wants_json(command: &Verb) -> bool {
     match command {
+        Verb::Deploy {
+            into: Some(DeployInto::Into(into)),
+            ..
+        } => into.json,
         Verb::Reboot { json, .. }
         | Verb::Boot { json, .. }
         | Verb::Restore { json, .. }
@@ -622,7 +624,6 @@ fn wants_json(command: &Verb) -> bool {
         | Verb::Abandon { json, .. }
         | Verb::Deploy { json, .. }
         | Verb::Factory { json, .. }
-        | Verb::Trace { json, .. }
         | Verb::Rename { json, .. }
         | Verb::Rollback { json, .. }
         | Verb::Primary { json, .. }
@@ -646,11 +647,11 @@ fn verb_name(command: &Verb) -> &'static str {
         Verb::Restore { .. } => "restore",
         Verb::Resume { .. } => "resume",
         Verb::Abandon { .. } => "abandon",
+        Verb::Deploy { into: Some(_), .. } => "deploy into",
         Verb::Deploy { .. } => "deploy",
         Verb::Factory { .. } => "factory",
         Verb::FactoryFinish { .. } => "factory-finish",
         Verb::Esp { .. } => "esp",
-        Verb::Trace { .. } => "trace",
         Verb::Rename { .. } => "rename",
         Verb::Rollback { .. } => "rollback",
         Verb::Primary { .. } => "primary",
@@ -993,7 +994,7 @@ pub(crate) fn run_menu(
     )
 }
 
-/// Target resolution and picker failures happen before a menu command can
+/// Target resolution failures happen before a menu command can
 /// enter `run_menu`. Give them the same response and invocation isolation.
 /// Parsing here is only for the command's output contract; no target resolves.
 pub(crate) fn finish_menu_pre_execution(
@@ -1007,7 +1008,7 @@ pub(crate) fn finish_menu_pre_execution(
     let args = std::iter::once("zboot")
         .chain(shortcut.then_some("boot"))
         .chain(words.iter().map(String::as_str));
-    let cli = match Cli::parse_for_menu(args) {
+    let cli = match Cli::parse_from_args(args) {
         Ok(cli) => cli,
         Err(error) => return usage_exit(error),
     };
@@ -1029,9 +1030,6 @@ fn run_parsed(
     verbosity: &InvocationVerbosity,
 ) -> i32 {
     reset_invocation();
-    if let Err(error) = cli.validate_complete() {
-        return usage_exit(error);
-    }
     verbosity.apply(cli.verbose);
     let json = wants_json(&cli.command);
     let verb = verb_name(&cli.command);
@@ -1101,7 +1099,6 @@ mod tests {
         };
         for args in [
             &["status"][..],
-            &["trace"],
             &["menu"],
             &["chroot", "rpool/ROOT/a"],
             &["default"],
@@ -1184,18 +1181,12 @@ mod tests {
     }
 
     #[test]
-    fn lossless_previews_take_no_lock_and_confirmed_reviews_recheck_under_it() {
-        let token = crate::consent::token(&7u8).unwrap();
-        for (dry_run, given, expected) in [
-            (true, None, vec![false]),
-            (false, Some("stale".to_owned()), vec![false]),
-            (false, Some(token), vec![false, true]),
-        ] {
+    fn a_lossless_preview_takes_no_lock_and_a_change_plans_once_under_it() {
+        for (dry_run, expected) in [(true, vec![false]), (false, vec![true])] {
             defer_writer("snapshot".into(), |_| Ok(None));
             let calls = std::cell::RefCell::new(Vec::new());
-            let result = review(
+            let result = lossless(
                 dry_run,
-                given,
                 true,
                 || {
                     calls
@@ -1203,15 +1194,14 @@ mod tests {
                         .push(WRITER.with_borrow(|writer| matches!(writer, Writer::Held(_))));
                     Ok(7u8)
                 },
-                crate::consent::token,
-                |_, _| String::new(),
+                |_| String::new(),
             );
             assert_eq!(*calls.borrow(), expected);
-            if expected.len() == 2 {
-                assert!(matches!(result, Ok(Some(_))));
-            }
+            assert_eq!(result.unwrap(), (!dry_run).then_some(7u8));
+            let preview = RESPONSE.take();
+            assert_eq!(preview.is_some(), dry_run);
+            assert!(preview.is_none_or(|value| value.get("token").is_none()));
             WRITER.set(Writer::NotDeferred);
-            RESPONSE.set(None);
         }
     }
 

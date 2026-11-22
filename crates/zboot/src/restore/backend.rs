@@ -154,13 +154,6 @@ pub struct DeploySpec {
 /// command does; callers judge an uncertain outcome by observing again.
 pub trait Backend {
     fn view(&mut self) -> Result<View>;
-    /// The received layer (`zfs get -o received`) of `root` and its
-    /// descendants for `properties`; absent entries have no received value.
-    fn received(
-        &mut self,
-        root: &str,
-        properties: &[&str],
-    ) -> Result<BTreeMap<String, BTreeMap<String, String>>>;
     fn disk_identity(&mut self, path: &str) -> Result<DiskIdentity>;
     /// Review of a whole disk; `owned` may be imported from it alone.
     fn disk(&mut self, path: &str, owned: Option<&str>) -> Result<DiskReview>;

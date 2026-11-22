@@ -14,7 +14,6 @@ pub const PLACEMENT_KEYS: &[&str] = &["mountpoint", "readonly", "canmount", "vol
 pub struct SavedProperty {
     pub value: String,
     pub source: String,
-    pub received: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,7 +29,6 @@ impl ReceivePlacement {
     pub fn capture(
         volume: bool,
         properties: &BTreeMap<String, NativeProperty>,
-        received: &BTreeMap<String, String>,
     ) -> Result<Self, Error> {
         let get = |key: &str| {
             let property = properties
@@ -44,7 +42,6 @@ impl ReceivePlacement {
             Ok(SavedProperty {
                 value: property.value.clone(),
                 source: property.source.clone(),
-                received: received.get(key).cloned(),
             })
         };
         Ok(Self {
@@ -60,7 +57,7 @@ impl ReceivePlacement {
     }
 }
 
-/// New copies cannot reproduce an external ancestor or a received layer.
+/// New copies cannot reproduce an external ancestor.
 /// Materialize their intended root values, but retain live inheritance inside
 /// the copied tree whenever the final parent produces that same value. A
 /// default descendant follows the copied parent too, even when that parent
@@ -76,7 +73,6 @@ pub fn new_member_property(
     let local = SavedProperty {
         value: intended.into(),
         source: "local".into(),
-        received: None,
     };
     if key == "canmount"
         || !(saved.source == "default"
@@ -238,7 +234,6 @@ mod tests {
         let saved = |value: &str, source: &str| SavedProperty {
             value: value.into(),
             source: source.into(),
-            received: Some("hidden original layer".into()),
         };
         let root = new_member_property(
             "mountpoint",
@@ -248,7 +243,6 @@ mod tests {
             None,
         );
         assert_eq!(root.source, "local");
-        assert_eq!(root.received, None);
         for source in [
             "default",
             "inherited from old",
@@ -271,7 +265,6 @@ mod tests {
                 Some(("new/home/alice", &child)),
             );
             assert_eq!(grandchild.source, "inherited from new/home");
-            assert_eq!(grandchild.received, None);
         }
         for source in ["local", "received", "unknown"] {
             assert_eq!(
@@ -398,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_retains_local_inherited_and_received_evidence() {
+    fn a_receipt_retains_local_and_inherited_evidence() {
         let properties = BTreeMap::from([
             (
                 "mountpoint".into(),
@@ -429,20 +422,16 @@ mod tests {
                 },
             ),
         ]);
-        let received = BTreeMap::from([("mountpoint".into(), "/old".into())]);
-        let placement = ReceivePlacement::capture(false, &properties, &received).unwrap();
-        assert_eq!(
-            placement.mountpoint.as_ref().unwrap().received.as_deref(),
-            Some("/old")
-        );
+        let placement = ReceivePlacement::capture(false, &properties).unwrap();
+        assert_eq!(placement.mountpoint.as_ref().unwrap().source, "local");
         assert_eq!(placement.volmode.source, "inherited from tank");
         let encoded = serde_json::to_string(&placement).unwrap();
         assert_eq!(
             serde_json::from_str::<ReceivePlacement>(&encoded).unwrap(),
             placement
         );
-        let volume = ReceivePlacement::capture(true, &properties, &received).unwrap();
+        let volume = ReceivePlacement::capture(true, &properties).unwrap();
         assert!(volume.mountpoint.is_none() && volume.canmount.is_none());
-        assert!(ReceivePlacement::capture(false, &BTreeMap::new(), &received).is_err());
+        assert!(ReceivePlacement::capture(false, &BTreeMap::new()).is_err());
     }
 }

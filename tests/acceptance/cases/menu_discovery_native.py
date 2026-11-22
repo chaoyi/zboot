@@ -44,8 +44,6 @@ def verdict(ev, check):
                     f'{pool} root has native root shape')
         check.equal(created.properties(f'{pool}/root')['canmount']['value'], 'noauto',
                     f'{pool} root has inactive placement')
-        check('zboot:be' not in created.properties(f'{pool}/root'),
-              f'{pool} root needs no legacy marker')
     menu, snapshot = s.step('menu'), s.step('snapshot')
     check.equal(menu.argv, ['zboot', 'menu', '--no-autoboot'], 'the real Menu is the background command')
     check.equal(menu.rc, 137, 'only the recorded Menu parent was killed with SIGKILL')

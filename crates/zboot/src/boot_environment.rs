@@ -167,38 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_marker_values_and_sources_do_not_change_classification() {
-        let mut fake = fixture();
-        fake.set("a/root", "zboot:be", "1");
-        fake.set("a/data", "zboot:be", "1");
-        for (value, source) in [
-            ("1", "local"),
-            ("0", "local"),
-            ("arbitrary legacy value", "received"),
-            ("1", "inherited from a"),
-        ] {
-            let mut state = fake.observe().unwrap();
-            for name in ["a/root", "a/data"] {
-                state.dataset_properties.get_mut(name).unwrap().insert(
-                    "zboot:be".into(),
-                    NativeProperty {
-                        value: value.into(),
-                        source: source.into(),
-                    },
-                );
-            }
-            assert_eq!(
-                roots(&state)
-                    .iter()
-                    .map(|dataset| dataset.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["a/root"]
-            );
-            admit(&state, "a/root").unwrap();
-        }
-    }
-
-    #[test]
     fn native_identity_and_descendant_roles_are_revalidated_without_mounting() {
         let fake = fixture();
         let mut state = fake.state().unwrap();

@@ -1233,7 +1233,6 @@ pub(crate) fn admit_members(
             match key.as_str() {
                 intent::PROPERTY if !property.local() || !name.contains('/') => {}
                 "zboot:placement"
-                | zfs_tools::engine::management::RETIRED_MARKER
                 | "zboot:cmdline"
                 | zfs_tools::engine::management::PAIR_PROPERTY => {}
                 // An operation's own marks: its record, its fences, its attachment.

@@ -427,42 +427,6 @@ impl Backend for Native {
         })
     }
 
-    fn received(
-        &mut self,
-        root: &str,
-        properties: &[&str],
-    ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-        zfs_tools::engine::validate_dataset_name(root)?;
-        let out = zfs(vec![
-            "get".into(),
-            "-H".into(),
-            "-p".into(),
-            "-r".into(),
-            "-t".into(),
-            "filesystem,volume".into(),
-            "-o".into(),
-            "name,property,received".into(),
-            properties.join(","),
-            root.into(),
-        ])?;
-        let mut result: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        for line in out.lines() {
-            let mut fields = line.splitn(3, '\t');
-            let (Some(name), Some(key), Some(value)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                return Err(refuse("zfs get received: malformed line"));
-            };
-            if value != "-" {
-                result
-                    .entry(name.into())
-                    .or_default()
-                    .insert(key.into(), value.into());
-            }
-        }
-        Ok(result)
-    }
-
     fn disk_identity(&mut self, path: &str) -> Result<DiskIdentity> {
         Ok(device::observe_identity(path)?)
     }
@@ -873,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_source_admission_ignores_legacy_markers_and_keeps_shape_and_cmdline_checks() {
+    fn restore_source_admission_keeps_shape_and_cmdline_checks() {
         let mut fake = crate::tree::fake::Fake::new();
         let be = "a/ROOT/os";
         fake.create("a/ROOT");
@@ -882,24 +846,8 @@ mod tests {
         fake.set(be, "mountpoint", "/");
         fake.set(be, "canmount", "noauto");
         fake.set("a/ROOT/os/var", "canmount", "noauto");
-        for legacy in [
-            None,
-            Some(("0", "received")),
-            Some(("arbitrary", "inherited from a")),
-        ] {
-            let mut state = fake.state().unwrap();
-            if let Some((value, source)) = legacy {
-                state.dataset_properties.get_mut(be).unwrap().insert(
-                    "zboot:be".into(),
-                    NativeProperty {
-                        value: value.into(),
-                        source: source.into(),
-                    },
-                );
-            }
-            let source = source_candidate(&state, be);
-            assert_eq!((source.refusal, source.writable_head), (None, true));
-        }
+        let source = source_candidate(&fake.state().unwrap(), be);
+        assert_eq!((source.refusal, source.writable_head), (None, true));
         fake.set(be, "zboot:cmdline", "root=evil");
         let source = source_candidate(&fake.state().unwrap(), be);
         assert!(

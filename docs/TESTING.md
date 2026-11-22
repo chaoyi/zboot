@@ -288,9 +288,9 @@ kills QEMU when the menu prints a phase, which lands at or after it.
 | small | `TRANSFER-NATIVE` | `sync` into an existing copy: refused until paired; push, with a child under the leaf reported and `sync --all` exiting 4; read-only pull |
 | small | `WIPE-NATIVE` | the imported-disk refusal, then confirmed metadata clearing of a virtio and an NVMe disk, verified by probes |
 | small | `WIPE-SANITIZE-NATIVE` | the native sanitize path on the emulated NVMe disk against a fake `nvme` (`guest/fake-nvme.sh`): a crypto erase seen running and verified on the disk, a sanitize already running after a power loss waited out first, a failed sanitize refused with nothing cleared, then a wipe in failure mode refused before any effect |
-| esp | `ESP-NATIVE` | one `esp` batch keeps loader ownership and file names on both imported-pool disks, leaves rescue media alone, installs after a typed answer and meets an ESP that turns read-only late; the files read back after a cold boot |
+| esp | `ESP-NATIVE` | one `esp` batch writes zboot's two fixed paths and keeps loader ownership on both imported-pool disks, reports an old-name zboot loader as stale and leaves it, leaves rescue media alone, installs after a typed answer and meets an ESP that turns read-only late; the files read back after a cold boot |
 | deploy | `DEPLOY-NATIVE` | whole-disk `deploy` of the factory tar with a host overlay (a file and a hook): GPT, read-only import by GUID, `@factory` and `@deployed`, overlay owner and mode, identity; the deployed system then boots and erases a spare disk itself, with the probe its package installed |
-| deploy | `DEPLOY-INTO` | `deploy --into` adds a bootable sibling and keeps the defaults; a power cut at `@factory`, `drop`, a retry and a UKI handoff |
+| deploy | `DEPLOY-INTO` | `deploy into` adds a bootable sibling and keeps the defaults; a power cut at `@factory`, `drop`, a retry and a UKI handoff |
 | deploy | `RESCUE-STICK` | `deploy --image --portable` with `builtin:rescue`, booted on different machines: no host in the labels, console and SSH login, new host keys each boot, two copies of one image |
 | restore | `RESTORE-ABANDON-DROP-NATIVE` | `abandon` keeps the only copy held and marked; `drop` releases and destroys it |
 | restore | `RESTORE-CHANGED-KEPT-NATIVE` | kept data changed after staging is never erased (cut before step 7) |

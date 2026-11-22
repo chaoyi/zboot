@@ -1,4 +1,4 @@
-"""DEPLOY-INTO adds a bootable sibling, preserves defaults and power-cuts a
+"""DEPLOY-INTO: `deploy into` adds a bootable sibling, preserves defaults and power-cuts a
 second native deployment at its @factory snapshot. A fresh boot observes its
 pending role, explicitly Drops it, and retries before an actual UKI handoff."""
 import json
@@ -25,15 +25,17 @@ def stage_3(console):
 def verdict(ev, check):
     first, second = ev.stage(1), ev.stage(2)
     preview, again = first.step('preview'), first.step('preview-again')
-    check.equal((preview.rc, preview.json['mode']), (0, 'preview'), 'into preview succeeds')
-    check.equal(again.json['token'], preview.json['token'], 'into token is stable across processes')
+    check.equal((preview.rc, preview.json['mode']), (0, 'preview'), 'deploy into preview succeeds')
+    check('token' not in preview.json, 'deploy into loses nothing and prints no token')
+    check.equal(again.json['result'], preview.json['result'], 'deploy into plan is stable across processes')
     plan = preview.json['result']
     check.equal(plan['request']['pool'], POOL, 'plan targets the imported pool')
     check.equal(plan['request']['be'], 'new', 'plan names its new BE')
     check.equal(len(plan['overlays']), 1, 'ordered overlay is bound')
     applied = first.step('apply')
-    check.equal((applied.rc, applied.json['mode'], applied.json['token']),
-                (0, 'applied', preview.json['token']), 'confirmed into applies the reviewed plan')
+    check.equal((applied.rc, applied.json['mode'], 'token' in applied.json),
+                (0, 'applied', False), 'deploy into applies without a token')
+    check.equal(applied.json['result']['dataset']['name'], BE, 'deploy into publishes the previewed BE')
     check(applied.json['result']['complete'] is True, 'new BE publication completed')
     check.equal(first.step('defaults-after').out, first.step('defaults-before').out, 'all imported defaults remain fixed')
     check.equal(first.step('disk-after').out, first.step('disk-before').out, 'pool addition preserves the complete GPT layout')

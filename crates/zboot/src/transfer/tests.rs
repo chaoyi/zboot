@@ -187,9 +187,7 @@ pub(crate) struct Fake {
     first_stream_effect: Option<usize>,
     volume_nodes: BTreeSet<String>,
     keep_volume_node: bool,
-    received_layers: BTreeMap<String, BTreeMap<String, String>>,
     altroots: BTreeMap<String, String>,
-    inherit_routes: Vec<(usize, String, PropertyKey, bool)>,
     cmdline_setters: usize,
     /// Snapshot renames, (old name, new name), in order.
     pub(crate) renamed: Vec<(String, String)>,
@@ -323,9 +321,7 @@ impl Fake {
             first_stream_effect: None,
             volume_nodes: BTreeSet::new(),
             keep_volume_node: false,
-            received_layers: BTreeMap::new(),
             altroots: BTreeMap::new(),
-            inherit_routes: vec![],
             cmdline_setters: 0,
             renamed: vec![],
             destroyed: vec![],
@@ -597,19 +593,6 @@ impl PairBackend for Fake {
         if value.key() == PropertyKey::Mountpoint {
             refuse_altroot(&PairBackend::observe(self)?, &endpoint.name)?;
         }
-        if crate::placement::PLACEMENT_KEYS.contains(&value.key().native())
-            && let Some(previous) = self
-                .native
-                .effective(&endpoint.name)
-                .get(value.key().native())
-            && previous.source == "received"
-        {
-            self.received_layers
-                .entry(endpoint.name.clone())
-                .or_default()
-                .entry(value.key().native().into())
-                .or_insert(previous.value.clone());
-        }
         let result = self
             .native
             .set(endpoint, &[(value.key().native().into(), encoded)]);
@@ -816,48 +799,15 @@ impl TransferBackend for Fake {
         }
         self.native.after()
     }
-    fn received_properties(
+    fn publish_mountpoint(
         &mut self,
         endpoint: &Endpoint,
-    ) -> Result<BTreeMap<String, String>, Error> {
-        refuse_altroot(&PairBackend::observe(self)?, &endpoint.name)?;
-        let mut received: BTreeMap<_, _> = self
-            .properties(endpoint)?
-            .into_iter()
-            .filter(|(_, property)| property.source == "received")
-            .map(|(key, property)| (key, property.value))
-            .collect();
-        received.extend(
-            self.received_layers
-                .get(&endpoint.name)
-                .cloned()
-                .unwrap_or_default(),
-        );
-        Ok(received)
-    }
-    fn restore_receive_property(
-        &mut self,
-        endpoint: &Endpoint,
-        key: PropertyKey,
         property: &crate::placement::SavedProperty,
     ) -> Result<(), Error> {
-        let received = restore_inherit_received(key, property)?;
-        if property.source != "local" && key == PropertyKey::Canmount && !received {
-            return Err(refuse("canmount is not inheritable"));
-        }
-        if self.received_properties(endpoint)?.get(key.native()) != property.received.as_ref() {
-            return Err(refuse("fake original received placement changed"));
-        }
         self.native.before()?;
-        if property.source != "local" {
-            self.inherit_routes
-                .push((self.native.effects, endpoint.name.clone(), key, received));
-        }
-        if key == PropertyKey::Mountpoint {
-            let props = self.native.effective(&endpoint.name);
-            assert_eq!(props["readonly"].value, "on");
-            assert_eq!(props["canmount"].value, "noauto");
-        }
+        let props = self.native.effective(&endpoint.name);
+        assert_eq!(props["readonly"].value, "on");
+        assert_eq!(props["canmount"].value, "noauto");
         if !self.native.members.iter().any(|m| m.endpoint == *endpoint) {
             return Err(refuse("fake receive placement endpoint changed"));
         }
@@ -866,7 +816,7 @@ impl TransferBackend for Fake {
             .entry(endpoint.name.clone())
             .or_default()
             .insert(
-                key.native().into(),
+                "mountpoint".into(),
                 NativeProperty {
                     value: property.value.clone(),
                     source: property.source.clone(),
@@ -2064,16 +2014,22 @@ fn public_transfer_captures_a_writable_leaf_and_reports_a_new_child() {
     assert!(error.contains("a pair joins leaf datasets"), "{error}");
     assert_eq!((fake.native.effects, fake.streams), (effects, 0));
 }
-#[test]
-fn readonly_secondary_push_preserves_ownership_and_rotates_only_managed_anchors() {
+/// A pair whose primary is A and whose secondary is B, both at `s2`; with
+/// FENCED, A is the secondary instead.
+fn paired(fenced: &str) -> (Fake, PairRecord) {
     let mut fake = Fake::unpaired(false);
     let state = fake.native.state().unwrap();
+    let primary = if fenced == "a/data" {
+        "b/data"
+    } else {
+        "a/data"
+    };
     let record = PairRecord {
         schema_version: 1,
         pair_id: PAIR_ID.into(),
-        endpoint: endpoint(&state, "a/data").unwrap(),
-        peer: endpoint(&state, "b/data").unwrap(),
-        role: Role::Secondary,
+        endpoint: endpoint(&state, primary).unwrap(),
+        peer: endpoint(&state, fenced).unwrap(),
+        role: Role::Primary,
     };
     for pair in [record.clone(), record.counterpart()] {
         fake.native
@@ -2088,7 +2044,7 @@ fn readonly_secondary_push_preserves_ownership_and_rotates_only_managed_anchors(
         .members
         .clone()
         .into_iter()
-        .filter(|m| history::contains_dataset("a/data", &m.endpoint.name))
+        .filter(|m| history::contains_dataset(fenced, &m.endpoint.name))
     {
         fake.set_property(
             &member.endpoint,
@@ -2103,6 +2059,19 @@ fn readonly_secondary_push_preserves_ownership_and_rotates_only_managed_anchors(
         )
         .unwrap();
         fake.native.mounted.remove(&member.endpoint.name);
+    }
+    (fake, record)
+}
+/// A read-only primary (fenced for a catch-up) sends its newest snapshot to
+/// its secondary: the roles stay, and only the pair's own anchors move.
+#[test]
+fn readonly_primary_push_preserves_ownership_and_rotates_only_managed_anchors() {
+    let (mut fake, record) = paired("b/data");
+    for member in fake.native.members.clone() {
+        if history::contains_dataset("a/data", &member.endpoint.name) {
+            fake.set_property(&member.endpoint, &PropertyValue::Readonly(true))
+                .unwrap();
+        }
     }
     for member in &mut fake.native.members {
         if history::contains_dataset("b/data", &member.endpoint.name) {
@@ -2151,13 +2120,13 @@ fn readonly_secondary_push_preserves_ownership_and_rotates_only_managed_anchors(
     let state = fake.native.state().unwrap();
     assert_eq!(
         management::ownership(&state, "a/data").unwrap(),
-        Ownership::Secondary {
+        Ownership::Primary {
             record: record.clone()
         }
     );
     assert_eq!(
         management::ownership(&state, "b/data").unwrap(),
-        Ownership::Primary {
+        Ownership::Secondary {
             record: record.counterpart()
         }
     );
@@ -2171,6 +2140,38 @@ fn readonly_secondary_push_preserves_ownership_and_rotates_only_managed_anchors(
         assert!(!fake.native.holds[&member.snapshots[0].name].contains(&tag));
         assert!(fake.native.holds[&member.snapshots.last().unwrap().name].contains(&tag));
     }
+}
+/// A sync never receives into the working copy: from the secondary it is
+/// refused before any effect, admission included, and names `primary`.
+#[test]
+fn a_transfer_from_the_secondary_is_refused_before_any_effect() {
+    let (mut fake, _) = paired("a/data");
+    for member in &mut fake.native.members {
+        if history::contains_dataset("b/data", &member.endpoint.name) {
+            member.snapshots.pop();
+        }
+    }
+    let request = TransferRequest {
+        source: "a/data".into(),
+        destination: "b/data".into(),
+    };
+    let effects = fake.native.effects;
+    let error = admission_with(&request, &mut fake).unwrap_err().to_string();
+    assert!(
+        error.contains("a/data is the secondary of b/data"),
+        "{error}"
+    );
+    assert!(error.contains("`zboot primary a/data`"), "{error}");
+    assert_eq!(fake.native.effects, effects);
+    // The engine itself refuses before its capture, under a caller's record.
+    let mut record = fake.record().unwrap();
+    let effects = fake.native.effects;
+    let error = transfer_with_id(&request, &mut record, &mut fake)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`zboot primary a/data`"), "{error}");
+    assert_eq!((fake.native.effects, fake.streams), (effects, 0));
+    assert!(record.transfer().is_none() && fake.markers.is_empty());
 }
 /// A resume reads its record and the plan it names on the source alone, and
 /// binds the requested and the recorded destination before any effect; a
@@ -2875,6 +2876,45 @@ fn a_pool_imported_with_an_altroot_since_the_plan_refuses_before_any_stream() {
             error.contains(&format!("pool {pool} is imported with an altroot")),
             "{error}"
         );
+        assert_eq!(fake.streams, 0);
+    }
+}
+
+/// A receiver replaced, or its pool imported with an altroot, between the
+/// plan and its commit is refused before the commit: the record names no
+/// transfer, no attachment is written and nothing changed.
+#[test]
+fn a_receiver_changed_between_plan_and_commit_refuses_before_the_commit() {
+    for altroot in [false, true] {
+        let mut fake = Fake::new(false);
+        let plan = fake.prepare();
+        let mut record = fake.record().unwrap();
+        if altroot {
+            fake.altroots.insert("b".into(), "/changed-import".into());
+        } else {
+            fake.native
+                .members
+                .iter_mut()
+                .find(|m| m.endpoint.name == "b/data")
+                .unwrap()
+                .endpoint
+                .identity
+                .objsetid = ObjsetId::new(999);
+        }
+        let (effects, writes) = (fake.native.effects, fake.writes.len());
+        let (chunks, markers) = (fake.chunks(), fake.markers.clone());
+        let error = commit(&mut record, plan, &mut fake)
+            .unwrap_err()
+            .to_string();
+        let expected = if altroot {
+            "pool b is imported with an altroot"
+        } else {
+            "receiving copy was replaced since the plan"
+        };
+        assert!(error.contains(expected), "{error}");
+        assert!(record.transfer().is_none());
+        assert_eq!((fake.native.effects, fake.writes.len()), (effects, writes));
+        assert_eq!((fake.chunks(), &fake.markers), (chunks, &markers));
         assert_eq!(fake.streams, 0);
     }
 }

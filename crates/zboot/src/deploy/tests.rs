@@ -525,15 +525,13 @@ fn fresh_pool_admission_accepts_sa_alias_but_refuses_directory_xattrs() {
         observe_member(&op, &state, name, None, false).unwrap();
     }
     // A fresh member carries no zboot property but its pending fence.
-    for key in ["zboot:be", "zboot:future-role"] {
-        let mut marked = state.clone();
-        marked
-            .dataset_properties
-            .get_mut(name)
-            .unwrap()
-            .insert(key.into(), property("unknown"));
-        assert!(observe_member(&op, &marked, name, None, false).is_err());
-    }
+    let mut marked = state.clone();
+    marked
+        .dataset_properties
+        .get_mut(name)
+        .unwrap()
+        .insert("zboot:future-role".into(), property("unknown"));
+    assert!(observe_member(&op, &marked, name, None, false).is_err());
     for value in ["dir", "off", "unknown"] {
         state
             .dataset_properties
@@ -575,21 +573,6 @@ fn fresh_be_admission_uses_native_roles_and_refuses_any_other_zboot_property() {
     }
     let state = fake.state().unwrap();
     observe_member(&op, &state, be, None, false).unwrap();
-    for (value, source) in [
-        ("1", "local"),
-        ("0", "received"),
-        ("arbitrary legacy value", "inherited from newpool"),
-    ] {
-        let mut state = state.clone();
-        state.dataset_properties.get_mut(be).unwrap().insert(
-            "zboot:be".into(),
-            native::NativeProperty {
-                value: value.into(),
-                source: source.into(),
-            },
-        );
-        assert!(observe_member(&op, &state, be, None, false).is_err());
-    }
 }
 
 #[test]
@@ -670,12 +653,6 @@ fn roles_are_set_on_every_member_at_creation_and_never_swept() {
     // The BE is created with its role and nothing else about mounting; the
     // systemd generator's properties are not zboot's.
     let create = be_create("rpool/ROOT/debian", "op");
-    assert!(
-        !create
-            .iter()
-            .any(|argument| argument.starts_with("zboot:be=")),
-        "{create:?}"
-    );
     assert!(create.iter().any(|a| a == "canmount=noauto"), "{create:?}");
     assert!(create.iter().any(|a| a == "mountpoint=/"), "{create:?}");
     assert!(
@@ -788,7 +765,7 @@ fn deploy_applies_no_implicit_base_overlay() {
     assert!(native.overlays().is_empty());
 }
 #[test]
-fn reordering_overlays_changes_the_token_including_image_and_into_plans() {
+fn reordering_overlays_changes_the_token_and_the_image_and_install_plans() {
     let scratch = Scratch::new();
     let mut overlays = Vec::new();
     for (name, bytes) in [
@@ -827,10 +804,10 @@ fn reordering_overlays_changes_the_token_including_image_and_into_plans() {
         overlays: review.overlays.clone(),
         defaults: BTreeMap::new(),
     };
-    let into_token = super::into::consent(&into).unwrap();
+    let reviewed_into = into.clone();
     into.overlays.reverse();
     into.request.overlays.reverse();
-    assert_ne!(into_token, super::into::consent(&into).unwrap());
+    assert_ne!(reviewed_into, into);
     let mut image_request = review.selection.clone();
     image_request.fresh_image = true;
     image_request.disk.clear();
@@ -849,7 +826,6 @@ fn reordering_overlays_changes_the_token_including_image_and_into_plans() {
         request: image_request,
         inputs: request::bound_inputs(&review),
     };
-    let image_token = super::image::consent(&image).unwrap();
     review.overlays.reverse();
     review.selection.overlays.reverse();
     review.loss_token = token(&review).unwrap();
@@ -860,9 +836,9 @@ fn reordering_overlays_changes_the_token_including_image_and_into_plans() {
     let reordered = super::image::Plan {
         request: reordered_request,
         inputs: request::bound_inputs(&review),
-        ..image
+        ..image.clone()
     };
-    assert_ne!(image_token, super::image::consent(&reordered).unwrap());
+    assert_ne!(image, reordered);
 }
 #[test]
 fn a_changed_overlay_is_refused_before_application() {

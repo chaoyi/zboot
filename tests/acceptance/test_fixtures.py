@@ -11,7 +11,6 @@ import shutil
 import shlex
 import signal
 import subprocess
-import symtable
 import sys
 import tarfile
 import tempfile
@@ -768,17 +767,6 @@ class UsbLoaderFixtureTests(unittest.TestCase):
 
 
 class DiscoveryFixtureTests(unittest.TestCase):
-    def test_efi_handoff_verdict_keeps_lifecycle_source_global(self):
-        fixture = Path(__file__).parent / "cases/efi_handoff_native.py"
-        module = symtable.symtable(fixture.read_text(), str(fixture), "exec")
-        self.assertTrue(module.lookup("source").is_imported())
-        verdicts = [scope for scope in module.get_children() if scope.get_name() == "verdict"]
-        self.assertEqual(len(verdicts), 1)
-        source = verdicts[0].lookup("source")
-        self.assertTrue(source.is_referenced())
-        self.assertTrue(source.is_global())
-        self.assertFalse(source.is_local(), "a later loop assignment must not shadow lifecycle.source")
-
     def test_writer_lock_probe_is_an_explicit_staged_native_tool(self):
         acceptance = Path(__file__).parent
         source = (acceptance / "guest/cases/MENU-DISCOVERY-NATIVE.sh").read_text()

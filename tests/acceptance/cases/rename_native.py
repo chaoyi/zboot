@@ -22,7 +22,7 @@ def verdict(ev, check):
     plan = preview['result']
     check.equal(preview['schema_version'], 1, 'preview envelope schema')
     check.equal(preview['mode'], 'preview', 'preview mode')
-    check(isinstance(preview.get('token'), str) and len(preview['token']) == 32, 'rename preview carries a stable plan token')
+    check('token' not in preview, 'a rename preview carries no token: rename loses nothing')
     check.equal(plan['kind'], 'rename', 'preview kind')
     check.equal(plan['source']['name'], SRC, 'preview source')
     check.equal(plan['destination'], DST, 'preview destination')
@@ -34,13 +34,12 @@ def verdict(ev, check):
     check(existing.rc != 0, f'move onto existing e2ea/plain refused: rc={existing.rc}')
     check.contains(existing.err, 'e2ea/plain exists', 'existing-destination refusal names the destination')
     unchanged(check, before, s.observe('after-existing'), 'existing-destination refusal')
-    token = s.step('stale-token')
-    check.equal(token.rc, 3, 'stale rename token exits 3')
-    check.equal(token.json['mode'], 'refused', 'stale rename token refusal envelope')
-    check.equal(token.json['result']['reason'], 'stale_token', 'stale rename token reason')
-    check('token' not in token.json and preview['token'] not in token.err, 'stale refusal discloses no current token')
-    unchanged(check, before, s.observe('after-token'), 'needless-token refusal')
-    check(SRC in s.observe('after-token').datasets, 'source still present after both refusals')
+    confirm = s.step('needless-confirm')
+    check.equal(confirm.rc, 2, 'rename takes no --confirm: a usage error')
+    check.equal(confirm.out, '', 'the usage error prints no JSON')
+    unchanged(check, before, s.observe('after-confirm'), 'needless-confirm refusal')
+    check(SRC in s.observe('after-confirm').datasets, 'source still present after both refusals')
+    check('token' not in s.step('rename').json, 'an applied rename carries no token')
 
     moved = s.step('rename').json
     check.equal(moved['schema_version'], 1, 'move envelope schema')

@@ -8,11 +8,6 @@ use crate::engine::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The boot-environment marker that builds before the markerless menu wrote,
-/// and that their loaders still need. Nothing here reads it to decide
-/// anything: a dataset that carries it is treated as if it did not, so a host
-/// keeps booting across the change and the marker can go afterwards.
-pub const RETIRED_MARKER: &str = "zboot:be";
 pub const PAIR_PROPERTY: &str = "zboot:pair";
 pub const PENDING_PROPERTY: &str = "zboot:pending";
 pub const STAGING_PROPERTY: &str = "zboot:staging";
@@ -468,8 +463,6 @@ fn validate_supported_properties_mode(
             // An operation record lives on its pool's root; descendants
             // inherit it. It is inert here: `resume` reads it, nothing else.
             OPERATION_PROPERTY if pool_root_source(&property.source, name) => {}
-            // Inert, whatever its value or source.
-            RETIRED_MARKER => {}
             "zboot:cmdline"
                 if !property.value.chars().any(char::is_control)
                     && trusted_source(&property.source) => {}
@@ -763,33 +756,11 @@ mod tests {
             assert!(admit_working(&state, name).is_err(), "{name}");
         }
     }
-    #[cfg(feature = "internal")]
-    #[test]
-    fn a_dataset_with_the_retired_boot_marker_is_admitted_as_if_unmarked() {
-        let mut state = fixture();
-        state
-            .dataset_properties
-            .get_mut("tank/data")
-            .unwrap()
-            .insert(RETIRED_MARKER.into(), prop("1", "local"));
-        state
-            .dataset_properties
-            .get_mut("tank/data/child")
-            .unwrap()
-            .insert(RETIRED_MARKER.into(), prop("1", "inherited from tank/data"));
-        crate::engine::operation::SnapshotScope::plan(
-            &state.inspection,
-            &state.dataset_properties,
-            &state.pool_properties,
-            &["tank/data".into()],
-        )
-        .unwrap();
-    }
     #[test]
     fn a_management_property_this_build_does_not_read_refuses_and_names_its_holder() {
         // Keys of a later zboot and of earlier ones alike; a plain refusal,
         // with no "inconsistent ZFS observation" prefix.
-        for key in ["zboot:future", "zboot:journal:0b8f2c1e:header"] {
+        for key in ["zboot:future", "zboot:be", "zboot:journal:0b8f2c1e:header"] {
             for (source, holder) in [("local", "tank/data"), ("inherited from tank", "tank")] {
                 let properties = BTreeMap::from([(key.into(), prop("1", source))]);
                 let message = validate_supported_properties(&properties, "tank/data")
@@ -801,13 +772,6 @@ mod tests {
                     )) && message.ends_with(&format!("`zfs inherit {key} {holder}`")),
                     "{message}"
                 );
-            }
-        }
-        // The retired boot marker is inert, whatever its value or source.
-        for value in ["1", "0", "-", "old future value"] {
-            for source in ["local", "received", "inherited from tank", "default"] {
-                let properties = BTreeMap::from([(RETIRED_MARKER.into(), prop(value, source))]);
-                validate_supported_properties(&properties, "tank/data").unwrap();
             }
         }
         // Another namespace is ordinary user data.

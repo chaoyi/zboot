@@ -297,10 +297,7 @@ fn plan_selected(
         Boot::External {
             partition,
             replace_fallback,
-        } => {
-            esp::refuse_foreign_deploy_loaders(partition)?;
-            Some(esp::plan_loader(partition, &artifacts, *replace_fallback)?)
-        }
+        } => Some(esp::plan_loader(partition, &artifacts, *replace_fallback)?),
         _ => None,
     };
     let mut request = request.clone();

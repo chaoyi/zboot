@@ -1,5 +1,6 @@
-//! Add one fenced boot environment to an imported pool. This has no restart
-//! journal. A surviving pending dataset is removed through an explicit Drop.
+//! `zboot deploy into POOL`: add one fenced boot environment to an imported pool.
+//! It has no restart journal. A surviving pending dataset is removed through
+//! an explicit Drop.
 use super::{identity, overlay, refuse};
 use crate::factory::{self, ImageFile, root_tar::RootTar};
 use serde::Serialize;
@@ -24,36 +25,6 @@ pub struct Request {
     pub hostname: Option<String>,
 }
 impl Request {
-    pub fn from_args(args: &super::command::Args) -> io::Result<Self> {
-        let super::command::Target::Into { pool } = &args.target else {
-            return Err(refuse("deploy into needs an imported pool"));
-        };
-        if args.portable
-            || args.pool.is_some()
-            || args.hostid.is_some()
-            || args.esp.is_some()
-            || args.esp_partition.is_some()
-            || args.swap.is_some()
-            || !args.efi.as_os_str().is_empty()
-        {
-            return Err(refuse(
-                "--into accepts only --tar, --overlay, --be and --hostname",
-            ));
-        }
-        Ok(Self {
-            pool: pool.clone(),
-            be: args
-                .be
-                .clone()
-                .unwrap_or_else(|| super::command::DEFAULT_BE.into()),
-            tar: args
-                .factory
-                .clone()
-                .ok_or_else(|| refuse("--into needs --tar"))?,
-            overlays: args.overlay.clone(),
-            hostname: args.hostname.clone(),
-        })
-    }
     pub fn dataset(&self) -> String {
         format!("{}/ROOT/{}", self.pool, self.be)
     }
@@ -166,9 +137,7 @@ fn container(state: &NativeState, name: &str) -> io::Result<Endpoint> {
     Ok(point)
 }
 fn forbidden_child_property(key: &str) -> bool {
-    management::managed_key(key)
-        && key != management::PENDING_PROPERTY
-        && key != management::RETIRED_MARKER
+    management::managed_key(key) && key != management::PENDING_PROPERTY
 }
 fn admit_inherited_properties(state: &NativeState, parent: &str) -> io::Result<()> {
     let properties = state.dataset_properties.get(parent).ok_or_else(|| {
@@ -190,7 +159,7 @@ fn admission(request: &Request, state: &NativeState) -> io::Result<(Endpoint, Op
         .pools
         .iter()
         .find(|p| p.name == request.pool)
-        .ok_or_else(|| refuse("--into pool is not imported"))?;
+        .ok_or_else(|| refuse("the pool is not imported"))?;
     let point = endpoint(state, &request.pool)?;
     if point.identity.pool_guid != pool.guid {
         return Err(refuse("pool root identity changed"));
@@ -244,10 +213,7 @@ pub fn plan_with(request: &Request, backend: &mut impl Backend) -> io::Result<Pl
         defaults: defaults(&state),
     })
 }
-pub fn consent(plan: &Plan) -> io::Result<String> {
-    crate::consent::token(&("zboot-deploy-into-1", plan))
-}
-pub fn describe(plan: &Plan, token: &str) -> String {
+pub fn describe(plan: &Plan) -> String {
     let mut text = format!(
         "Deploy into imported pool\n  BE: {}\n  Hostid: {}\n  Root: {} {}\n  Boot defaults remain unchanged\n",
         zfs_tools::engine::escape_display(&plan.request.dataset()),
@@ -262,7 +228,6 @@ pub fn describe(plan: &Plan, token: &str) -> String {
             item.sha256
         ));
     }
-    text.push_str(&format!("  Token: {token}\n"));
     text
 }
 fn bound(
@@ -556,8 +521,9 @@ impl Backend for Native {
                                     ("ZBOOT_POOL", plan.pool.name.clone()),
                                     ("ZBOOT_BE", name.clone()),
                                 ],
-                                &Path::new("/run")
-                                    .join(format!("zboot-into-{id}-post-install-{index}.log")),
+                                &Path::new("/run").join(format!(
+                                    "zboot-deploy-into-{id}-post-install-{index}.log"
+                                )),
                             )?;
                         }
                         Ok(())
@@ -998,7 +964,7 @@ mod tests {
         );
     }
     #[test]
-    fn reordering_overlays_changes_the_into_token() {
+    fn reordering_overlays_changes_the_plan() {
         let scratch = crate::factory::tests::Scratch::new();
         let mut req = request();
         for (name, value) in [("one", "1"), ("two", "2")] {
@@ -1011,7 +977,7 @@ mod tests {
         let first = plan_with(&req, &mut fake).unwrap();
         req.overlays.reverse();
         let second = plan_with(&req, &mut fake).unwrap();
-        assert_ne!(consent(&first).unwrap(), consent(&second).unwrap());
+        assert_ne!(first, second);
         assert_ne!(first.overlays[0].sha256, second.overlays[0].sha256);
     }
     #[test]

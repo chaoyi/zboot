@@ -1451,7 +1451,6 @@ mod tests {
         assert!(fake.snapshots[&outcome.source_snapshot].holds.is_empty());
         assert_eq!(fake.snapshots[&outcome.source_snapshot].content, content);
         assert_eq!(fake.datasets["a/BE/next"].content, content);
-        assert_eq!(fake.effective("a/BE/next", "zboot:be"), None);
     }
 
     #[test]
@@ -1872,12 +1871,6 @@ mod tests {
         let root = &f.datasets["a/BE/next"];
         assert_eq!(root.origin.as_deref(), Some("a/BE/root@base"));
         assert_eq!(root.content, f.snapshots["a/BE/root@base"].content);
-        assert!(!root.props.contains_key("zboot:be"));
-        assert!(
-            !f.log
-                .iter()
-                .any(|effect| effect.contains("key: \"zboot:be\""))
-        );
         assert_eq!(
             root.props.get("zboot:cmdline").map(String::as_str),
             Some("quiet")
@@ -2080,17 +2073,8 @@ mod tests {
         }
         let mut f = fixture();
         f.create("a/other");
-        let mut state = f.observe().unwrap();
-        for source in ["received", "inherited from a"] {
-            state.dataset_properties.get_mut("a/other").unwrap().insert(
-                "zboot:be".into(),
-                zfs_tools::engine::native::NativeProperty {
-                    value: "1".into(),
-                    source: source.into(),
-                },
-            );
-            destination_outside_boot_environment(&state, "a/other/next").unwrap();
-        }
+        let state = f.observe().unwrap();
+        destination_outside_boot_environment(&state, "a/other/next").unwrap();
         // A shaped root itself is permitted after publication.
         destination_outside_boot_environment(&state, "a/BE/root").unwrap();
     }
@@ -2458,7 +2442,6 @@ mod tests {
             let found = record(&mut f).unwrap();
             let decoded: Intent<State> = decode(found.clone(), KIND).unwrap();
             let staged = format!("{}/copy", decoded.state.workspace.name);
-            assert_eq!(f.effective(&staged, "zboot:be"), None);
             let child = format!("{staged}/var");
             match change {
                 "child" => {

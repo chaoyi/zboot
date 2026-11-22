@@ -9,10 +9,7 @@ pub(crate) mod inventory;
 mod menu_connect;
 mod menu_view;
 pub mod pool_access;
-pub mod preserve;
 pub(crate) mod ram_boot;
-mod restore_command;
-pub mod restore_console;
 pub(crate) mod select;
 
 use crate::handoff::{
@@ -275,10 +272,8 @@ fn shutdown_from_menu(restart: bool) -> Result<()> {
     Err(refuse("reboot returned without restarting"))
 }
 
-fn numbering(
-    entries: &[menu_view::MenuEntry],
-    datasets: &console::DatasetMenu,
-) -> crate::status::Numbering {
+/// The BE labels the menu displayed, each bound to the incarnation it showed.
+fn numbering(entries: &[menu_view::MenuEntry]) -> crate::status::Numbering {
     crate::status::Numbering {
         boot: entries
             .iter()
@@ -290,52 +285,6 @@ fn numbering(
                 )
             })
             .collect(),
-        datasets: datasets
-            .numbered()
-            .map(|(label, name, identity)| (name.to_owned(), (label.to_owned(), identity.clone())))
-            .collect(),
-    }
-}
-
-/// Ordinary dataset labels are published after a full text report succeeds.
-/// BE selectors retain the last displayed menu inventory. Status reads only
-/// the supplied ZFS state and leaves kernel discovery to menu rendering.
-#[derive(Default)]
-struct StatusNumberingUpdate {
-    datasets: Option<console::DatasetMenu>,
-}
-
-impl StatusNumberingUpdate {
-    fn stage(command: &crate::cli::grammar::Verb, observed: &NativeState) -> Self {
-        use crate::cli::grammar::Verb;
-        match command {
-            Verb::Status {
-                datasets,
-                json: false,
-                all,
-                snapshots,
-                ..
-            } if datasets.is_empty() && (*all || *snapshots) => Self {
-                datasets: Some(console::DatasetMenu::from_state(observed)),
-            },
-            _ => Self::default(),
-        }
-    }
-
-    fn numbers(
-        &self,
-        entries: &[menu_view::MenuEntry],
-        datasets: &console::DatasetMenu,
-    ) -> crate::status::Numbering {
-        numbering(entries, self.datasets.as_ref().unwrap_or(datasets))
-    }
-
-    fn publish(self, code: i32, datasets: &mut console::DatasetMenu) {
-        if code == 0
-            && let Some(updated) = self.datasets
-        {
-            *datasets = updated;
-        }
     }
 }
 
@@ -472,7 +421,6 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
     let mut autoboot_consumed = no_autoboot;
     let mut prompt_shown = false;
     let mut displayed_access = access_hold;
-    let mut datasets = console::DatasetMenu::default();
     println!("{}", menu_shortcuts(connect_available()));
     loop {
         if poll_remote_access(&mut access_hold) {
@@ -644,7 +592,6 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
         }
         let borrowed = words.iter().map(String::as_str).collect::<Vec<_>>();
         let mut pre_execution = false;
-        let mut cancelled = false;
         let result = (|| -> Result<()> {
             match borrowed.as_slice() {
                 [] => return Ok(()),
@@ -655,7 +602,7 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                     )?);
                 }
                 ["help", command] => {
-                    return match crate::cli::grammar::Cli::parse_for_menu([
+                    return match crate::cli::grammar::Cli::parse_from_args([
                         "zboot", command, "--help",
                     ]) {
                         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
@@ -676,11 +623,7 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                 ["rescan"] => {
                     discovery::start()?;
                     inventory.refresh_with(menu_inventory);
-                    if let Some(observed) = inventory.countdown_state() {
-                        datasets = console::DatasetMenu::from_state(observed);
-                    }
                     render_menu(&inventory.entries)?;
-                    datasets.render(&mut io::stdout())?;
                     return Ok(());
                 }
                 ["shell"] => {
@@ -700,44 +643,26 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                 _ => {}
             }
             pre_execution = true;
-            // Numbers and pickers resolve against the displayed tables only;
-            // the command checks their identities at entry and under its lock.
-            let (mut cli, mut bindings, shortcut) = if words.len() == 1
+            // Numbers resolve against the displayed tables only; the command
+            // checks their identities at entry and under its lock.
+            let (cli, bindings, shortcut) = if words.len() == 1
                 && words[0].as_bytes().first().is_some_and(u8::is_ascii_digit)
             {
                 let (cli, bindings, request) = boot_shortcut(&words[0], &inventory.entries)?;
                 (cli, bindings, Some(request))
             } else {
-                let (cli, bindings) = parsed_menu_command(&words, &inventory.entries, &datasets)?;
+                let (cli, bindings) = parsed_menu_command(&words, &inventory.entries)?;
                 (cli, bindings, None)
             };
-            let Some(picked) = restore_command::fill(&mut cli, &mut input, &mut io::stdout())?
-            else {
-                cancelled = true;
-                return Ok(());
-            };
-            bindings.extend(picked.datasets);
-            cli.validate_complete()
-                .map_err(|error| refuse(error.to_string()))?;
-            let bindings = crate::cli::access::Bindings {
-                datasets: bindings,
-                snapshots: picked.snapshots,
-                disks: picked.disks,
-            };
+            let bindings = crate::cli::access::Bindings { datasets: bindings };
             let listing = matches!(cli.command, crate::cli::grammar::Verb::Status { .. });
-            let staged = if listing {
-                StatusNumberingUpdate::stage(&cli.command, &state::observe()?)
-            } else {
-                StatusNumberingUpdate::default()
-            };
-            let numbers = staged.numbers(&inventory.entries, &datasets);
+            let numbers = numbering(&inventory.entries);
             let listed_boot = match shortcut {
                 Some(request) => Some(request),
                 None => listed_boot_request(&cli, &inventory.entries)?,
             };
             pre_execution = false;
             let code = crate::cli::run_menu(cli, bindings, Some(&numbers), listed_boot);
-            staged.publish(code, &mut datasets);
             if code != 0 {
                 return Ok(()); // The common finalizer already printed the command result.
             }
@@ -747,9 +672,7 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
             }
             Ok(())
         })();
-        if cancelled {
-            crate::cli::finish_menu_pre_execution(&words, Box::new(crate::consent::Unconfirmed));
-        } else if let Err(error) = result {
+        if let Err(error) = result {
             if pre_execution {
                 crate::cli::finish_menu_pre_execution(&words, Box::new(error));
             } else {
@@ -778,49 +701,15 @@ mod tests {
     }
 
     #[test]
-    fn status_number_maps_use_only_zfs_state_and_preserve_displayed_boot_entries() {
-        use crate::cli::grammar::Cli;
+    fn status_numbers_are_the_displayed_boot_entries() {
         let prior = fixture_with_be_guid(true, 10);
-        let current = fixture_with_be_guid(true, 99);
-        let old_entries = vec![displayed_be(&prior)];
-        let old_datasets = console::DatasetMenu::from_state(&prior);
-        let new_datasets = console::DatasetMenu::from_state(&current);
-        let old_boot = numbering(&old_entries, &old_datasets).boot;
-        let parse = |args: &[&str]| {
-            Cli::parse_for_menu(std::iter::once("zboot").chain(args.iter().copied())).unwrap()
-        };
-
-        // The stage API takes only parsed arguments and already-observed ZFS
-        // state. Every status form retains the displayed BE/kernel table.
-        for args in [
-            &["status"][..],
-            &["status", "--all", "--json"],
-            &["status", "tank/ROOT/be"],
-            &["status", "tank/ROOT/be", "--all"],
-        ] {
-            let update = StatusNumberingUpdate::stage(&parse(args).command, &current);
-            assert_eq!(update.numbers(&old_entries, &old_datasets).boot, old_boot);
-            let mut datasets = old_datasets.clone();
-            update.publish(0, &mut datasets);
-            assert_eq!(datasets, old_datasets);
-        }
-
-        let mut datasets = old_datasets.clone();
-        let update = StatusNumberingUpdate::stage(&parse(&["status", "--all"]).command, &current);
-        let staged = update.numbers(&old_entries, &datasets);
-        assert_eq!(staged.boot, old_boot);
-        assert_ne!(staged.datasets, numbering(&old_entries, &datasets).datasets);
-        assert_eq!(datasets, old_datasets);
-        update.publish(1, &mut datasets);
-        assert_eq!(datasets, old_datasets);
-        for option in ["--all", "--snapshots"] {
-            let update =
-                StatusNumberingUpdate::stage(&parse(&["status", option]).command, &current);
-            assert_eq!(update.numbers(&old_entries, &datasets).boot, old_boot);
-            update.publish(0, &mut datasets);
-            assert_eq!(datasets, new_datasets);
-            assert_eq!(numbering(&old_entries, &datasets).boot, old_boot);
-        }
+        let entry = displayed_be(&prior);
+        let numbers = numbering(std::slice::from_ref(&entry));
+        assert_eq!(
+            numbers.boot.get(&entry.candidate.dataset),
+            Some(&("1".to_owned(), entry.candidate.identity.clone()))
+        );
+        assert_eq!(numbers.boot.len(), 1);
     }
 
     #[test]
@@ -858,7 +747,6 @@ mod tests {
                 "short" => vec!["drop", "short", "--json"],
                 "number" => vec!["drop", "1", "--json"],
                 "syntax" => vec!["drop", "tank/ROOT/be", "--unknown", "--json"],
-                "cancel" => vec!["wipe", "--json"],
                 "shortcut" => vec!["99"],
                 _ => panic!("unknown menu error case"),
             }
@@ -867,27 +755,19 @@ mod tests {
             .collect::<Vec<_>>();
             let observed = fixture(true);
             let error: Box<dyn std::error::Error> = match case.as_str() {
-                "cancel" => Box::new(crate::consent::Unconfirmed),
                 "shortcut" => Box::new(boot_shortcut(&words[0], &[]).unwrap_err()),
                 "number" => {
                     let entry = displayed_be(&observed);
                     let replaced =
                         fixture_with_be_guid(true, entry.candidate.identity.guid.get() + 1);
-                    let (_, datasets) =
-                        parsed_menu_command(&words, &[entry], &console::DatasetMenu::default())
-                            .unwrap();
+                    let (_, datasets) = parsed_menu_command(&words, &[entry]).unwrap();
                     Box::new(
-                        crate::cli::access::Bindings {
-                            datasets,
-                            ..Default::default()
-                        }
-                        .check_state(&replaced)
-                        .unwrap_err(),
+                        crate::cli::access::Bindings { datasets }
+                            .check_state(&replaced)
+                            .unwrap_err(),
                     )
                 }
-                _ => Box::new(
-                    parsed_menu_command(&words, &[], &console::DatasetMenu::default()).unwrap_err(),
-                ),
+                _ => Box::new(parsed_menu_command(&words, &[]).unwrap_err()),
             };
             let code = crate::cli::finish_menu_pre_execution(&words, error);
             assert!(
@@ -904,7 +784,6 @@ mod tests {
             ("short", 1, Some("refused")),
             ("number", 1, Some("refused")),
             ("syntax", 2, None),
-            ("cancel", 3, Some("preview")),
             ("shortcut", 1, None),
         ] {
             let scratch = crate::factory::tests::Scratch::new();

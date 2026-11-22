@@ -34,10 +34,6 @@ stage_1() {
     must unknown-role zfs clone -o canmount=noauto -o mountpoint=/ \
         -o zboot:future-discovery=fenced e2ea/BE/proof@discovery e2ea/BE/unknown
     be e2eb 5 noauto ZFS-E2E-VAR-B
-    # Compatibility-only input: even an invalid legacy value grants no
-    # authority and must not become an unknown-role refusal. Ordinary roots
-    # above are marker-free; retire this legacy property before booting B.
-    must legacy-marker zfs set zboot:be=legacy-not-authority e2eb/BE/proof
     must token sh -c 'echo ZFS-E2E-HANDOFF-TOKEN > /mnt/be-e2eb/handoff-token'
     must boot-snapshot zfs snapshot e2eb/BE/proof@boot
     must umount-e2eb umount /mnt/be-e2eb
@@ -71,16 +67,10 @@ stock_boot() {
 # only A's /var. Then the operator repairs that child from inside A.
 stage_3() {
     step cmdline cat /proc/cmdline
-    must trace zboot trace --json
     stock_boot e2ea/BE/proof
     step var-token cat /selected-root/var/var-token
     observe target
-    must legacy-marker-observed zfs get -H -o value,source zboot:be e2eb/BE/proof
     must export-b zpool export e2eb
-    must import-b-writable zpool import -N -d "$(disk B)1" -o cachefile=none e2eb
-    must retire-legacy-marker zfs inherit zboot:be e2eb/BE/proof
-    must legacy-marker-retired zfs get -H -o value,source zboot:be e2eb/BE/proof
-    must export-b-marker-retired zpool export e2eb
     must export-a-readonly zpool export e2ea
     must import-a-writable zpool import -N -d "$(disk A)1" -o cachefile=none e2ea
     must repair zfs set canmount=noauto e2ea/BE/proof/var
@@ -91,7 +81,6 @@ stage_3() {
 # The kexec'd target B: verify what the Menu handed over, read-only.
 stage_5() {
     step cmdline cat /proc/cmdline
-    must trace zboot trace --json
     stock_boot e2eb/BE/proof
     step token cat /selected-root/handoff-token
     step var-token cat /selected-root/var/var-token

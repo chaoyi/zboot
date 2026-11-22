@@ -2,8 +2,8 @@
 //! displayed inventory.
 use super::{RecoveryError, Result, cleanup_error_for, discovery, hostid_adopt, menu_view, refuse};
 use crate::handoff::{
-    Action, AssetHashes, LISTING_MS, NativeRecovery, RecoveryBackend, bound_file, default_assets,
-    diagnostic, digest_file, eligible, readonly_pools,
+    Action, AssetHashes, NativeRecovery, RecoveryBackend, bound_file, default_assets, diagnostic,
+    digest_file, eligible, readonly_pools,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -298,7 +298,6 @@ fn entries_with(
         });
     }
     let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-    LISTING_MS.set(Some(elapsed_ms));
     diagnostic!("ZBOOT_MENU_LISTING_MS={elapsed_ms}");
     Ok(entries)
 }
@@ -375,8 +374,6 @@ pub(crate) mod tests {
     use crate::menu::select::auto_boot_request;
     use crate::menu::{menu_prompt, menu_view, refuse};
     use zfs_tools::engine::Error as NativeError;
-
-    use zfs_tools::engine::native::NativeProperty;
 
     pub(in crate::menu) fn displayed_be(state: &NativeState) -> menu_view::MenuEntry {
         let mut entry = menu_entry("tank/ROOT/be", false, None, vec![], None);
@@ -745,7 +742,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn candidates_ignore_legacy_markers_and_refuse_a_pending_boot_environment() {
+    fn candidates_refuse_a_pending_boot_environment() {
         let mut state = fixture(true);
         let refusal = |state: &NativeState| {
             candidates(state)
@@ -754,18 +751,6 @@ pub(crate) mod tests {
                 .unwrap()
                 .refusal
         };
-        assert_eq!(refusal(&state), None);
-        state
-            .dataset_properties
-            .get_mut("tank/ROOT/be")
-            .unwrap()
-            .insert(
-                "zboot:be".into(),
-                NativeProperty {
-                    value: "obsolete".into(),
-                    source: "received".into(),
-                },
-            );
         assert_eq!(refusal(&state), None);
         state
             .dataset_properties

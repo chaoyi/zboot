@@ -976,7 +976,7 @@ mod tests {
                 );
             }
         }
-        let text = crate::status::render_diagnostics(&report).unwrap();
+        let text = crate::status::render_diagnostics(&report, true).unwrap();
         assert!(text.contains("tank/copy  policy=- "), "{text}");
         assert!(text.contains(" status=fenced\n"), "{text}");
         assert!(text.contains(" status=read_only\n"), "{text}");
@@ -984,5 +984,13 @@ mod tests {
         assert!(!text.contains("inconsistent"), "{text}");
         assert!(text.contains("read_only = read-only dataset"), "{text}");
         assert!(text.contains("fenced = fenced pair copy"), "{text}");
+        assert!(text.contains("Policies (frequency; retention):"), "{text}");
+        let single = crate::status::render_diagnostics(&report, false).unwrap();
+        assert!(
+            !single.contains("Policies (frequency; retention):"),
+            "{single}"
+        );
+        assert!(single.contains(" status=read_only\n"), "{single}");
+        assert!(single.contains("read_only = read-only dataset"), "{single}");
     }
 }

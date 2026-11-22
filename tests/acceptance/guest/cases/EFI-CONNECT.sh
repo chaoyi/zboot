@@ -48,8 +48,6 @@ request() { # NAME key|empty
     must "$request_name-unmount" umount "$ESP"
 }
 
-# The installed factory root carries no jq; zboot prints the token on its own line.
-installed_token() { sed -n 's/^  "token": "\([0-9a-f]\{32\}\)"$/\1/p' "$ZT_LAST.out" | grep .; }
 
 next_stage() {
     # The installed initramfs imports the pool as soon as the ZFS module loads.
@@ -160,8 +158,7 @@ SHIM
     must reboot-shim-executable chmod 755 "$shim/systemctl"
     must reboot-key-symlink ln -s /run/zt-connect-public/authorized_keys /run/zt-connect-reboot-key
     must reboot-key-preview zboot reboot --menu --key /run/zt-connect-reboot-key ${menu_esp:+--esp "$boot_partition"} --dry-run --json
-    token=$(installed_token) || fail 'reboot key preview has no token'
-    step reboot-partial env "PATH=$shim:$PATH" zboot reboot --menu --key /run/zt-connect-reboot-key ${menu_esp:+--esp "$boot_partition"} --confirm "$token" --json
+    step reboot-partial env "PATH=$shim:$PATH" zboot reboot --menu --key /run/zt-connect-reboot-key ${menu_esp:+--esp "$boot_partition"} --json
     [ "$rc" -eq 4 ] || fail "reboot dispatch failure should be partial, got $rc"
     must reboot-systemctl cat /run/zt-connect-systemctl
     must reboot-key-canonical sh -e -c 'awk "{print \$1 \" \" \$2}" "$1" > /run/zt-connect-canonical-key' canonical /run/zt-connect-public/authorized_keys
@@ -207,8 +204,7 @@ REBOOT_UNIT
     must reboot-success-order systemctl show -p ActiveState -p After -p Before -p Conflicts zt-menu-reboot-proof.service
     must reboot-success-key-canonical sh -e -c 'awk "{print \$1 \" \" \$2}" "$1" > /run/zt-connect-canonical-key' canonical /run/zt-connect-public/authorized_keys
     must reboot-success-preview zboot reboot --menu --key /run/zt-connect-public/authorized_keys --dry-run --json
-    token=$(installed_token) || fail 'successful reboot preview has no token'
-    must reboot-success-apply zboot reboot --menu --key /run/zt-connect-public/authorized_keys --confirm "$token" --json
+    must reboot-success-apply zboot reboot --menu --key /run/zt-connect-public/authorized_keys --json
     mkdir -p "$ESP"
     must reboot-success-published-mount mount -t vfat -o nosuid,nodev,noexec "$boot_partition" "$ESP"
     must reboot-success-published-key sh -e -c 'cmp "$1/zboot/authorized_keys" /run/zt-connect-canonical-key; sha256sum "$1/zboot/authorized_keys"; cat "$1/zboot/authorized_keys"' published "$ESP"

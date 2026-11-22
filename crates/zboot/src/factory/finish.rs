@@ -5,7 +5,7 @@
 //! 1. zboot itself: the `zboot` package with `dpkg -i`, then each of
 //!    `/usr/bin/{zboot,zsnap}` run once inside the root;
 //! 2. no mount setting: the root keeps Debian's stock mounting;
-//! 3. the OpenZFS cohort is one version (from the donor suite, if any);
+//! 3. the OpenZFS cohort is one version;
 //! 4. host identity and generated secrets are removed, and the deployed apt
 //!    sources written, before any initrd is generated (the ZFS hook copies
 //!    `/etc/hostid` and the pool cache);
@@ -105,15 +105,7 @@ pub(crate) fn finish(
     let step = |what: &'static str| move |e: io::Error| refuse(format!("factory {what}: {e}"));
     install_package(root, stage, run).map_err(step("zboot package"))?;
     let installed = parse_inventory(&query_inventory(run)?)?;
-    let version = check_cohort(&installed).map_err(step("OpenZFS cohort"))?;
-    if let Some(donor) = &plan.zfs_from_suite {
-        check_donor(
-            &run.run("apt-cache", &["madison", "zfsutils-linux"])?,
-            &version,
-            donor,
-        )
-        .map_err(step("OpenZFS donor"))?;
-    }
+    check_cohort(&installed).map_err(step("OpenZFS cohort"))?;
     neutralize(root).map_err(step("host identity"))?;
     lock_root_password(root).map_err(step("root password"))?;
     install_missing_host_keys(root, installed.contains_key("openssh-server"))
@@ -618,25 +610,6 @@ pub(crate) fn check_cohort(packages: &BTreeMap<String, (String, String)>) -> io:
     Ok(distinct[0].to_string())
 }
 
-/// `apt-cache madison` shows the installed cohort version offered by the
-/// donor suite.
-pub(crate) fn check_donor(madison: &[u8], version: &str, donor: &str) -> io::Result<()> {
-    let text = String::from_utf8_lossy(madison);
-    if !text.lines().any(|line| {
-        let fields: Vec<_> = line.split('|').map(str::trim).collect();
-        fields.len() >= 3
-            && fields[1] == version
-            && fields[2]
-                .split_whitespace()
-                .any(|f| f.starts_with(&format!("{donor}/")))
-    }) {
-        return Err(refuse(format!(
-            "the installed OpenZFS {version} is not the {donor} suite's"
-        )));
-    }
-    Ok(())
-}
-
 pub(crate) fn verify_bzimage_release(file: &mut File, release: &str) -> io::Result<()> {
     let mut header = [0_u8; 0x210];
     file.read_exact(&mut header)?;
@@ -898,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn the_openzfs_cohort_is_one_version_from_the_donor() {
+    fn the_openzfs_cohort_is_one_version() {
         let rows = |zfs: &str, lib: &str| {
             format!(
                 "ii \tzfs-dkms\t{zfs}\tall\nii \tzfsutils-linux\t{zfs}\tamd64\nii \tzfs-zed\t{zfs}\tamd64\nii \tzfs-initramfs\t{zfs}\tall\nii \tlibzfs7linux:amd64\t{lib}\tamd64\nrc \tlibzfs6linux:amd64\t2.3.1-1\tamd64\nii \tbash\t5.3-1\tamd64\n"
@@ -909,9 +882,6 @@ mod tests {
         assert_eq!(check_cohort(&same).unwrap(), "2.4.4-1");
         let mixed = parse_inventory(rows("2.4.4-1", "2.4.3-2").as_bytes()).unwrap();
         assert!(check_cohort(&mixed).is_err());
-        let madison = b"zfsutils-linux |    2.4.4-1 | https://deb.debian.org/debian sid/contrib amd64 Packages\nzfsutils-linux |    2.4.3-2 | https://deb.debian.org/debian forky/contrib amd64 Packages\n";
-        check_donor(madison, "2.4.4-1", "sid").unwrap();
-        assert!(check_donor(madison, "2.4.3-2", "sid").is_err());
         // The published rows read back the same.
         let published = render_inventory(&same);
         assert_eq!(parse_inventory(&published).unwrap(), same);
@@ -995,7 +965,6 @@ mod tests {
         fs::write(stage.join(PACKAGE), b"package").unwrap();
         let plan = Stage {
             sources: "Types: deb\n".into(),
-            zfs_from_suite: None,
         };
         let mut fake = Fake {
             root: root.clone(),

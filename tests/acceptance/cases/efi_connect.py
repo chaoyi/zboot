@@ -313,11 +313,8 @@ def stage_8(console):
         'sync /run/zt-connect-arm/zboot/authorized_keys; sync /run/zt-connect-arm/zboot; '
         'umount /run/zt-connect-arm')
     setting = shlex.quote('console=ttyS0,115200 zt.case=EFI-CONNECT zt.stage=11')
-    console.must('arm-repair-cmdline', f'set -e; preview=$(zboot cmdline {ROOT} --set {setting} --dry-run --json); '
-        # The UKI carries no jq; zboot prints the token on its own line.
-        'token=$(printf "%s\\n" "$preview" | /bin/busybox sed -n '
-        '\'s/^  "token": "\\([0-9a-f]\\{32\\}\\)"$/\\1/p\'); test -n "$token"; '
-        f'zboot cmdline {ROOT} --set {setting} --confirm "$token" --json')
+    console.must('arm-repair-cmdline', f'set -e; zboot cmdline {ROOT} --set {setting} --dry-run --json > /dev/null; '
+        f'zboot cmdline {ROOT} --set {setting} --json')
     console.leave_shell()
 
 
@@ -702,7 +699,7 @@ def verdict(ev, check):
                 'installed root reviews the actual CLI reboot and exact public file')
     check.equal((applied.rc, applied.json.get('mode')), (0, 'applied'),
                 'normal installed CLI publishes the request and queues the real service-manager reboot')
-    check.equal(applied.json.get('token'), preview.json.get('token'), 'actual reboot uses the fresh reviewed token')
+    check('token' not in preview.json and 'token' not in applied.json, 'reboot --menu loses nothing and prints no token')
     order = repaired.step('reboot-success-order').out
     check.contains(order, 'ActiveState=active', 'runtime shutdown guard is active before the real reboot')
     check(re.search(r'(?m)^After=.*\bzt-connect-probe\.service\b', order) is not None,

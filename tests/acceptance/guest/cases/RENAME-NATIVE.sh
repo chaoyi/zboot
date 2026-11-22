@@ -22,13 +22,12 @@ stage_1() {
         zpool set bootfs=e2ea/move-source e2ea'
     observe before
     must preview zboot rename $SRC $DST --dry-run --json
-    rename_token=$(json .token) || fail "rename preview has no token"
     observe after-preview
     refuse existing zboot rename $SRC e2ea/plain --json
     observe after-existing
-    refuse stale-token zboot rename $SRC $DST --confirm stale-token --json
-    observe after-token
-    must rename zboot rename $SRC $DST --confirm "$rename_token" --json
+    refuse needless-confirm zboot rename $SRC $DST --confirm 00112233445566778899aabbccddeeff --json
+    observe after-confirm
+    must rename zboot rename $SRC $DST --json
     observe after
     must live-root cat /mnt/zfs-e2e/move-source/data
     must live-child cat /mnt/zfs-e2e/move-source/child/data

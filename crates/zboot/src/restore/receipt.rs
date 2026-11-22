@@ -26,15 +26,6 @@ use zfs_tools::engine::{
     native::NativeProperty,
 };
 
-const KEYS: &[&str] = &[
-    "mountpoint",
-    "readonly",
-    "canmount",
-    "volmode",
-    "zboot:placement",
-    "zboot:cmdline",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Member {
@@ -830,7 +821,6 @@ pub(super) fn validate(receipt: &Receipt, state: &State, id: &str) -> Result<()>
 }
 
 fn capture_tree(
-    backend: &mut impl Backend,
     view: &View,
     root: &str,
     suffix: &str,
@@ -845,7 +835,6 @@ fn capture_tree(
     let dataset = view
         .dataset(root)
         .ok_or_else(|| refuse("placement source disappeared"))?;
-    let received = backend.received(root, KEYS)?;
     let altroot = view
         .pool(root.split('/').next().unwrap())
         .and_then(|p| p.altroot.as_deref());
@@ -881,12 +870,7 @@ fn capture_tree(
         if let Some(mountpoint) = properties.get_mut("mountpoint") {
             mountpoint.value = super::strip_altroot(&mountpoint.value, altroot);
         }
-        let empty = BTreeMap::new();
-        let placement = ReceivePlacement::capture(
-            member.volume,
-            &properties,
-            received.get(&member.name).unwrap_or(&empty),
-        )?;
+        let placement = ReceivePlacement::capture(member.volume, &properties)?;
         let managed = member
             .properties
             .iter()
@@ -931,7 +915,6 @@ pub(super) fn capture(backend: &mut impl Backend, state: &State, id: &str) -> Re
         .ok_or_else(|| refuse("restore source boundary is malformed"))?
         .1;
     let source_tree = capture_tree(
-        backend,
         &view,
         &state.source.name,
         suffix,
@@ -963,7 +946,6 @@ pub(super) fn capture(backend: &mut impl Backend, state: &State, id: &str) -> Re
                 ))
             })?;
         let mut tree = capture_tree(
-            backend,
             &view,
             root,
             &State::suffix(id),
@@ -1008,46 +990,12 @@ mod tests {
         // Exercise capture's stream-shape invariant independently of the
         // stricter planner, which refuses a selected boundary missing any
         // current member. Later members must never get invented receipts.
-        let tree = capture_tree(&mut backend, &view, root, "old", guid, &digest).unwrap();
+        let tree = capture_tree(&view, root, "old", guid, &digest).unwrap();
         assert_eq!(
             tree.members.keys().map(String::as_str).collect::<Vec<_>>(),
             ["", "var"]
         );
         assert_eq!(tree.digest, digest);
         assert!(backend.effects.is_empty());
-    }
-
-    #[test]
-    fn new_receipts_omit_legacy_boot_markers_from_local_received_and_inherited_layers() {
-        let root = "bpool/ROOT/debian";
-        for source in ["local", "received", "inherited"] {
-            let mut backend = Fake::world();
-            match source {
-                "local" => backend
-                    .dataset_mut(root)
-                    .local
-                    .insert("zboot:be".into(), "arbitrary legacy value".into()),
-                "received" => backend
-                    .dataset_mut(root)
-                    .received
-                    .insert("zboot:be".into(), "0".into()),
-                "inherited" => backend
-                    .dataset_mut("bpool")
-                    .local
-                    .insert("zboot:be".into(), "1".into()),
-                _ => unreachable!(),
-            };
-            let view = backend.view().unwrap();
-            let digest = tree_digest(&view, root, "old");
-            let guid = view.dataset(root).unwrap().identity.guid;
-            let tree = capture_tree(&mut backend, &view, root, "old", guid, &digest).unwrap();
-            assert!(
-                tree.members
-                    .values()
-                    .all(|member| !member.managed.contains_key("zboot:be")),
-                "{source}: {tree:?}"
-            );
-            assert!(backend.effects.is_empty());
-        }
     }
 }

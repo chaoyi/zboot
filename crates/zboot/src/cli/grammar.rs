@@ -15,23 +15,24 @@ pub(crate) struct Cli {
 }
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum Verb {
-    /// Install a root tar on a disk, a new image, or an imported pool.
-    /// Disk and image targets create an ESP and pool or an empty POOL/ROOT.
-    /// --into adds a BE while preserving every boot default.
-    /// An interrupted deploy is rerun, never resumed.
-    #[command(group(clap::ArgGroup::new("deploy_target").args(["disk","image","into"]).required(true).multiple(false)))]
+    /// Install a root tar, or an empty POOL/ROOT, on a disk or a new image,
+    /// with its own ESP and pool; `deploy into POOL` adds a BE to an imported
+    /// pool. An interrupted deploy is rerun, never resumed.
+    #[command(
+        group(clap::ArgGroup::new("deploy_target").args(["disk","image"]).required(true).multiple(false)),
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        disable_help_subcommand = true
+    )]
     Deploy {
+        /// `deploy into POOL`; it takes none of the disk and image options.
+        #[command(subcommand)]
+        into: Option<DeployInto>,
         /// Whole-disk device, e.g. /dev/disk/by-id/nvme-...
         disk: Option<String>,
-        /// Create a new image file; an existing file is refused.
+        /// Create a new image file, sized to its content; an existing file is refused.
         #[arg(long, value_name = "FILE")]
         image: Option<std::path::PathBuf>,
-        /// Add a BE to an imported pool, preserving all boot defaults.
-        #[arg(long, value_name = "POOL", conflicts_with_all = ["pool", "hostid", "esp", "esp_partition", "swap", "efi", "size", "portable", "empty"])]
-        into: Option<String>,
-        /// Image size (default: content plus headroom, rounded to GiB).
-        #[arg(long,value_parser=parse_size,requires="image")]
-        size: Option<u64>,
         /// No host identity, swap or boot default; read-only root with RAM writes.
         #[arg(long,conflicts_with_all=["hostid","swap","esp_partition","empty"])]
         portable: bool,
@@ -84,8 +85,9 @@ pub(crate) enum Verb {
         /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
+        /// Proceed with the token an earlier preview of this plan printed
+        /// (DISK only: an image loses nothing).
+        #[arg(long, conflicts_with_all = ["dry_run", "image"])]
         confirm: Option<String>,
         /// Print the plan (with its token) or the outcome as JSON.
         #[arg(long)]
@@ -95,9 +97,9 @@ pub(crate) enum Verb {
     /// selected dataset trees of A; erases A after typed confirmation.
     Restore {
         /// `POOL/ROOT/BE` (snapshotted now; the running root only) or `BE@SNAP`.
-        source: Option<String>,
+        source: String,
         /// Whole-disk device of A, e.g. /dev/disk/by-id/nvme-...
-        disk: Option<String>,
+        disk: String,
         /// A dataset root on A to keep, with its descendants; repeatable.
         #[arg(long = "keep", value_name = "DATASET")]
         keep: Vec<String>,
@@ -159,9 +161,6 @@ pub(crate) enum Verb {
         /// More packages, e.g. openssh-server.
         #[arg(long, value_name = "PKG,...", value_delimiter = ',')]
         packages: Vec<String>,
-        /// Take only the OpenZFS packages from this suite.
-        #[arg(long, value_name = "SUITE")]
-        zfs_from_suite: Option<String>,
         /// Print the outcome as JSON.
         #[arg(long)]
         json: bool,
@@ -186,15 +185,6 @@ pub(crate) enum Verb {
         #[arg(long)]
         json: bool,
     },
-    /// Decode the stage timings and asset hashes carried by the last handoff.
-    Trace {
-        /// Kernel command-line file to decode.
-        #[arg(long, default_value = "/proc/cmdline")]
-        cmdline: std::path::PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-    },
     /// Rename an unpaired tree within its pool. Across pools use sync,
     /// primary, unpair --release-anchors, then drop.
     Rename {
@@ -204,9 +194,6 @@ pub(crate) enum Verb {
         /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Proceed with the token an earlier preview printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         /// Print the plan or the outcome as JSON.
         #[arg(long)]
         json: bool,
@@ -252,7 +239,7 @@ pub(crate) enum Verb {
     /// Erase an unused whole disk: NVMe sanitize where that is safe, else clear its labels, signatures and partition tables.
     Wipe {
         /// Whole-disk device path, preferably /dev/disk/by-id/...
-        disk: Option<String>,
+        disk: String,
         /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -264,8 +251,9 @@ pub(crate) enum Verb {
         json: bool,
     },
     /// Copy new snapshots one way, never overwriting the receiver's history:
-    /// a pair from its working copy, SRC into DEST (an absent DEST is created
-    /// and paired with SRC), or every imported pair.
+    /// a pair from its working copy, SRC into DEST (a primary into its
+    /// secondary, or an unpaired SRC into an absent DEST, which is created and
+    /// paired with SRC), or every imported pair.
     Sync {
         /// Pair root, or the source when DEST is given.
         #[arg(value_name = "DATASET|SRC", required_unless_present = "all")]
@@ -289,8 +277,6 @@ pub(crate) enum Verb {
         dataset: Option<String>,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -308,8 +294,6 @@ pub(crate) enum Verb {
         clear: bool,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
     },
     /// Clone a BE's snapshot, or capture the running BE and clone it, as a new BE in one pool.
     #[command(allow_missing_positional = true)]
@@ -321,8 +305,6 @@ pub(crate) enum Verb {
         destination: String,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -382,8 +364,6 @@ pub(crate) enum Verb {
         /// Show the selected ESP and key fingerprints without changing it.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -421,8 +401,6 @@ pub(crate) enum Verb {
         right: String,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -433,8 +411,6 @@ pub(crate) enum Verb {
         datasets: Vec<String>,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -454,21 +430,44 @@ pub(crate) enum Verb {
     },
 }
 
+/// The forms of `deploy` that carry their own options.
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum DeployInto {
+    /// Add a boot environment from a root tar to an imported pool. Erases
+    /// nothing and changes no boot default. An interrupted one is rerun.
+    Into(Box<IntoArgs>),
+}
+
+/// `deploy into POOL`'s own options.
+#[derive(Debug, PartialEq, Eq, clap::Args)]
+pub(crate) struct IntoArgs {
+    /// The imported pool that gets POOL/ROOT/NAME.
+    #[arg(value_name = "POOL")]
+    pub(crate) pool: String,
+    /// Root tar (`zboot factory` writes one).
+    #[arg(long, value_name = "TAR")]
+    pub(crate) tar: std::path::PathBuf,
+    /// Host overlay: `rootfs/` copied over the BE and an optional
+    /// `post-install` run in it, as a directory or tar.
+    #[arg(long, value_name = "DIR|TAR|builtin:NAME", value_parser = parse_overlay)]
+    pub(crate) overlay: Vec<std::path::PathBuf>,
+    /// BE name (default: default); an existing BE is refused.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) be: Option<String>,
+    /// The new system's /etc/hostname (default: the factory's).
+    #[arg(long, value_name = "NAME", value_parser = parse_hostname)]
+    pub(crate) hostname: Option<String>,
+    /// Show the plan and change nothing.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Print the plan or the outcome as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
 impl Cli {
     /// Parse a complete external command line, including its program name.
     pub(crate) fn parse_from_args<I, T>(args: I) -> Result<Self, clap::Error>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<std::ffi::OsString> + Clone,
-    {
-        let cli = Self::parse_for_menu(args)?;
-        cli.validate_complete()?;
-        Ok(cli)
-    }
-
-    /// Parse the same argv grammar, including its program name, allowing the
-    /// menu to fill omitted restore/wipe operands with its identity-bound pickers.
-    pub(crate) fn parse_for_menu<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -479,53 +478,19 @@ impl Cli {
         Ok(cli)
     }
 
-    /// Check the final command after any menu pickers have supplied operands.
-    pub(crate) fn validate_complete(&self) -> Result<(), clap::Error> {
-        self.validate()?;
-        let missing = match &self.command {
-            Verb::Restore {
-                source: None,
-                disk: None,
-                ..
-            } => Some("restore requires SOURCE and DISK"),
-            Verb::Restore { source: None, .. } => Some("restore requires SOURCE"),
-            Verb::Restore { disk: None, .. } => Some("restore requires DISK"),
-            Verb::Wipe { disk: None, .. } => Some("wipe requires DISK"),
-            _ => None,
-        };
-        match missing {
-            Some(message) => Err(super::help::command()
-                .error(clap::error::ErrorKind::MissingRequiredArgument, message)),
-            None => Ok(()),
-        }
-    }
-
     pub(crate) fn validate(&self) -> Result<(), clap::Error> {
         let message = match &self.command {
-            // Clap's required target group can satisfy the image dependency
-            // through its disk alternative; keep this relation semantic too.
-            Verb::Deploy {
-                image: None,
-                size: Some(_),
-                ..
-            } => Some("deploy --size requires --image"),
             Verb::Default {
                 dataset: None,
-                dry_run,
-                confirm,
+                dry_run: true,
                 ..
-            } if *dry_run || confirm.is_some() => {
-                Some("default --dry-run and --confirm require a BE to change")
-            }
+            } => Some("default --dry-run requires a BE to change"),
             Verb::Cmdline {
                 set: None,
                 clear: false,
-                dry_run,
-                confirm,
+                dry_run: true,
                 ..
-            } if *dry_run || confirm.is_some() => {
-                Some("cmdline --dry-run and --confirm require --set or --clear")
-            }
+            } => Some("cmdline --dry-run requires --set or --clear"),
             Verb::Fork {
                 snapshot: Some(source),
                 ..
@@ -585,7 +550,7 @@ impl Verb {
                 ..
             } => source.iter_mut().chain(destination.iter_mut()).collect(),
             Self::Restore { source, keep, .. } => {
-                source.iter_mut().chain(keep.iter_mut()).collect()
+                std::iter::once(source).chain(keep.iter_mut()).collect()
             }
             Self::Deploy { .. }
             | Self::Resume { .. }
@@ -593,7 +558,6 @@ impl Verb {
             | Self::Factory { .. }
             | Self::FactoryFinish { .. }
             | Self::Esp { .. }
-            | Self::Trace { .. }
             | Self::Wipe { .. }
             | Self::Reboot { .. }
             | Self::Menu { .. } => Vec::new(),
@@ -663,10 +627,6 @@ mod tests {
         Cli::parse_from_args(std::iter::once("zboot").chain(args.iter().copied()))
     }
 
-    fn parse_menu(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::parse_for_menu(std::iter::once("zboot").chain(args.iter().copied()))
-    }
-
     #[test]
     fn reboot_menu_requires_menu_and_accepts_normal_preview_options() {
         let cli = Cli::parse_from_args([
@@ -699,53 +659,11 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-        assert!(
-            Cli::parse_from_args([
-                "zboot",
-                "reboot",
-                "--menu",
-                "--dry-run",
-                "--confirm",
-                "token"
-            ])
-            .is_err()
-        );
+        assert!(Cli::parse_from_args(["zboot", "reboot", "--menu", "--confirm", "token"]).is_err());
     }
 
     #[test]
-    fn a_menu_line_and_a_command_line_parse_to_the_same_command() {
-        for args in [
-            &["status", "a/ROOT/be", "--json"][..],
-            &["boot"],
-            &[
-                "boot",
-                "a/ROOT/be",
-                "--kernel",
-                "6.12.1-amd64",
-                "--json",
-                "-v",
-            ],
-            &["menu", "--no-autoboot"],
-            &[
-                "restore",
-                "b/ROOT/be@s",
-                "/dev/disk",
-                "--keep",
-                "a/home",
-                "--dry-run",
-            ],
-            &["wipe", "/dev/disk", "--confirm", "token"],
-            &["resume"],
-            &["abandon", "operation"],
-            &["cmdline", "a/ROOT/be", "--set", "console=ttyS0 d1 3"],
-            &["chroot", "a/ROOT/be", "--", "printf", "%s", "d1"],
-        ] {
-            assert_eq!(parse(args).unwrap(), parse_menu(args).unwrap(), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn only_menu_parsing_allows_picker_operands_to_be_omitted() {
+    fn restore_and_wipe_require_their_operands() {
         for args in [
             &["restore"][..],
             &["restore", "b/ROOT/be@s"],
@@ -753,46 +671,14 @@ mod tests {
             &["wipe"],
             &["wipe", "--confirm", "token"],
         ] {
-            let mut cli = parse_menu(args).unwrap();
-            for error in [
-                parse(args).unwrap_err(),
-                cli.validate_complete().unwrap_err(),
-            ] {
-                assert_eq!(
-                    error.kind(),
-                    clap::error::ErrorKind::MissingRequiredArgument,
-                    "{args:?}: {error}"
-                );
-                assert_eq!(error.exit_code(), 2);
-            }
-            match &mut cli.command {
-                Verb::Restore { source, disk, .. } => {
-                    *source = Some("b/ROOT/be@s".into());
-                    *disk = Some("/dev/disk".into());
-                }
-                Verb::Wipe { disk, .. } => *disk = Some("/dev/disk".into()),
-                _ => panic!("unexpected picker fixture"),
-            }
-            cli.validate_complete().unwrap();
+            let error = parse(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}: {error}"
+            );
+            assert_eq!(error.exit_code(), 2);
         }
-        let mut cli = parse_menu(&["restore"]).unwrap();
-        let Verb::Restore { disk, .. } = &mut cli.command else {
-            unreachable!()
-        };
-        *disk = Some("/dev/disk".into());
-        let error = cli.validate_complete().unwrap_err();
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(
-            error.to_string().contains("restore requires SOURCE"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn menu_parsing_keeps_syntax_and_semantic_usage_errors() {
         for args in [
             &["restore", "--dry-run", "--confirm", "token"][..],
             &["wipe", "--dry-run", "--confirm", "token"],
@@ -806,9 +692,7 @@ mod tests {
             &["menu", "--json"],
             &["menu", "--debug"],
         ] {
-            for error in [parse(args).unwrap_err(), parse_menu(args).unwrap_err()] {
-                assert_eq!(error.exit_code(), 2, "{args:?}: {error}");
-            }
+            assert_eq!(parse(args).unwrap_err().exit_code(), 2, "{args:?}");
         }
     }
 
@@ -842,26 +726,24 @@ mod tests {
             "--overlay",
             "/access",
         ];
-        for parsed in [parse(&ram), parse_menu(&ram)] {
-            let Verb::Boot {
-                dataset: None,
-                kernel: None,
-                tar: Some(tar),
-                overlay,
-                json: false,
-            } = parsed.unwrap().command
-            else {
-                panic!("boot --tar did not parse as a RAM boot");
-            };
-            assert_eq!(tar, std::path::Path::new("-"));
-            assert_eq!(
-                overlay,
-                [
-                    std::path::PathBuf::from("builtin:rescue"),
-                    std::path::PathBuf::from("/access")
-                ]
-            );
-        }
+        let Verb::Boot {
+            dataset: None,
+            kernel: None,
+            tar: Some(tar),
+            overlay,
+            json: false,
+        } = parse(&ram).unwrap().command
+        else {
+            panic!("boot --tar did not parse as a RAM boot");
+        };
+        assert_eq!(tar, std::path::Path::new("-"));
+        assert_eq!(
+            overlay,
+            [
+                std::path::PathBuf::from("builtin:rescue"),
+                std::path::PathBuf::from("/access")
+            ]
+        );
         assert!(matches!(
             parse(&["menu"]).unwrap().command,
             Verb::Menu { no_autoboot: false }
@@ -888,7 +770,6 @@ mod tests {
             &["boot", "--tar", "/root.tar", "--overlay", "builtin:base"],
         ] {
             assert_eq!(parse(args).unwrap_err().exit_code(), 2, "{args:?}");
-            assert_eq!(parse_menu(args).unwrap_err().exit_code(), 2, "{args:?}");
         }
     }
 
@@ -985,13 +866,26 @@ mod tests {
                 ],
                 &[],
             ),
+            (
+                &[
+                    "deploy",
+                    "into",
+                    "work",
+                    "--tar",
+                    "/input/root.tar",
+                    "--be",
+                    "work",
+                    "--overlay",
+                    "work",
+                ],
+                &[],
+            ),
             (&["resume", "work", "--confirm", "token"], &[]),
             (&["abandon", "work", "--confirm", "token"], &[]),
             (&["wipe", "/dev/disk"], &[]),
             (&["esp", "/dev/esp", "--efi", "/input/recovery.efi"], &[]),
             (&["factory", "/output/root.tar"], &[]),
             (&["factory-finish", "/private/root", "/private/stage"], &[]),
-            (&["trace", "--cmdline", "/input/cmdline"], &[]),
             (
                 &["boot", "work", "--kernel", "6.12-work", "--json"],
                 &["rpool/ROOT/work"],
@@ -1019,10 +913,11 @@ mod tests {
                     set: Some(value), ..
                 } => assert_eq!(value, "work@day"),
                 Verb::Restore { disk, pool, .. } => {
-                    assert_eq!(disk.as_deref(), Some("/dev/disk"));
+                    assert_eq!(disk, "/dev/disk");
                     assert_eq!(pool.as_deref(), Some("work"));
                 }
                 Verb::Deploy {
+                    into: None,
                     disk,
                     tar,
                     efi,
@@ -1044,11 +939,20 @@ mod tests {
                     assert_eq!(be.as_deref(), Some("work"));
                     assert_eq!(esp_partition.as_deref(), Some("/dev/esp"));
                 }
+                Verb::Deploy {
+                    into: Some(DeployInto::Into(into)),
+                    ..
+                } => {
+                    assert_eq!(into.pool, "work");
+                    assert_eq!(into.tar, std::path::Path::new("/input/root.tar"));
+                    assert_eq!(into.overlay, [std::path::PathBuf::from("work")]);
+                    assert_eq!(into.be.as_deref(), Some("work"));
+                }
                 Verb::Resume { id, confirm, .. } | Verb::Abandon { id, confirm, .. } => {
                     assert_eq!(id.as_deref(), Some("work"));
                     assert_eq!(confirm.as_deref(), Some("token"));
                 }
-                Verb::Wipe { disk, .. } => assert_eq!(disk.as_deref(), Some("/dev/disk")),
+                Verb::Wipe { disk, .. } => assert_eq!(disk, "/dev/disk"),
                 Verb::Esp {
                     partitions, efi, ..
                 } => {
@@ -1098,17 +1002,18 @@ mod tests {
                 &["pair", "a", "b"],
             ),
             (&["default", "--dry-run"], &["default", "a", "--dry-run"]),
-            (
-                &["default", "--confirm", "t"],
-                &["default", "a", "--confirm", "t"],
-            ),
+            (&["default", "a", "--confirm", "t"], &["default", "a"]),
             (
                 &["cmdline", "--dry-run"],
                 &["cmdline", "--set", "quiet", "--dry-run"],
             ),
             (
-                &["cmdline", "a", "--confirm", "t"],
                 &["cmdline", "a", "--clear", "--confirm", "t"],
+                &["cmdline", "a", "--clear"],
+            ),
+            (
+                &["deploy", "--image", "/new.img", "--empty", "--confirm", "t"],
+                &["deploy", "/dev/sdz", "--empty", "--confirm", "t"],
             ),
         ];
         for (invalid, valid) in cases {
@@ -1124,23 +1029,18 @@ mod tests {
         assert!(parse(&["snapshot", "@x"]).is_ok());
     }
 
-    fn changing_forms() -> Vec<Vec<&'static str>> {
+    /// The verbs whose plan can lose data, always or in some cases.
+    fn loss_capable_forms() -> Vec<Vec<&'static str>> {
         vec![
-            vec!["snapshot"],
-            vec!["fork", "next"],
-            vec!["default", "a"],
-            vec!["cmdline", "a", "--set", "quiet"],
-            vec!["cmdline", "a", "--clear"],
-            vec!["rename", "a", "b"],
             vec!["rollback", "a@x"],
             vec!["drop", "a"],
-            vec!["pair", "a", "b"],
             vec!["sync", "a"],
             vec!["sync", "a", "b"],
             vec!["sync", "--all"],
             vec!["primary", "a"],
             vec!["unpair", "a"],
             vec!["deploy", "/dev/sdz", "--empty"],
+            vec!["esp"],
             vec!["esp", "/dev/sdz1"],
             vec!["wipe", "/dev/sdz"],
             vec!["restore", "a@x", "/dev/sdz"],
@@ -1149,9 +1049,25 @@ mod tests {
         ]
     }
 
+    /// The changing verbs that cannot lose data.
+    fn lossless_forms() -> Vec<Vec<&'static str>> {
+        vec![
+            vec!["snapshot"],
+            vec!["fork", "next"],
+            vec!["default", "a"],
+            vec!["cmdline", "a", "--set", "quiet"],
+            vec!["cmdline", "a", "--clear"],
+            vec!["rename", "a", "b"],
+            vec!["pair", "a", "b"],
+            vec!["reboot", "--menu"],
+            vec!["deploy", "--image", "/new.img", "--empty"],
+            vec!["deploy", "into", "pool", "--tar", "/root.tar"],
+        ]
+    }
+
     #[test]
-    fn every_changing_verb_takes_dry_run_and_confirm() {
-        for args in changing_forms() {
+    fn only_loss_capable_verbs_take_confirm_and_every_changing_verb_takes_dry_run() {
+        for args in loss_capable_forms() {
             for flags in [&["--dry-run"][..], &["--confirm", "token"]] {
                 let command = [args.as_slice(), flags].concat();
                 assert!(parse(&command).is_ok(), "{command:?}");
@@ -1162,6 +1078,12 @@ mod tests {
                 2,
                 "{conflicting:?}"
             );
+        }
+        for args in lossless_forms() {
+            let command = [args.as_slice(), &["--dry-run"]].concat();
+            assert!(parse(&command).is_ok(), "{command:?}");
+            let command = [args.as_slice(), &["--confirm", "token"]].concat();
+            assert_eq!(parse(&command).err().unwrap().exit_code(), 2, "{command:?}");
         }
         for args in [
             &["factory", "/root.tar", "--dry-run"][..],
@@ -1258,13 +1180,12 @@ mod tests {
                 "20261108T022935Z",
                 "--packages",
                 "openssh-server,vim",
-                "--zfs-from-suite",
-                "sid",
                 "--json"
             ])
             .is_ok()
         );
         assert!(parse(&["factory"]).is_err());
+        assert!(parse(&["factory", "/root.tar.zst", "--zfs-from-suite", "sid"]).is_err());
         assert!(parse(&["factory-finish", "/root", "/stage"]).is_ok());
         assert!(parse(&["factory-finish", "/root"]).is_err());
     }
@@ -1277,8 +1198,6 @@ mod tests {
                 "deploy",
                 "--image",
                 "/new.img",
-                "--size",
-                "8G",
                 "--tar",
                 "/root.tar",
                 "--portable",
@@ -1295,6 +1214,8 @@ mod tests {
             vec!["deploy", "--empty"],
             vec!["deploy", "/dev/sdz", "--image", "/new.img", "--empty"],
             vec!["deploy", "/dev/sdz", "--empty", "--size", "8G"],
+            vec!["deploy", "--image", "/new.img", "--empty", "--size", "8G"],
+            vec!["deploy", "--into", "pool", "--tar", "/root.tar"],
             vec![
                 "deploy",
                 "--image",
@@ -1424,7 +1345,7 @@ mod tests {
         for args in [
             &["fork", "next"][..],
             &["fork", "next", "--dry-run"],
-            &["fork", "--confirm", "t", "next"],
+            &["fork", "--json", "next"],
         ] {
             let Verb::Fork {
                 snapshot,
@@ -1581,7 +1502,6 @@ mod tests {
             ("ARGS", "quiet"),
             ("SIZE", "512M"),
             ("TIME", "20261108T022935Z"),
-            ("SUITE", "sid"),
             ("URL", "https://deb.example"),
             ("TAR", "/root.tar.zst"),
             ("PKG", "openssh-server"),
@@ -1598,10 +1518,10 @@ mod tests {
     }
 
     #[test]
-    fn deploy_into_uses_only_its_documented_options() {
+    fn deploy_into_takes_only_its_own_options() {
         let cli = parse(&[
             "deploy",
-            "--into",
+            "into",
             "pool",
             "--tar",
             "/root.tar",
@@ -1617,7 +1537,24 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Verb::Deploy { into: Some(ref pool), .. } if pool == "pool"));
+        let Verb::Deploy {
+            into: Some(DeployInto::Into(into)),
+            disk: None,
+            image: None,
+            ..
+        } = cli.command
+        else {
+            panic!("deploy into did not parse as its subcommand");
+        };
+        assert_eq!(
+            (
+                into.pool.as_str(),
+                into.overlay.len(),
+                into.dry_run,
+                into.json
+            ),
+            ("pool", 2, true, true)
+        );
         for extra in [
             vec!["/dev/sdz"],
             vec!["--image", "/new.raw"],
@@ -1629,69 +1566,44 @@ mod tests {
             vec!["--esp", "1G"],
             vec!["--esp-partition", "/dev/sda1"],
             vec!["--swap", "1G"],
-            vec!["--size", "4G"],
+            vec!["--confirm", "token"],
+            vec!["--overlay", "builtin:unknown"],
+            vec!["--hostname", "bad host"],
         ] {
-            let mut args = vec!["deploy", "--into", "pool", "--tar", "/root.tar"];
+            let mut args = vec!["deploy", "into", "pool", "--tar", "/root.tar"];
             args.extend(extra);
             assert!(parse(&args).is_err(), "{args:?}");
         }
-        assert!(parse(&["deploy", "--into", "pool"]).is_err());
-    }
-
-    fn deploy_option_table() -> Vec<(String, [bool; 5])> {
-        let mut rows = include_str!("../../../../docs/CLI.md")
-            .lines()
-            .skip_while(|line| {
-                !line.starts_with("| Option | Default | `DISK` | `--image` | `--into` |")
-            });
-        assert!(
-            rows.next().is_some(),
-            "the documented deploy option table exists"
+        assert!(parse(&["deploy", "into", "pool"]).is_err());
+        assert!(parse(&["deploy", "into", "--tar", "/root.tar"]).is_err());
+        // Options of the disk and image forms do not reach `into`, before or
+        // after it, and the old spelling is gone.
+        for args in [
+            &["deploy", "--empty", "into", "pool", "--tar", "/root.tar"][..],
+            &["deploy", "--json", "into", "pool", "--tar", "/root.tar"],
+            &["deploy", "/dev/sdz", "into", "pool", "--tar", "/root.tar"],
+            &["deploy", "--into", "pool", "--tar", "/root.tar"],
+            &["install", "pool", "--tar", "/root.tar"],
+        ] {
+            assert_eq!(parse(args).unwrap_err().exit_code(), 2, "{args:?}");
+        }
+        // A disk path is never the subcommand.
+        assert!(matches!(
+            parse(&["deploy", "/dev/disk/by-id/into", "--empty"]).unwrap().command,
+            Verb::Deploy { into: None, disk: Some(ref disk), .. } if disk == "/dev/disk/by-id/into"
+        ));
+        assert_eq!(
+            parse(&["deploy", "--empty"]).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
-        rows.next().expect("table separator");
-        let mut rules = Vec::new();
-        for row in rows.take_while(|line| line.starts_with('|')) {
-            let cells: Vec<_> = row.trim_matches('|').split('|').map(str::trim).collect();
-            assert_eq!(cells.len(), 7, "{row}");
-            let allowed = std::array::from_fn(|index| cells[index + 2] != "-");
-            for option in cells[0].split('`').skip(1).step_by(2) {
-                let flag = option.split_whitespace().next().unwrap();
-                assert!(flag.starts_with("--"), "{row}");
-                rules.push((flag.to_owned(), allowed));
-            }
-        }
-        assert_eq!(rules.len(), 12, "every documented option has a rule");
-        rules
-    }
-
-    fn documented_deploy_combination(args: &[String], rules: &[(String, [bool; 5])]) -> bool {
-        if args.get(1).is_none_or(|verb| verb != "deploy") {
-            return true;
-        }
-        let has = |flag: &str| args.iter().any(|arg| arg == flag);
-        let target = if has("--into") {
-            2
-        } else {
-            usize::from(has("--image"))
-        };
-        rules.iter().all(|(flag, allowed)| {
-            !has(flag)
-                || (allowed[target]
-                    && (!has("--portable") || allowed[3])
-                    && (!has("--empty") || allowed[4]))
-        })
     }
 
     #[test]
     fn every_cli_md_synopsis_parses() {
         let mut parsed_synopses = 0;
         let mut parsed_lines = 0;
-        let deploy_rules = deploy_option_table();
-        let mut refused_deploy_combinations = 0;
         let mut delivered_deploy_forms = std::collections::BTreeSet::new();
         let mut delivered_deploy_options = std::collections::BTreeSet::new();
-        let mut delivered_disk_tar = false;
-        let mut delivered_disk_empty = false;
         for synopsis in synopses() {
             if synopsis.starts_with("zboot VERB ") {
                 continue;
@@ -1714,66 +1626,50 @@ mod tests {
                 {
                     continue;
                 }
-                // The consolidated synopsis shares an option tail. The table
-                // supplies the documented target/content restrictions.
-                if !documented_deploy_combination(&args, &deploy_rules) {
-                    assert!(
-                        Cli::parse_from_args(args.iter().map(String::as_str)).is_err(),
-                        "documented invalid combination must refuse: {args:?}"
-                    );
-                    refused_deploy_combinations += 1;
-                    continue;
-                }
                 let refs: Vec<_> = args.iter().map(String::as_str).collect();
                 assert!(
                     Cli::parse_from_args(refs.iter().copied()).is_ok(),
                     "{synopsis}\n  {refs:?}"
                 );
-                if args.get(1).is_some_and(|verb| verb == "deploy") {
+                if args.get(1).is_some_and(|verb| verb == "deploy")
+                    && args.get(2).is_some_and(|form| form == "into")
+                {
+                    delivered_deploy_forms.insert("into");
+                } else if args.get(1).is_some_and(|verb| verb == "deploy") {
                     let has = |flag: &str| args.iter().any(|arg| arg == flag);
-                    let form = match (has("--into"), has("--image"), has("--empty")) {
-                        (true, _, _) => "into-tar",
-                        (_, true, true) => "image-empty",
-                        (_, true, false) => "image-tar",
-                        (_, _, true) => "disk-empty",
-                        _ => "disk-tar",
+                    let form = match (has("--image"), has("--empty")) {
+                        (true, true) => "image-empty",
+                        (true, false) => "image-tar",
+                        (false, true) => "disk-empty",
+                        (false, false) => "disk-tar",
                     };
                     delivered_deploy_forms.insert(form);
                     if has("--portable") {
                         delivered_deploy_forms.insert("portable-tar");
                     }
-                }
-                if args.get(1).is_some_and(|verb| verb == "deploy")
-                    && args.get(2).is_some_and(|target| target == "/dev/sdz")
-                {
-                    delivered_disk_tar |= args.iter().any(|arg| arg == "--tar");
-                    delivered_disk_empty |= args.iter().any(|arg| arg == "--empty");
-                    delivered_deploy_options
-                        .extend(args.iter().filter(|arg| arg.starts_with("--")).cloned());
+                    if !has("--image") {
+                        delivered_deploy_options
+                            .extend(args.iter().filter(|arg| arg.starts_with("--")).cloned());
+                    }
                 }
                 parsed_this_synopsis = true;
                 parsed_lines += 1;
             }
             parsed_synopses += usize::from(parsed_this_synopsis);
         }
-        assert!(refused_deploy_combinations > 0);
         for form in [
             "disk-tar",
             "disk-empty",
             "image-tar",
             "image-empty",
-            "into-tar",
             "portable-tar",
+            "into",
         ] {
             assert!(
                 delivered_deploy_forms.contains(form),
                 "documented {form} parses"
             );
         }
-        assert!(
-            delivered_disk_tar && delivered_disk_empty,
-            "both delivered DISK forms parse"
-        );
         for flag in [
             "--tar",
             "--empty",

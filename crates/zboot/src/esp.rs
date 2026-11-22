@@ -1,8 +1,9 @@
 //! zboot's loader files on an existing GPT/FAT ESP; formatting belongs to
-//! deploy. zboot owns the firmware fallback `EFI/BOOT/BOOTX64.EFI` and the
-//! files directly in `EFI/zboot/` that are its own UKIs, and nothing else on
-//! an ESP: no other directory is read for loaders, and subdirectories of
-//! `EFI/zboot/` (such as an old `operations/`) are ignored.
+//! deploy. zboot writes exactly two paths on an ESP, `EFI/zboot/zboot.efi`
+//! and the firmware fallback `EFI/BOOT/BOOTX64.EFI`, and nothing else. Its
+//! own UKIs under other names directly in `EFI/zboot/`, which earlier builds
+//! refreshed in place, are reported as stale and left alone. The kernel's
+//! vfat driver matches names without regard to case.
 use crate::{
     device::{self, PartitionIdentity},
     loader::EfiFile,
@@ -19,13 +20,14 @@ use std::{
 };
 
 use crate::deploy::layout::ESP_TYPE;
-/// zboot's directory: each of its own UKIs directly in it is refreshed under
-/// its existing name, because firmware entries point at those names.
+/// zboot's directory. Its own UKIs there under other names are stale.
 const DIRECTORY: &str = "EFI/zboot";
-/// The name an install writes in [`DIRECTORY`].
+/// The name firmware entries point at.
 const CANONICAL: &str = "EFI/zboot/zboot.efi";
 /// The firmware's default path, which boots a disk without a boot entry.
 const FALLBACK: &str = "EFI/BOOT/BOOTX64.EFI";
+/// zboot's two paths, as findings list them.
+const PATHS: [&str; 2] = [CANONICAL, FALLBACK];
 /// The ESP review's schema, as its JSON reports it.
 const SCHEMA: u32 = 4;
 const MIB: u64 = 1024 * 1024;
@@ -205,54 +207,10 @@ fn checked(root: &Path, relative: &str, create: bool) -> std::io::Result<PathBuf
     }
     Ok(path)
 }
-/// The on-disk spelling of the ESP path PATH. Each name is matched without
-/// regard to ASCII case, as FAT does; from the first name that is missing
-/// on, PATH's own spelling is kept.
-fn locate(root: &Path, path: &str) -> std::io::Result<String> {
-    let mut parent = Some(root.to_path_buf());
-    let mut names = Vec::new();
-    for name in path.split('/') {
-        let found = match &parent {
-            Some(directory) => matching_entry(directory, name, path)?,
-            None => None,
-        };
-        parent = parent
-            .zip(found.as_ref())
-            .map(|(dir, found)| dir.join(found));
-        names.push(found.unwrap_or_else(|| name.to_owned()));
-    }
-    Ok(names.join("/"))
-}
-fn matching_entry(directory: &Path, name: &str, path: &str) -> std::io::Result<Option<String>> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        // `checked` refuses an ancestor that is not a directory.
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let mut found = None;
-    for entry in entries {
-        let entry = entry?.file_name();
-        if entry
-            .to_str()
-            .is_some_and(|entry| entry.eq_ignore_ascii_case(name))
-        {
-            if found.is_some() {
-                return Err(refuse(format!(
-                    "{path}: more than one ESP entry is spelled {name}"
-                )));
-            }
-            found = entry.into_string().ok();
-        }
-    }
-    Ok(found)
-}
 /// The regular file at the ESP path PATH, opened without following a link,
 /// or `None` when nothing is there.
 fn open_existing(root: &Path, path: &str) -> std::io::Result<Option<File>> {
-    let path = match checked(root, &locate(root, path)?, false) {
+    let path = match checked(root, path, false) {
         Ok(path) => path,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -281,105 +239,62 @@ fn identity(root: &Path, path: &str) -> std::io::Result<Option<FileIdentity>> {
     let (sha256, bytes) = crate::loader::hash(&mut file)?;
     Ok(Some(FileIdentity { sha256, bytes }))
 }
-fn fixed(path: &str) -> bool {
-    path.eq_ignore_ascii_case(CANONICAL) || path.eq_ignore_ascii_case(FALLBACK)
-}
-/// Whose file the ESP path PATH holds, with its bytes when it is zboot's or
-/// at the canonical name or fallback; `None` when nothing is there. Another
-/// system's file elsewhere in [`DIRECTORY`] is classified, never hashed.
-fn examine(
-    root: &Path,
-    path: &str,
-) -> std::io::Result<Option<(LoaderOwner, Option<FileIdentity>)>> {
+/// Whose file the ESP path PATH holds, with its bytes; `None` when nothing
+/// is there.
+fn examine(root: &Path, path: &str) -> std::io::Result<Option<(LoaderOwner, FileIdentity)>> {
     let Some(mut file) = open_existing(root, path)? else {
         return Ok(None);
     };
     let before = file.metadata()?;
     let owner = loader_owner(&mut file)?;
-    if owner != LoaderOwner::Zboot && !fixed(path) {
-        return Ok(Some((owner, None)));
-    }
     let (sha256, bytes) = crate::loader::hash(&mut file)?;
     if !crate::loader::stable(&before, &file.metadata()?) {
         return Err(refuse("ESP loader changed while it was read"));
     }
-    Ok(Some((owner, Some(FileIdentity { sha256, bytes }))))
+    Ok(Some((owner, FileIdentity { sha256, bytes })))
 }
-/// Every path that may be zboot's: each regular file directly in
-/// [`DIRECTORY`] under its on-disk name, the canonical name and the fallback.
-/// Subdirectories and this module's interrupted temporaries are skipped.
-fn candidates(root: &Path) -> std::io::Result<Vec<String>> {
-    let mut paths = Vec::new();
-    let directory = match checked(root, &format!("{}/entry", locate(root, DIRECTORY)?), false) {
-        Ok(entry) => Some(entry.parent().unwrap().to_path_buf()),
-        Err(error) if error.kind() == ErrorKind::NotFound => None,
+/// zboot's own UKIs directly in [`DIRECTORY`] under any name but
+/// `zboot.efi`: names earlier builds refreshed in place. zboot no longer
+/// writes them, so a firmware entry still pointed at one boots an old
+/// loader. Subdirectories, other systems' files and staged copies `atomic`
+/// left behind are not reported.
+fn stale_at(root: &Path) -> std::io::Result<Vec<String>> {
+    let directory = match checked(root, CANONICAL, false) {
+        Ok(path) => path.parent().unwrap().to_path_buf(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let entries = match directory.as_deref().map(fs::read_dir) {
-        Some(Ok(entries)) => Some(entries),
-        None => None,
-        Some(Err(error)) if error.kind() == ErrorKind::NotFound => None,
-        Some(Err(error)) => return Err(error),
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    for entry in entries.into_iter().flatten() {
+    let mut stale = Vec::new();
+    for entry in entries {
         let entry = entry?;
-        if paths.len() >= 1024 {
-            return Err(refuse(format!("{DIRECTORY} holds more than 1024 entries")));
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| refuse(format!("a file name in {DIRECTORY} is not UTF-8")))?;
-        if entry.file_type()?.is_dir() || atomic_temporary(&name) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        if lower == "zboot.efi"
+            || lower.starts_with(".zboot-") && lower.ends_with(".tmp")
+            || !entry.file_type()?.is_file()
+        {
             continue;
         }
-        paths.push(format!("{DIRECTORY}/{name}"));
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(entry.path())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(refuse(format!("{DIRECTORY}/{name}: {error}"))),
+        };
+        if file.metadata()?.is_file() && loader_owner(&mut file)? == LoaderOwner::Zboot {
+            stale.push(format!("{DIRECTORY}/{name}"));
+        }
     }
-    if !paths
-        .iter()
-        .any(|path| path.eq_ignore_ascii_case(CANONICAL))
-    {
-        paths.push(CANONICAL.into());
-    }
-    paths.sort();
-    paths.push(FALLBACK.into());
-    let mut spellings = std::collections::BTreeSet::new();
-    if paths
-        .iter()
-        .any(|path| !spellings.insert(path.to_ascii_lowercase()))
-    {
-        return Err(refuse("ESP loader names differ only in case"));
-    }
-    Ok(paths)
-}
-/// A path an ESP review may write: the fallback or one file directly in
-/// [`DIRECTORY`].
-fn owned_path(path: &str) -> bool {
-    path == FALLBACK
-        || path
-            .strip_prefix(DIRECTORY)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some_and(|name| {
-                !matches!(name, "" | "." | "..")
-                    && name.len() <= 255
-                    && !name.contains('/')
-                    && !atomic_temporary(name)
-            })
-}
-/// A staged copy `atomic` left behind when it was cut off; never a loader.
-fn atomic_temporary(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let Some(value) = name
-        .strip_prefix(".zboot-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    uuid::Uuid::parse_str(value).is_ok_and(|id| {
-        id.to_string() == value
-            && id.get_version_num() == 4
-            && id.get_variant() == uuid::Variant::RFC4122
-    })
+    stale.sort();
+    Ok(stale)
 }
 fn token(review: &EspReview) -> std::io::Result<String> {
     let mut clean = review.clone();
@@ -408,34 +323,12 @@ fn review(
     review.loss_token = token(&review)?;
     Ok(review)
 }
-/// External deployment preserves every loader owned by another system.
-/// Foreign loader conflicts require preservation or a different destination.
-pub fn refuse_foreign_deploy_loaders(partition: &str) -> std::io::Result<()> {
-    let target = device::observe_partition(partition).map_err(refuse)?;
-    mounted(&target, false, refuse_foreign_deploy_at)
-}
-fn refuse_foreign_deploy_at(root: &Path) -> std::io::Result<()> {
-    refuse_foreign(&findings(root).map_err(|error| refuse(format!("external ESP {error}")))?)
-}
-/// Deploy never replaces another system's file at the canonical name or
-/// fallback, the only foreign files findings hold.
-fn refuse_foreign(found: &[Finding]) -> std::io::Result<()> {
-    if let Some(file) = found
-        .iter()
-        .find(|file| file.identity.is_some() && !file.owned)
-    {
-        return Err(refuse(format!(
-            "external ESP loader {} belongs to another system. Preserve that loader and choose another ESP for deployment",
-            file.path
-        )));
-    }
-    Ok(())
-}
-
-/// Compose a deploy child from a reviewed standalone UKI. It writes what
-/// `esp PART` writes, except that it keeps the fallback unless
-/// REPLACE_FALLBACK, and it refuses another system's file at either fixed
-/// path in the same observation that binds the write set.
+/// Deploy's write of LOADER on the ESP at PARTITION: `EFI/zboot/zboot.efi`,
+/// and the fallback only when REPLACE_FALLBACK. Deploy's own new ESP takes
+/// both; an existing ESP on another disk (`--esp-partition`) keeps its
+/// fallback. Another system's file at either path is refused in the same
+/// observation that binds the write set; `esp PART` replaces one after a
+/// typed answer.
 pub fn plan_loader(
     partition: &str,
     loader: &EfiFile,
@@ -462,14 +355,22 @@ fn deploy_review(
     available: u64,
 ) -> std::io::Result<EspReview> {
     let found = findings(root)?;
-    refuse_foreign(&found)?;
-    let mut previous = write_paths(&found, true);
-    if !replace_fallback {
-        previous.remove(FALLBACK);
+    if let Some(file) = found
+        .iter()
+        .find(|file| file.identity.is_some() && !file.owned)
+    {
+        return Err(refuse(format!(
+            "ESP loader {} belongs to another system. Preserve that loader and choose another ESP for deployment",
+            file.path
+        )));
     }
+    let previous = found
+        .into_iter()
+        .filter(|file| replace_fallback || file.path != FALLBACK)
+        .map(|file| (file.path, file.identity))
+        .collect();
     review(target, loader.clone(), previous, available)
 }
-
 /// Verify the physical partition identity without checking file preimages.
 pub fn verify_target(review: &EspReview) -> std::io::Result<()> {
     current(&review.target)
@@ -501,13 +402,11 @@ pub fn inspect_reviewed(
 }
 pub(crate) fn validate_review(review: &EspReview) -> std::io::Result<()> {
     review.artifacts.validate()?;
-    let mut spellings = std::collections::BTreeSet::new();
     if review.previous.is_empty()
-        || review.previous.len() > 1025
         || review
             .previous
             .keys()
-            .any(|path| !owned_path(path) || !spellings.insert(path.to_ascii_lowercase()))
+            .any(|path| !PATHS.contains(&path.as_str()))
         || token(review)? != review.loss_token
     {
         return Err(refuse("invalid ESP review"));
@@ -535,6 +434,10 @@ pub struct Loader {
     pub matches_installed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// One of zboot's own UKIs under another name in `EFI/zboot/`, which
+    /// zboot no longer refreshes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 pub struct LoaderInventory {
@@ -542,35 +445,41 @@ pub struct LoaderInventory {
     pub loaders: Vec<Loader>,
 }
 
-/// zboot's files directly in [`DIRECTORY`], the canonical name and the
-/// fallback, each present or not. Another system's file elsewhere in the
-/// directory is not reported. Comparison applies only to zboot's files.
+/// zboot's two paths, each present or not, then its stale loaders.
+/// Comparison applies only to zboot's files at its two paths.
 fn loaders_at(root: &Path, installed: Option<&FileIdentity>) -> std::io::Result<Vec<Loader>> {
     let mut loaders = Vec::new();
-    for path in candidates(root)? {
+    for path in PATHS {
         let mut loader = Loader {
-            path,
+            path: path.into(),
             identity: None,
             owner: None,
             matches_installed: None,
             error: None,
+            stale: false,
         };
-        match examine(root, &loader.path) {
+        match examine(root, path) {
             Ok(None) => {}
-            Ok(Some((owner, _))) if owner != LoaderOwner::Zboot && !fixed(&loader.path) => {
-                continue;
-            }
             Ok(Some((owner, identity))) => {
                 loader.matches_installed = installed
                     .filter(|_| owner == LoaderOwner::Zboot)
-                    .zip(identity.as_ref())
-                    .map(|(installed, identity)| installed == identity);
+                    .map(|installed| *installed == identity);
                 loader.owner = Some(owner);
-                loader.identity = identity;
+                loader.identity = Some(identity);
             }
             Err(error) => loader.error = Some(error.to_string()),
         }
         loaders.push(loader);
+    }
+    for path in stale_at(root)? {
+        loaders.push(Loader {
+            path,
+            identity: None,
+            owner: Some(LoaderOwner::Zboot),
+            matches_installed: None,
+            error: None,
+            stale: true,
+        });
     }
     Ok(loaders)
 }
@@ -708,7 +617,7 @@ fn execute(
             source.seek(SeekFrom::Start(0))?;
             atomic(
                 root,
-                &locate(root, path)?,
+                path,
                 |file| {
                     let mut hash = Sha256::new();
                     let mut remaining = expected.bytes;
@@ -743,7 +652,7 @@ fn execute(
 /// Make a file that already holds the new bytes durable: an interrupted run
 /// may have renamed it into place without syncing it.
 fn sync_in_place(root: &Path, path: &str) -> std::io::Result<()> {
-    let path = checked(root, &locate(root, path)?, false)?;
+    let path = checked(root, path, false)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -766,8 +675,8 @@ pub fn apply(review: &EspReview, consent: &str) -> std::io::Result<()> {
     })
 }
 
-/// An observed file at a path zboot may own. The plan freezes classification
-/// as well as bytes.
+/// What one of zboot's two paths holds. The plan freezes classification as
+/// well as bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     pub path: String,
@@ -777,7 +686,7 @@ pub struct Finding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefreshTarget {
     pub review: EspReview,
-    /// zboot's files in `EFI/zboot/`, the canonical name and the fallback.
+    /// zboot's two paths, canonical name first.
     pub findings: Vec<Finding>,
     /// Another system's files this plan replaces: typed loss.
     pub foreign_replacements: Vec<String>,
@@ -794,10 +703,13 @@ pub struct RefreshPlan {
     /// Why an automatic plan left the ESP this boot came from alone.
     pub loader_left_alone: Option<String>,
     pub targets: Vec<RefreshTarget>,
+    /// zboot's stale loaders on the ESPs the plan inspected, left in place.
+    pub stale_loaders: Vec<EspFile>,
 }
-/// Another system's file at the canonical name or fallback, left in place.
+/// A file on an ESP: another system's file at one of zboot's paths, or a
+/// stale zboot loader; either is left in place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ForeignFile {
+pub struct EspFile {
     pub partition: String,
     pub path: String,
 }
@@ -806,40 +718,38 @@ pub struct RefreshOutcome {
     pub complete: bool,
     pub efi_sha256: String,
     pub partitions: Vec<String>,
-    pub left_in_place: Vec<ForeignFile>,
+    pub left_in_place: Vec<EspFile>,
+    pub stale_loaders: Vec<EspFile>,
 }
-/// zboot's files directly in [`DIRECTORY`], and the canonical name and
-/// fallback whatever holds them.
+/// What zboot's two paths hold.
 fn findings(root: &Path) -> std::io::Result<Vec<Finding>> {
-    let mut found = Vec::new();
-    for path in candidates(root)? {
-        let examined = examine(root, &path).map_err(|error| refuse(format!("{path}: {error}")))?;
-        let owned = matches!(examined, Some((LoaderOwner::Zboot, _)));
-        if owned || fixed(&path) {
-            found.push(Finding {
-                path,
-                identity: examined.and_then(|(_, identity)| identity),
-                owned,
-            });
-        }
-    }
-    Ok(found)
+    PATHS
+        .into_iter()
+        .map(|path| {
+            let examined =
+                examine(root, path).map_err(|error| refuse(format!("{path}: {error}")))?;
+            Ok(Finding {
+                path: path.into(),
+                owned: matches!(examined, Some((LoaderOwner::Zboot, _))),
+                identity: examined.map(|(_, identity)| identity),
+            })
+        })
+        .collect()
 }
-/// What a plan writes on one ESP: each of zboot's files under its existing
-/// name, and the fallback when it is zboot's or empty, leaving a foreign
-/// fallback in place. An install (EXPLICIT) on an ESP with none of zboot's
-/// files in [`DIRECTORY`] writes the canonical name and the fallback
-/// instead, whatever holds them; with one there it refreshes, so it adds no
-/// second copy beside a loader firmware already boots.
-fn write_paths(found: &[Finding], explicit: bool) -> BTreeMap<String, Option<FileIdentity>> {
-    let install = explicit && !found.iter().any(|file| file.owned && file.path != FALLBACK);
+/// Whether zboot is installed on an ESP: its loader is at the canonical
+/// name. A zboot fallback alone does not count.
+fn installed(found: &[Finding]) -> bool {
     found
         .iter()
-        .filter(|file| {
-            file.owned
-                || install && fixed(&file.path)
-                || file.path == FALLBACK && file.identity.is_none()
-        })
+        .any(|file| file.owned && file.path == CANONICAL)
+}
+/// What a plan writes on one ESP: each of zboot's paths that holds its
+/// loader or nothing, leaving another system's file in place. An INSTALL
+/// writes both paths, whatever holds them.
+fn write_paths(found: &[Finding], install: bool) -> BTreeMap<String, Option<FileIdentity>> {
+    found
+        .iter()
+        .filter(|file| install || file.owned || file.identity.is_none())
         .map(|file| (file.path.clone(), file.identity.clone()))
         .collect()
 }
@@ -853,8 +763,7 @@ fn foreign_replacements(
         .map(|file| file.path.clone())
         .collect()
 }
-/// Another system's files at the canonical name or fallback that TARGET
-/// does not write.
+/// Another system's files at zboot's paths that TARGET does not write.
 fn kept(target: &RefreshTarget) -> impl Iterator<Item = &str> {
     target
         .findings
@@ -866,26 +775,43 @@ fn kept(target: &RefreshTarget) -> impl Iterator<Item = &str> {
         })
         .map(|file| file.path.as_str())
 }
+/// What one ESP's inspection found: the write it needs, if any, and
+/// zboot's stale loaders there.
+struct Inspection {
+    target: Option<RefreshTarget>,
+    stale: Vec<String>,
+}
+/// Plan one ESP. A refresh takes an ESP that holds zboot's loader at either
+/// path or a stale one; an install (EXPLICIT) takes any, and writes both
+/// paths unless zboot is installed there.
 fn refresh_target(
     target: PartitionIdentity,
     efi: &crate::loader::EfiFile,
     explicit: bool,
     root: &Path,
     available: u64,
-) -> std::io::Result<Option<RefreshTarget>> {
+) -> std::io::Result<Inspection> {
     validate_target(&target)?;
     let found = findings(root)?;
-    if !explicit && !found.iter().any(|file| file.owned) {
-        return Ok(None);
+    let stale = stale_at(root)?;
+    let previous = write_paths(&found, explicit && !installed(&found));
+    if !explicit && stale.is_empty() && !found.iter().any(|file| file.owned) || previous.is_empty()
+    {
+        return Ok(Inspection {
+            target: None,
+            stale,
+        });
     }
     writable_target(&target)?;
-    let previous = write_paths(&found, explicit);
     let foreign_replacements = foreign_replacements(&found, &previous);
-    Ok(Some(RefreshTarget {
-        review: review(target, efi.clone(), previous, available)?,
-        findings: found,
-        foreign_replacements,
-    }))
+    Ok(Inspection {
+        target: Some(RefreshTarget {
+            review: review(target, efi.clone(), previous, available)?,
+            findings: found,
+            foreign_replacements,
+        }),
+        stale,
+    })
 }
 fn imported_storage() -> std::io::Result<Vec<device::PoolStorage>> {
     let state = zfs_tools::engine::state::observe().map_err(refuse)?;
@@ -1000,11 +926,11 @@ pub(crate) fn fixed_disk_refusal(path: &str) -> std::io::Result<Option<String>> 
     Ok(crate::menu::hostid_adopt::transport_refusal(path, &stack)
         .or_else(|| removable_refusal(path, &stack)))
 }
-/// Whether the ESP TARGET holds one of zboot's files: a zboot UKI directly
-/// in [`DIRECTORY`] or at the fallback, as `esp` and `status --devices` judge.
+/// Whether the ESP TARGET holds one of zboot's loaders: at either of its
+/// paths, or a stale one, as `esp` and `status --devices` judge.
 pub(crate) fn holds_zboot(target: &PartitionIdentity) -> std::io::Result<bool> {
     mounted(target, false, |root| {
-        Ok(findings(root)?.iter().any(|file| file.owned))
+        Ok(findings(root)?.iter().any(|file| file.owned) || !stale_at(root)?.is_empty())
     })
 }
 /// Whether BLOCK is a partition of the EFI system partition type.
@@ -1101,7 +1027,7 @@ fn refresh_plan_with(
         &PartitionIdentity,
         &crate::loader::EfiFile,
         bool,
-    ) -> std::io::Result<Option<RefreshTarget>>,
+    ) -> std::io::Result<Inspection>,
 ) -> std::io::Result<RefreshPlan> {
     let automatic = partitions.is_empty();
     let loader = loader.filter(|_| automatic);
@@ -1187,6 +1113,13 @@ fn refresh_plan_with(
     names.sort();
     names.dedup();
     let mut targets = Vec::new();
+    let mut stale_loaders = Vec::new();
+    let mut note_stale = |target: &PartitionIdentity, stale: Vec<String>| {
+        stale_loaders.extend(stale.into_iter().map(|path| EspFile {
+            partition: target.partition.path.clone(),
+            path,
+        }));
+    };
     for name in names {
         let target = observe(&name)?;
         if automatic && !on_imported_disk(&target, &storage) {
@@ -1199,8 +1132,9 @@ fn refresh_plan_with(
         if automatic && target.partition.filesystem.as_deref() != Some("vfat") {
             continue;
         }
-        let planned = inspect(&target, &efi, !automatic)?;
-        if let Some(planned) = planned {
+        let inspected = inspect(&target, &efi, !automatic)?;
+        note_stale(&target, inspected.stale);
+        if let Some(planned) = inspected.target {
             if targets.iter().any(|old: &RefreshTarget| {
                 old.review.target.partition.device_number
                     == planned.review.target.partition.device_number
@@ -1219,7 +1153,9 @@ fn refresh_plan_with(
             if target.partition.filesystem.as_deref() != Some("vfat") {
                 return Ok(None);
             }
-            inspect(&target, &efi, false)
+            let inspected = inspect(&target, &efi, false)?;
+            note_stale(&target, inspected.stale);
+            Ok(inspected.target)
         });
         match planned {
             Ok(Some(planned)) => {
@@ -1247,6 +1183,7 @@ fn refresh_plan_with(
         loader_partuuid,
         loader_left_alone,
         targets,
+        stale_loaders,
     })
 }
 pub fn refresh_consent(plan: &RefreshPlan) -> std::io::Result<String> {
@@ -1288,12 +1225,20 @@ pub fn loader_note(plan: &RefreshPlan) -> Option<String> {
         )
     })
 }
-/// Another system's files the plan leaves at the canonical name or fallback.
-pub fn left_in_place(plan: &RefreshPlan) -> Vec<ForeignFile> {
+/// What `esp` and `status --devices` say about zboot's stale loader PATH
+/// on the ESP PARTITION. Unescaped: the caller escapes it for a terminal.
+pub fn stale_note(partition: &str, path: &str) -> String {
+    format!(
+        "ESP {partition}: {path} is a stale zboot loader; zboot no longer refreshes it. \
+         Point the firmware boot entry at {CANONICAL} (efibootmgr), then remove {path}."
+    )
+}
+/// Another system's files the plan leaves at zboot's paths.
+pub fn left_in_place(plan: &RefreshPlan) -> Vec<EspFile> {
     plan.targets
         .iter()
         .flat_map(|target| {
-            kept(target).map(|path| ForeignFile {
+            kept(target).map(|path| EspFile {
                 partition: target.review.target.partition.path.clone(),
                 path: path.into(),
             })
@@ -1330,6 +1275,12 @@ pub fn describe_refresh(plan: &RefreshPlan, token: &str) -> String {
             ));
         }
     }
+    for stale in &plan.stale_loaders {
+        text.push_str(&format!(
+            "  {}\n",
+            zfs_tools::engine::escape_display(&stale_note(&stale.partition, &stale.path))
+        ));
+    }
     if let Some(note) = loader_note(plan) {
         text.push_str(&format!("  {note}\n"));
     }
@@ -1347,29 +1298,15 @@ fn admit_refresh(
     let done = |file: &Finding| {
         file.owned
             && file.identity.as_ref() == Some(expected)
-            && target
-                .review
-                .previous
-                .keys()
-                .any(|planned| planned.eq_ignore_ascii_case(&file.path))
+            && target.review.previous.contains_key(&file.path)
     };
-    for old in &target.findings {
-        match now
+    if now.len() != target.findings.len()
+        || now
             .iter()
-            .find(|file| file.path.eq_ignore_ascii_case(&old.path))
-        {
-            Some(file) if file == old || done(file) => {}
-            _ => return Err(refuse("ESP ownership findings changed since review")),
-        }
-    }
-    if now.iter().any(|file| {
-        !done(file)
-            && !target
-                .findings
-                .iter()
-                .any(|old| old.path.eq_ignore_ascii_case(&file.path))
-    }) {
-        return Err(refuse("an unreviewed ESP loader appeared"));
+            .zip(&target.findings)
+            .any(|(file, old)| file != old && !done(file))
+    {
+        return Err(refuse("ESP ownership findings changed since review"));
     }
     Ok(())
 }
@@ -1398,6 +1335,7 @@ fn apply_targets(
             .map(|target| target.review.target.partition.path.clone())
             .collect(),
         left_in_place: left_in_place(plan),
+        stale_loaders: plan.stale_loaders.clone(),
     })
 }
 fn validate_refresh(plan: &RefreshPlan) -> std::io::Result<()> {
@@ -1413,9 +1351,19 @@ fn validate_refresh(plan: &RefreshPlan) -> std::io::Result<()> {
     }
     let mut seen = std::collections::BTreeSet::new();
     for target in &plan.targets {
-        let previous = write_paths(&target.findings, !plan.automatic);
+        let install = !plan.automatic && !installed(&target.findings);
+        let previous = write_paths(&target.findings, install);
+        let stale = plan
+            .stale_loaders
+            .iter()
+            .any(|file| file.partition == target.review.target.partition.path);
         if target.review.artifacts != plan.efi
             || !seen.insert(target.review.target.partition.device_number.clone())
+            || target
+                .findings
+                .iter()
+                .map(|file| file.path.as_str())
+                .ne(PATHS)
             || target.review.previous != previous
             || target.foreign_replacements != foreign_replacements(&target.findings, &previous)
             || plan.automatic
@@ -1423,7 +1371,7 @@ fn validate_refresh(plan: &RefreshPlan) -> std::io::Result<()> {
                     &target.review.target,
                     &plan.imported_storage,
                     plan.loader_partuuid.as_deref(),
-                ) || !target.findings.iter().any(|file| file.owned))
+                ) || !stale && !target.findings.iter().any(|file| file.owned))
         {
             return Err(refuse(
                 "ESP batch paths or source differ from their reviewed ownership",
@@ -1449,12 +1397,8 @@ pub fn refresh_apply(plan: &RefreshPlan, consent: &str) -> std::io::Result<Refre
             "imported pool disks or the loader ESP changed since ESP review",
         ));
     }
-    // Every ESP is admitted before any is written.
-    for target in &plan.targets {
-        mounted(&target.review.target, false, |root| {
-            admit_refresh(root, target, &expected)
-        })?;
-    }
+    // The plan was made just before; each ESP is admitted again as it is
+    // written.
     apply_targets(plan, |target| {
         mounted(&target.review.target, true, |root| {
             admit_refresh(root, target, &expected)?;
@@ -1469,7 +1413,7 @@ mod tests {
     use crate::device::{DiskIdentity, Partition};
     use std::os::unix::fs::{MetadataExt, symlink};
     const DESTINATIONS: [&str; 2] = [CANONICAL, FALLBACK];
-    /// Another of zboot's files in its directory, under a name of its own.
+    /// The name an older install wrote and firmware may still boot: stale.
     const RECOVERY: &str = "EFI/zboot/zboot-recovery.efi";
     struct Scratch(PathBuf);
     impl Scratch {
@@ -1516,7 +1460,37 @@ mod tests {
             loader_partuuid: None,
             loader_left_alone: None,
             targets,
+            stale_loaders: vec![],
         }
+    }
+    /// The plan `esp` (or with EXPLICIT, `esp /dev/vda1`) makes for the one
+    /// ESP at ROOT.
+    fn plan_at(root: &Path, efi: &EfiFile, explicit: bool) -> RefreshPlan {
+        let member = target_fixture();
+        let names = if explicit {
+            vec![member.partition.path.clone()]
+        } else {
+            vec![]
+        };
+        refresh_plan_with(
+            &names,
+            efi.clone(),
+            if explicit {
+                vec![]
+            } else {
+                member_storage(&member)
+            },
+            None,
+            &if explicit {
+                vec![]
+            } else {
+                member_landscape(&member)
+            },
+            |_| Ok(None),
+            |_| Ok(member.clone()),
+            |target, efi, explicit| inspect_fixture(root, target, efi, explicit),
+        )
+        .unwrap()
     }
     fn publish_at(
         root: &Path,
@@ -1592,39 +1566,30 @@ mod tests {
     }
 
     #[test]
-    fn an_external_esp_with_a_foreign_loader_is_refused() {
-        let scratch = Scratch::new();
-        let root = &scratch.0;
-        for path in DESTINATIONS {
-            put(root, path, b"ID=another-system\n");
-            let error = refuse_foreign_deploy_at(root).unwrap_err().to_string();
-            assert!(error.contains("belongs to another system"), "{error}");
-            assert!(error.contains(path), "{error}");
-            assert!(error.contains("choose another ESP"), "{error}");
-            assert!(!error.contains("Run zboot esp PART"), "{error}");
-            put(root, path, b"ID=zboot\n");
-            refuse_foreign_deploy_at(root).unwrap();
-        }
-        // Another system's file elsewhere, even in zboot's directory, is
-        // outside deploy's write set.
-        for path in ["EFI/zboot/custom.efi", "EFI/vendor/other.efi"] {
-            put(root, path, b"ID=another-system\n");
-        }
-        refuse_foreign_deploy_at(root).unwrap();
+    fn a_stale_loader_note_names_the_path_and_the_firmware_fix() {
+        assert_eq!(
+            stale_note("/dev/nvme0n1p1", RECOVERY),
+            "ESP /dev/nvme0n1p1: EFI/zboot/zboot-recovery.efi is a stale zboot loader; \
+             zboot no longer refreshes it. Point the firmware boot entry at \
+             EFI/zboot/zboot.efi (efibootmgr), then remove EFI/zboot/zboot-recovery.efi."
+        );
     }
 
     #[test]
-    fn a_refresh_rewrites_zboots_files_in_its_directory_under_their_names() {
+    fn a_refresh_writes_only_zboots_two_paths_and_reports_its_stale_loaders() {
         let scratch = Scratch::new();
         let root = &scratch.0;
         let efi = source_fixture(root);
+        put(root, CANONICAL, b"ID=zboot\nVERSION_ID=\"0.1.0\"\n");
         put(root, RECOVERY, b"ID=zboot\nVERSION_ID=\"0.1.0\"\n");
         put(root, "EFI/zboot/custom", b"ID=zboot\n");
+        let temporary = format!("EFI/zboot/.zboot-{}.tmp", uuid::Uuid::new_v4());
         for (path, release) in [
             ("EFI/Linux/zboot.efi", b"ID=zboot\n".as_slice()),
             ("EFI/zboot/nested/zboot.efi", b"ID=zboot\n"),
             ("EFI/zboot/other.efi", b"ID=another-system\n"),
             ("EFI/nvidia-vram-oc/zboot.efi", b"ID=zboot\n"),
+            (temporary.as_str(), b"ID=zboot\n"),
             (FALLBACK, b"ID=another-system\n"),
         ] {
             put(root, path, release);
@@ -1633,72 +1598,164 @@ mod tests {
         fs::create_dir_all(root.join("EFI/zboot/operations")).unwrap();
         fs::write(root.join(&record), b"legacy record").unwrap();
         let untouched: Vec<_> = [
+            RECOVERY,
+            "EFI/zboot/custom",
             "EFI/Linux/zboot.efi",
             "EFI/zboot/nested/zboot.efi",
             "EFI/zboot/other.efi",
             "EFI/nvidia-vram-oc/zboot.efi",
+            &temporary,
             FALLBACK,
             &record,
         ]
         .into_iter()
         .map(|path| (path.to_owned(), fs::read(root.join(path)).unwrap()))
         .collect();
-        let target = planned(root, &efi, false).unwrap();
-        assert_eq!(paths(&target), ["EFI/zboot/custom", RECOVERY]);
-        assert!(target.foreign_replacements.is_empty());
-        assert_eq!(kept(&target).collect::<Vec<_>>(), [FALLBACK]);
-        let plan = explicit_plan(&efi, vec![target]);
-        assert!(!plan.needs_confirmation());
-        assert!(
-            describe_refresh(&plan, "token")
-                .contains("EFI/BOOT/BOOTX64.EFI is another system's; left in place")
-        );
-        let outcome = apply_targets(&plan, |target| {
-            publish_at(root, target, &efi, &mut |_| Ok(()))
-        })
-        .unwrap();
-        assert_eq!(
-            outcome.left_in_place,
-            [ForeignFile {
-                partition: "/dev/vda1".into(),
-                path: FALLBACK.into()
-            }]
-        );
-        for path in ["EFI/zboot/custom", RECOVERY] {
-            assert_eq!(identity(root, path).unwrap(), Some(efi.identity().unwrap()));
+        for explicit in [false, true] {
+            let plan = plan_at(root, &efi, explicit);
+            let [target] = &plan.targets[..] else {
+                panic!("one target");
+            };
+            assert_eq!(paths(target), [CANONICAL]);
+            assert!(target.foreign_replacements.is_empty());
+            assert_eq!(kept(target).collect::<Vec<_>>(), [FALLBACK]);
+            assert_eq!(
+                plan.stale_loaders,
+                ["EFI/zboot/custom", RECOVERY].map(|path| EspFile {
+                    partition: "/dev/vda1".into(),
+                    path: path.into()
+                })
+            );
+            validate_refresh(&plan).unwrap();
+            assert!(!plan.needs_confirmation());
+            let text = describe_refresh(&plan, "token");
+            assert!(
+                text.contains("EFI/BOOT/BOOTX64.EFI is another system's; left in place"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&stale_note("/dev/vda1", RECOVERY))
+                    && text.contains(&stale_note("/dev/vda1", "EFI/zboot/custom")),
+                "{text}"
+            );
+            let outcome = apply_targets(&plan, |target| {
+                publish_at(root, target, &efi, &mut |_| Ok(()))
+            })
+            .unwrap();
+            assert_eq!(
+                outcome.left_in_place,
+                [EspFile {
+                    partition: "/dev/vda1".into(),
+                    path: FALLBACK.into()
+                }]
+            );
+            assert_eq!(outcome.stale_loaders, plan.stale_loaders);
+            let json = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(
+                json["stale_loaders"][1],
+                serde_json::json!({"partition": "/dev/vda1", "path": RECOVERY})
+            );
+            assert_eq!(
+                identity(root, CANONICAL).unwrap(),
+                Some(efi.identity().unwrap())
+            );
+            for (path, bytes) in &untouched {
+                assert_eq!(&fs::read(root.join(path)).unwrap(), bytes, "{path}");
+            }
         }
-        for (path, bytes) in untouched {
-            assert_eq!(fs::read(root.join(&path)).unwrap(), bytes, "{path}");
-        }
-        assert!(!root.join(CANONICAL).exists());
+        // The canonical name in another case is the canonical file, as the
+        // vfat driver opens it, never a stale one.
+        fs::rename(root.join(CANONICAL), root.join("EFI/zboot/ZBOOT.EFI")).unwrap();
+        assert_eq!(stale_at(root).unwrap(), ["EFI/zboot/custom", RECOVERY]);
     }
 
     #[test]
-    fn esp_alone_writes_an_empty_fallback_and_never_adopts_other_paths() {
+    fn an_esp_with_only_a_stale_loader_gains_the_canonical_name_and_keeps_the_old_one() {
+        // The firmware entry of an older install boots EFI/zboot/zboot-recovery.efi.
         let efi_root = Scratch::new();
         let efi = source_fixture(&efi_root.0);
-        // zboot's canonical file and an empty fallback: both are written.
-        let scratch = Scratch::new();
-        put(&scratch.0, CANONICAL, b"ID=zboot\n");
-        let target = planned(&scratch.0, &efi, false).unwrap();
-        assert_eq!(paths(&target), [FALLBACK, CANONICAL]);
-        publish_at(&scratch.0, &target, &efi, &mut |_| Ok(())).unwrap();
-        for path in DESTINATIONS {
+        for explicit in [false, true] {
+            let scratch = Scratch::new();
+            let root = &scratch.0;
+            put(root, RECOVERY, b"ID=zboot\nVERSION=old\n");
+            put(root, FALLBACK, b"ID=zboot\nVERSION=old\n");
+            let old = fs::read(root.join(RECOVERY)).unwrap();
+            let plan = plan_at(root, &efi, explicit);
+            let [target] = &plan.targets[..] else {
+                panic!("one target");
+            };
             assert_eq!(
-                identity(&scratch.0, path).unwrap(),
-                Some(efi.identity().unwrap())
+                ordered(&target.review)
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>(),
+                [FALLBACK, CANONICAL]
             );
+            assert!(!plan.needs_confirmation());
+            assert_eq!(
+                serde_json::to_value(&plan).unwrap()["stale_loaders"],
+                serde_json::json!([{"partition": "/dev/vda1", "path": RECOVERY}])
+            );
+            assert!(describe_refresh(&plan, "token").contains(&stale_note("/dev/vda1", RECOVERY)));
+            let outcome = apply_targets(&plan, |target| {
+                publish_at(root, target, &efi, &mut |_| Ok(()))
+            })
+            .unwrap();
+            assert_eq!(outcome.stale_loaders, plan.stale_loaders);
+            for path in [CANONICAL, FALLBACK] {
+                assert_eq!(identity(root, path).unwrap(), Some(efi.identity().unwrap()));
+            }
+            assert_eq!(fs::read(root.join(RECOVERY)).unwrap(), old);
+            // A rerun still reports it: zboot never removes it.
+            assert_eq!(plan_at(root, &efi, false).stale_loaders, plan.stale_loaders);
         }
-        // zboot's fallback alone: a refresh does not add the canonical name.
+        // Another system's fallback beside it: a refresh keeps it, an install
+        // replaces it only after a typed answer.
         let scratch = Scratch::new();
-        put(&scratch.0, FALLBACK, b"ID=zboot\n");
-        let target = planned(&scratch.0, &efi, false).unwrap();
-        assert_eq!(paths(&target), [FALLBACK]);
-        publish_at(&scratch.0, &target, &efi, &mut |_| Ok(())).unwrap();
-        assert!(!scratch.0.join(CANONICAL).exists());
-        // Without one of zboot's own files at its paths an ESP is not
-        // selected: another system's files, zboot UKIs elsewhere, a stray
-        // subdirectory or an old operations record.
+        let root = &scratch.0;
+        put(root, RECOVERY, b"ID=zboot\n");
+        put(root, FALLBACK, b"ID=another-system\n");
+        let refresh = plan_at(root, &efi, false);
+        assert_eq!(paths(&refresh.targets[0]), [CANONICAL]);
+        assert!(!refresh.needs_confirmation());
+        let install = plan_at(root, &efi, true);
+        assert_eq!(install.targets[0].foreign_replacements, [FALLBACK]);
+        assert!(install.needs_confirmation());
+        assert_eq!(install.stale_loaders.len(), 1);
+        // With another system's files at both paths there is nothing a
+        // refresh may write, and the stale loader is still reported.
+        put(root, CANONICAL, b"ID=another-system\n");
+        let plan = plan_at(root, &efi, false);
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.stale_loaders[0].path, RECOVERY);
+        // An automatic plan binds the stale loader that selected the ESP.
+        fs::remove_file(root.join(CANONICAL)).unwrap();
+        let mut plan = plan_at(root, &efi, false);
+        validate_refresh(&plan).unwrap();
+        plan.stale_loaders.clear();
+        assert!(validate_refresh(&plan).is_err());
+    }
+
+    #[test]
+    fn esp_alone_writes_zboots_paths_where_empty_and_never_adopts_other_paths() {
+        let efi_root = Scratch::new();
+        let efi = source_fixture(&efi_root.0);
+        // zboot's canonical file or its fallback: both paths are written.
+        for seeded in [CANONICAL, FALLBACK] {
+            let scratch = Scratch::new();
+            put(&scratch.0, seeded, b"ID=zboot\n");
+            let target = planned(&scratch.0, &efi, false).unwrap();
+            assert_eq!(paths(&target), [FALLBACK, CANONICAL]);
+            publish_at(&scratch.0, &target, &efi, &mut |_| Ok(())).unwrap();
+            for path in DESTINATIONS {
+                assert_eq!(
+                    identity(&scratch.0, path).unwrap(),
+                    Some(efi.identity().unwrap())
+                );
+            }
+        }
+        // Without one of zboot's own files at its paths or a stale one an
+        // ESP is not selected: another system's files, zboot UKIs elsewhere,
+        // a stray subdirectory or an old operations record.
         let scratch = Scratch::new();
         for path in DESTINATIONS {
             put(&scratch.0, path, b"ID=another-system\n");
@@ -1711,6 +1768,7 @@ mod tests {
             put(&scratch.0, path, b"ID=zboot\n");
         }
         assert!(planned(&scratch.0, &efi, false).is_none());
+        assert!(stale_at(&scratch.0).unwrap().is_empty());
     }
 
     #[test]
@@ -1727,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn an_install_adds_both_paths_only_where_zboot_has_no_loader_in_its_directory() {
+    fn an_install_writes_both_paths_unless_zboot_is_installed() {
         let efi_root = Scratch::new();
         let efi = source_fixture(&efi_root.0);
         let other = b"ID=another-system\n".as_slice();
@@ -1753,20 +1811,20 @@ mod tests {
                 &[CANONICAL],
                 &[],
             ),
-            // zboot's loader in its directory: the install refreshes it and
-            // adds no second copy under the canonical name.
-            (&[(RECOVERY, zboot)], &[FALLBACK, RECOVERY], &[], &[]),
+            // Installed: the install refreshes and keeps a foreign fallback.
+            (&[(CANONICAL, zboot)], &[FALLBACK, CANONICAL], &[], &[]),
             (
-                &[(RECOVERY, zboot), (FALLBACK, other)],
-                &[RECOVERY],
+                &[(CANONICAL, zboot), (FALLBACK, other)],
+                &[CANONICAL],
                 &[],
                 &[FALLBACK],
             ),
+            // A stale loader does not make the ESP installed.
             (
-                &[(RECOVERY, zboot), (CANONICAL, other)],
-                &[FALLBACK, RECOVERY],
+                &[(RECOVERY, zboot), (FALLBACK, other)],
+                &[FALLBACK, CANONICAL],
+                &[FALLBACK],
                 &[],
-                &[CANONICAL],
             ),
         ];
         for (seed, expected, foreign, left) in cases {
@@ -1798,17 +1856,22 @@ mod tests {
             for (path, bytes) in left.iter().zip(before) {
                 assert_eq!(fs::read(scratch.0.join(path)).unwrap(), bytes);
             }
-            if !expected.contains(&CANONICAL) && !left.contains(&CANONICAL) {
-                assert!(!scratch.0.join(CANONICAL).exists(), "{seed:?}");
-            }
         }
     }
 
     #[test]
-    fn deploy_children_keep_the_fallback_unless_asked() {
+    fn deploy_writes_zboot_efi_and_the_fallback_only_when_asked() {
         let scratch = Scratch::new();
         let root = &scratch.0;
         let efi = source_fixture(root);
+        // Deploy's own new ESP: both paths, both empty.
+        let fresh = deploy_review(target_fixture(), &efi, root, true, 512 * MIB).unwrap();
+        assert_eq!(
+            fresh.previous,
+            [(CANONICAL.into(), None), (FALLBACK.into(), None)].into()
+        );
+        validate_review(&fresh).unwrap();
+        // An existing ESP on another disk keeps its fallback.
         put(root, FALLBACK, b"ID=zboot\n");
         let fallback = identity(root, FALLBACK).unwrap();
         let kept = deploy_review(target_fixture(), &efi, root, false, 512 * MIB).unwrap();
@@ -1821,103 +1884,89 @@ mod tests {
             identity(root, CANONICAL).unwrap(),
             Some(efi.identity().unwrap())
         );
-        // An ESP whose firmware already boots zboot's loader gains no copy.
-        let scratch = Scratch::new();
-        let root = &scratch.0;
+        // zboot's loader at the canonical name is refreshed in place; a stale
+        // one under an old name is neither written nor a reason to refuse.
         put(root, RECOVERY, b"ID=zboot\n");
-        for (replace, expected) in [(false, &[RECOVERY][..]), (true, &[FALLBACK, RECOVERY])] {
-            let review = deploy_review(target_fixture(), &efi, root, replace, 512 * MIB).unwrap();
-            assert_eq!(review.previous.keys().collect::<Vec<_>>(), expected);
-        }
-        // Another system's file at a fixed path is refused in the same
-        // observation that binds the write set.
+        let refreshed = deploy_review(target_fixture(), &efi, root, false, 512 * MIB).unwrap();
+        assert_eq!(refreshed.previous.keys().collect::<Vec<_>>(), [CANONICAL]);
+        assert!(refreshed.previous[CANONICAL].is_some());
+        // Another system's file at either path is refused, fallback included
+        // when deploy keeps it; another system's file elsewhere is not.
+        put(root, "EFI/zboot/custom.efi", b"ID=another-system\n");
+        put(root, "EFI/vendor/other.efi", b"ID=another-system\n");
+        deploy_review(target_fixture(), &efi, root, false, 512 * MIB).unwrap();
         for path in DESTINATIONS {
+            let before = fs::read(root.join(path)).unwrap();
             put(root, path, b"ID=another-system\n");
-            let error = deploy_review(target_fixture(), &efi, root, true, 512 * MIB)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("belongs to another system"), "{error}");
-            assert!(error.contains(path), "{error}");
-            fs::remove_file(root.join(path)).unwrap();
+            for replace in [false, true] {
+                let error = deploy_review(target_fixture(), &efi, root, replace, 512 * MIB)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("belongs to another system"), "{error}");
+                assert!(error.contains(path), "{error}");
+                assert!(error.contains("choose another ESP"), "{error}");
+            }
+            fs::write(root.join(path), before).unwrap();
         }
     }
 
     #[test]
-    fn a_differently_cased_esp_is_found_and_written_in_place() {
+    fn status_lists_both_paths_then_stale_loaders_only() {
         let scratch = Scratch::new();
         let root = &scratch.0;
-        let efi = source_fixture(root);
-        put(root, "efi/boot/bootx64.efi", b"ID=zboot\n");
-        put(root, "efi/zboot/ZBOOT.EFI", b"ID=zboot\n");
-        let target = planned(root, &efi, true).unwrap();
-        assert_eq!(paths(&target), [FALLBACK, "EFI/zboot/ZBOOT.EFI"]);
-        assert!(target.foreign_replacements.is_empty());
-        assert_eq!(
-            loaders_at(root, None)
-                .unwrap()
-                .iter()
-                .map(|loader| (loader.path.as_str(), loader.owner))
-                .collect::<Vec<_>>(),
-            [
-                ("EFI/zboot/ZBOOT.EFI", Some(LoaderOwner::Zboot)),
-                (FALLBACK, Some(LoaderOwner::Zboot))
-            ]
-        );
-        publish_at(root, &target, &efi, &mut |_| Ok(())).unwrap();
-        for path in ["efi/boot/bootx64.efi", "efi/zboot/ZBOOT.EFI"] {
-            assert_eq!(
-                fs::read(root.join(path)).unwrap(),
-                fs::read(&efi.efi).unwrap()
-            );
-        }
-        assert!(!root.join("EFI").exists());
-        // Two spellings of one FAT name cannot be told apart.
-        put(root, "EFI/BOOT/BOOTX64.EFI", b"ID=zboot\n");
-        assert!(
-            findings(root)
-                .unwrap_err()
-                .to_string()
-                .contains("more than one ESP entry")
-        );
-    }
-
-    #[test]
-    fn status_lists_zboots_files_and_both_fixed_paths_only() {
-        let scratch = Scratch::new();
-        let root = &scratch.0;
-        put(root, RECOVERY, b"ID=zboot\nVERSION=now\n");
+        put(root, CANONICAL, b"ID=zboot\nVERSION=now\n");
+        put(root, RECOVERY, b"ID=zboot\nVERSION=old\n");
         put(root, "EFI/zboot/old.efi", b"ID=zboot\nVERSION=old\n");
         put(root, "EFI/zboot/other.efi", b"ID=another-system\n");
         put(root, "EFI/Linux/zboot.efi", b"ID=zboot\n");
         put(root, "EFI/zboot/operations/old.efi", b"ID=zboot\n");
         put(root, FALLBACK, b"ID=another-system\n");
         symlink("/outside", root.join("EFI/zboot/escape.efi")).unwrap();
-        let installed = identity(root, RECOVERY).unwrap().unwrap();
+        let installed = identity(root, CANONICAL).unwrap().unwrap();
         let loaders = loaders_at(root, Some(&installed)).unwrap();
-        fn shown(loader: &Loader) -> (&str, Option<LoaderOwner>, Option<bool>, bool, bool) {
+        type Shown<'a> = (&'a str, Option<LoaderOwner>, Option<bool>, bool, bool, bool);
+        fn shown(loader: &Loader) -> Shown<'_> {
             (
                 loader.path.as_str(),
                 loader.owner,
                 loader.matches_installed,
                 loader.identity.is_some(),
                 loader.error.is_some(),
+                loader.stale,
             )
         }
         assert_eq!(
             loaders.iter().map(shown).collect::<Vec<_>>(),
             [
-                ("EFI/zboot/escape.efi", None, None, false, true),
+                (
+                    CANONICAL,
+                    Some(LoaderOwner::Zboot),
+                    Some(true),
+                    true,
+                    false,
+                    false
+                ),
+                (FALLBACK, Some(LoaderOwner::Other), None, true, false, false),
                 (
                     "EFI/zboot/old.efi",
                     Some(LoaderOwner::Zboot),
-                    Some(false),
-                    true,
-                    false
+                    None,
+                    false,
+                    false,
+                    true
                 ),
-                (RECOVERY, Some(LoaderOwner::Zboot), Some(true), true, false),
-                (CANONICAL, None, None, false, false),
-                (FALLBACK, Some(LoaderOwner::Other), None, true, false),
+                (RECOVERY, Some(LoaderOwner::Zboot), None, false, false, true),
             ]
+        );
+        assert_eq!(
+            serde_json::to_value(&loaders[3]).unwrap(),
+            serde_json::json!({"path": RECOVERY, "owner": "zboot", "stale": true})
+        );
+        assert!(
+            serde_json::to_value(&loaders[0])
+                .unwrap()
+                .get("stale")
+                .is_none()
         );
         assert!(
             loaders_at(root, None)
@@ -1928,43 +1977,17 @@ mod tests {
     }
 
     #[test]
-    fn zboots_directory_is_bounded() {
-        let scratch = Scratch::new();
-        fs::create_dir_all(scratch.0.join(DIRECTORY)).unwrap();
-        for index in 0..1025 {
-            fs::write(scratch.0.join(format!("{DIRECTORY}/{index}")), b"").unwrap();
-        }
-        assert!(
-            findings(&scratch.0)
-                .unwrap_err()
-                .to_string()
-                .contains("1024")
-        );
-        assert!(loaders_at(&scratch.0, None).is_err());
-    }
-
-    #[test]
-    fn a_cut_atomic_temporary_is_never_adopted_as_an_owned_loader() {
+    fn a_cut_atomic_temporary_is_never_reported_or_adopted() {
         let scratch = Scratch::new();
         let efi = source_fixture(&scratch.0);
-        let temporary = format!("EFI/zboot/.zboot-{}.tmp", uuid::Uuid::new_v4());
-        put(&scratch.0, &temporary, b"ID=zboot\n");
-        let name = temporary.rsplit('/').next().unwrap();
-        assert!(atomic_temporary(name));
-        assert!(atomic_temporary(&name.to_ascii_uppercase()));
-        assert!(!owned_path(&temporary));
+        for temporary in [
+            format!("EFI/zboot/.zboot-{}.tmp", uuid::Uuid::new_v4()),
+            format!("EFI/zboot/.ZBOOT-{}.TMP", uuid::Uuid::new_v4()),
+        ] {
+            put(&scratch.0, &temporary, b"ID=zboot\n");
+        }
+        assert!(stale_at(&scratch.0).unwrap().is_empty());
         assert!(planned(&scratch.0, &efi, false).is_none());
-        let ordinary = "EFI/zboot/.zboot-custom.tmp";
-        put(&scratch.0, ordinary, b"ID=zboot\n");
-        let plan = planned(&scratch.0, &efi, false).unwrap();
-        assert!(plan.review.previous.contains_key(ordinary));
-        assert!(!plan.review.previous.contains_key(&temporary));
-        publish_at(&scratch.0, &plan, &efi, &mut |_| Ok(())).unwrap();
-        assert!(scratch.0.join(&temporary).is_file());
-        assert_eq!(
-            fs::read(scratch.0.join(ordinary)).unwrap(),
-            fs::read(&efi.efi).unwrap()
-        );
     }
 
     #[test]
@@ -1972,50 +1995,51 @@ mod tests {
         let scratch = Scratch::new();
         let root = &scratch.0;
         let efi = source_fixture(root);
-        put(root, RECOVERY, b"ID=zboot\n");
+        put(root, CANONICAL, b"ID=zboot\n");
         put(root, FALLBACK, b"ID=another-system\n");
         let target = planned(root, &efi, false).unwrap();
         let expected = efi.identity().unwrap();
         admit_refresh(root, &target, &expected).unwrap();
         // The foreign fallback is left in place but bound: so is any change.
-        for (path, release, error) in [
-            (
-                FALLBACK,
-                b"ID=another-system\nVERSION=2\n".as_slice(),
-                "findings changed",
-            ),
-            (FALLBACK, b"ID=zboot\n", "findings changed"),
-            (RECOVERY, b"ID=zboot\nVERSION=2\n", "findings changed"),
-            ("EFI/zboot/new.efi", b"ID=zboot\n", "unreviewed ESP loader"),
+        for (path, release) in [
+            (FALLBACK, b"ID=another-system\nVERSION=2\n".as_slice()),
+            (FALLBACK, b"ID=zboot\n"),
+            (CANONICAL, b"ID=zboot\nVERSION=2\n"),
+            (CANONICAL, b"ID=another-system\n"),
         ] {
-            let before = fs::read(root.join(path)).ok();
+            let before = fs::read(root.join(path)).unwrap();
             put(root, path, release);
             let refused = publish_at(root, &target, &efi, &mut |_| Ok(())).unwrap_err();
-            assert!(refused.to_string().contains(error), "{path}: {refused}");
+            assert!(
+                refused.to_string().contains("findings changed"),
+                "{path}: {refused}"
+            );
             assert_ne!(planned(root, &efi, false), Some(target.clone()));
-            match before {
-                Some(bytes) => fs::write(root.join(path), bytes).unwrap(),
-                None => fs::remove_file(root.join(path)).unwrap(),
-            }
+            fs::write(root.join(path), before).unwrap();
         }
         assert_eq!(planned(root, &efi, false), Some(target.clone()));
-        // An explicit plan validates; a path outside zboot's own is refused.
+        // An explicit plan validates; a path outside zboot's two is refused.
         let mut plan = explicit_plan(&efi, vec![planned(root, &efi, true).unwrap()]);
         validate_refresh(&plan).unwrap();
         let review = &mut plan.targets[0].review;
         review.previous.insert("EFI/Linux/zboot.efi".into(), None);
         review.loss_token = token(review).unwrap();
         assert!(validate_refresh(&plan).is_err());
+        // A stale loader that appears is not written, so it does not stop a
+        // reviewed write.
+        put(root, RECOVERY, b"ID=zboot\n");
+        publish_at(root, &target, &efi, &mut |_| Ok(())).unwrap();
+        assert_eq!(identity(root, CANONICAL).unwrap(), Some(expected));
     }
 
     #[test]
-    fn reviews_have_one_schema_and_write_only_owned_paths() {
+    fn reviews_have_one_schema_and_write_only_zboots_paths() {
         let scratch = Scratch::new();
         let efi = source_fixture(&scratch.0);
         let valid = review(
             target_fixture(),
             efi,
-            [(RECOVERY.into(), None), (FALLBACK.into(), None)].into(),
+            [(CANONICAL.into(), None), (FALLBACK.into(), None)].into(),
             512 * MIB,
         )
         .unwrap();
@@ -2029,13 +2053,15 @@ mod tests {
         assert!(validate_review(&retoken(empty)).is_err());
         let temporary = format!("EFI/zboot/.zboot-{}.tmp", uuid::Uuid::new_v4());
         for path in [
+            RECOVERY,
+            "EFI/zboot/ZBOOT.EFI",
+            "efi/boot/bootx64.efi",
             "EFI/Linux/zboot.efi",
             "EFI/zboot/nested/zboot.efi",
             "EFI/zboot/",
             "EFI/zboot/..",
             "/EFI/zboot/zboot.efi",
             "EFI/BOOT/other.efi",
-            "EFI/zboot/ZBOOT-RECOVERY.EFI",
             temporary.as_str(),
         ] {
             let mut review = valid.clone();
@@ -2043,8 +2069,9 @@ mod tests {
             assert!(validate_review(&retoken(review)).is_err(), "{path}");
         }
         let mut stale = valid.clone();
-        stale.previous.insert(CANONICAL.into(), None);
+        stale.previous.remove(FALLBACK);
         assert!(validate_review(&stale).is_err());
+        validate_review(&retoken(stale)).unwrap();
     }
 
     #[test]
@@ -2059,7 +2086,8 @@ mod tests {
             root,
             2 * MIB + METADATA_RESERVE - 1,
         )
-        .unwrap_err()
+        .err()
+        .unwrap()
         .to_string();
         assert!(refused.contains("bytes free"), "{refused}");
         let target = refresh_target(
@@ -2070,6 +2098,7 @@ mod tests {
             2 * MIB + METADATA_RESERVE,
         )
         .unwrap()
+        .target
         .unwrap();
         publish_at(root, &target, &efi, &mut |_| Ok(())).unwrap();
         // Paths that already hold the new bytes need no space.
@@ -2136,7 +2165,9 @@ mod tests {
         crate::loader::EfiFile::inspect(&path).unwrap()
     }
     fn planned(root: &Path, efi: &EfiFile, explicit: bool) -> Option<RefreshTarget> {
-        refresh_target(target_fixture(), efi, explicit, root, 512 * MIB).unwrap()
+        refresh_target(target_fixture(), efi, explicit, root, 512 * MIB)
+            .unwrap()
+            .target
     }
     fn block(path: &str, number: &str, kind: &str, children: Vec<device::Block>) -> device::Block {
         device::Block {
@@ -2185,7 +2216,7 @@ mod tests {
         target: &PartitionIdentity,
         efi: &crate::loader::EfiFile,
         explicit: bool,
-    ) -> std::io::Result<Option<RefreshTarget>> {
+    ) -> std::io::Result<Inspection> {
         refresh_target(target.clone(), efi, explicit, root, 512 * MIB)
     }
     #[test]
@@ -2725,9 +2756,12 @@ mod tests {
                     fs::read_dir(scratch.0.join(directory))
                         .into_iter()
                         .flatten()
-                        .all(|entry| !atomic_temporary(
-                            entry.unwrap().file_name().to_str().unwrap()
-                        ))
+                        .all(|entry| !entry
+                            .unwrap()
+                            .file_name()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(".zboot-"))
                 );
             }
             let fresh = planned(&scratch.0, &efi, true).unwrap();

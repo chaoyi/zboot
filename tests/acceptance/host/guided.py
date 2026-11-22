@@ -33,7 +33,6 @@ UNRELATED = 'ZFS-E2E-GUIDED-UNRELATED-B'
 RESTORED = 'Restored e2ea/ROOT/be1 on pool e2ea; it is the boot default.'
 ERASE = 'Type the disk serial (ZFS-E2E-A) to proceed, anything else cancels: '
 CONTINUE = ERASE
-RESUME = 'Resume number (blank cancels): '
 PROBE_OK = '\nZFS_E2E_GUIDED_A_BOOT_OK'
 # Line-anchored native recovery diagnostics end a guided dialogue at once;
 # `Restore...fail` lines are left to the verdict (`failure_lines`).
@@ -59,21 +58,24 @@ def lines(text):
     return text.replace('\r', '').splitlines()
 
 
-def row_number(text, dataset):
-    """The one preservation-picker row number listing `dataset`."""
-    found = []
+def newest_snapshot(text, dataset):
+    """`DATASET@SNAP` for the last (newest) snapshot row under DATASET in a
+    `status DATASET --snapshots` report, which lists them by createtxg."""
+    found, inside = [], False
     for line in lines(text):
-        if dataset in line and ':' in line:
-            number = line.strip().split(':', 1)[0].split()[-1:]
-            found.append(int(number[0]) if number and number[0].isdigit() else None)
-    if found and None not in found and len(found) == 1:
-        return found[0]
-    raise ConsoleError(f'preservation picker rows for {dataset}: {found}')
+        row = re.match(r'\s*(?:\d+: )?(\S+)  \[', line)
+        if row:
+            inside = row.group(1) == dataset
+        elif inside and (snapshot := re.match(r'\s*@(\S+)  guid=', line)):
+            found.append(snapshot.group(1))
+    if not found:
+        raise ConsoleError(f'status lists no snapshot of {dataset}')
+    return f'{dataset}@{found[-1]}'
 
 
 def operations(text):
-    """Rows `N. restore ID on POOL: STEP (DETAIL)` of the Menu's `resume` listing."""
-    return re.findall(r'(?m)^\s*(\d+)\. restore (\S+) on (\S+): ', text.replace('\r', ''))
+    """Rows `restore ID on POOL after step N` of the Menu's short `status`."""
+    return re.findall(r'(?m)^\s+restore (\S+) on (\S+) after step ', text.replace('\r', ''))
 
 
 def eligible_rows(text, dataset):
@@ -104,17 +106,15 @@ def probe(text):
 # --- Menu dialogues (stage functions) ---
 
 def restore(console, cut=None, repair=None):
-    """Stick Menu: `restore` B's mirror onto A, keeping A's three data leaves.
-    With a cut, the dialogue ends as soon as the Menu prints that phase's
-    progress line and the boot is power-cut (host SIGKILL): the stick runs
-    no fault shim, so the cut lands at or after the phase, not exactly at
-    it."""
+    """Stick Menu: `restore` B's mirror, from its newest snapshot, onto A,
+    keeping A's three data leaves. With a cut, the dialogue ends as soon as
+    the Menu prints that phase's progress line and the boot is power-cut
+    (host SIGKILL): the stick runs no fault shim, so the cut lands at or
+    after the phase, not exactly at it."""
     console.ready()
-    rows = console.menu('restore', f'restore {ROOT_B} /dev/vda', until=('Preserve selection> ',), failures=GUIDED)
-    for dataset in KEPT:
-        console.menu(f'keep-{dataset.rsplit("/", 1)[1]}', str(row_number(rows, dataset)),
-                     until=('Preserve selection> ',), failures=GUIDED)
-    console.menu('review', 'done', until=(ERASE,), failures=GUIDED)
+    source = newest_snapshot(console.menu('source', f'status {ROOT_B} --snapshots', failures=GUIDED), ROOT_B)
+    keep = ' '.join(f'--keep {dataset}' for dataset in KEPT)
+    console.menu('restore', f'restore {source} /dev/vda {keep}', until=(ERASE,), failures=GUIDED)
     if cut:
         console.menu('consent', 'ZFS-E2E-A', until=('\n' + CUTS[cut],), seconds=SECONDS, failures=GUIDED)
         return
@@ -123,19 +123,19 @@ def restore(console, cut=None, repair=None):
 
 
 def resume(console, consent):
-    """A fresh stick boot after a cut: `resume` the one discovered restore.
+    """A fresh stick boot after a cut: `resume` the one restore `status` lists.
     Before erasure the Menu must ask for consent again; after it, never."""
     console.ready()
-    listing = console.menu('resume', 'resume', until=(RESUME,), failures=GUIDED)
-    found = operations(listing)
+    found = operations(console.menu('status', 'status', failures=GUIDED))
     if len(found) != 1:
-        raise ConsoleError(f'resume listed {found}')
+        raise ConsoleError(f'status listed {found}')
+    command = f'resume {found[0][0]}'
     if consent:
-        console.menu('resume-select', found[0][0], until=(CONTINUE,), failures=GUIDED)
+        console.menu('resume', command, until=(CONTINUE,), failures=GUIDED)
         console.menu('resume-consent', 'ZFS-E2E-A', until=(RESTORED, MENU_PROMPT), seconds=SECONDS,
                      failures=GUIDED)
     else:
-        console.menu('resume-select', found[0][0], until=(RESTORED, MENU_PROMPT), seconds=SECONDS,
+        console.menu('resume', command, until=(RESTORED, MENU_PROMPT), seconds=SECONDS,
                      failures=GUIDED + ('Type the disk serial',))
     verify(console)
 
@@ -307,16 +307,15 @@ def check_restore(ev, n, check, cut=None):
     """The guided restore dialogue of stage n (completed unless cut)."""
     check_stick(ev, n, check)
     s = ev.stage(n)
-    rows = s.step('restore').out
-    for dataset in KEPT:
-        listed = [line for line in lines(rows) if dataset in line]
-        check(len(listed) == 1 and re.match(r'\s*(?:\S+\s+)*\d+:', listed[0]) is not None,
-              f'picker lists {dataset} once on a numbered row: {listed}')
-    review = s.step('review').out
+    source = newest_snapshot(s.step('source').out, ROOT_B)
+    check.equal(s.step('restore').argv,
+                [f'restore {source} /dev/vda ' + ' '.join(f'--keep {dataset}' for dataset in KEPT)],
+                'the restore names the newest mirror snapshot, disk A and the kept leaves')
+    review = s.step('restore').out
     check.contains(review, ERASE, 'review asks for the disk serial')
     identity = uki(ev, check)
     for needle, what in ((f'Restore {ROOT_A} (operation ', 'restores the BE'),
-                         (f'  Source: {ROOT_B}@', 'from the B mirror'),
+                         (f'  Source: {source} (existing snapshot', 'from the B mirror'),
                          ('  Target disk: /dev/vda - serial ZFS-E2E-A', 'onto disk A'),
                          (f'hostid {HOSTID}', "with the BE's hostid"),
                          (f'  Loader: {ROOT_B}@', 'installing the loader the B mirror ships'),
@@ -331,19 +330,18 @@ def check_restore(ev, n, check, cut=None):
     else:
         check.contains(consent, RESTORED, 'restore completes')
         check(consent.rstrip().endswith(MENU_PROMPT.strip()), 'Menu prompt returns after the restore')
-    check_dialogue(s, ('restore', 'keep-scratch', 'keep-guided-child', 'keep-guided-disabled', 'review',
-                       'consent'), check)
+    check_dialogue(s, ('source', 'restore', 'consent'), check)
 
 
 def check_resume(ev, n, check, consent, stick='neutral'):
     check_stick(ev, n, check, stick)
     s = ev.stage(n)
-    listing = s.step('resume').out
-    check.contains(listing, RESUME, 'resume asks for a number')
-    found = operations(listing)
-    check.equal(len(found), 1, f'one discovered restore operation: {found}')
-    check.equal([pool for _, _, pool in found], ['e2eb'], 'the operation is recorded on surviving B')
-    selected = s.step('resume-select').out
+    found = operations(s.step('status').out)
+    check.equal(len(found), 1, f'status lists one interrupted restore: {found}')
+    check.equal([pool for _, pool in found], ['e2eb'], 'the operation is recorded on surviving B')
+    check.equal(s.step('resume').argv, [f'resume {found[0][0]}' if found else 'resume'],
+                'resume names the listed operation')
+    selected = s.step('resume').out
     if consent:
         check.contains(selected, CONTINUE, 'a resume before erasure asks for consent again')
         done = s.step('resume-consent').out
@@ -352,7 +350,7 @@ def check_resume(ev, n, check, consent, stick='neutral'):
         done = selected
     check.contains(done, RESTORED, 'the resume completes the restore')
     check(done.rstrip().endswith(MENU_PROMPT.strip()), 'Menu prompt returns after the resume')
-    check_dialogue(s, ('resume', 'resume-select') + (('resume-consent',) if consent else ()), check)
+    check_dialogue(s, ('status', 'resume') + (('resume-consent',) if consent else ()), check)
 
 
 def check_restored(ev, n, check):

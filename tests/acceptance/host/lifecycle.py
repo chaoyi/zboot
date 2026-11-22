@@ -79,8 +79,9 @@ def no_operation(check, obs, what):
     check.equal(chunked(obs), [], f'{what}: no journal or attachment property is left')
 
 
-def envelope(check, step, mode, what):
-    """The versioned envelope of a successful --json zboot call."""
+def envelope(check, step, mode, what, token=True):
+    """The versioned envelope of a successful --json zboot call. A preview
+    carries a token exactly when its verb takes --confirm (`token`)."""
     check.equal(step.rc, 0, f'{what} exit status ({step.err.strip()[-300:]})')
     try:
         value = step.json
@@ -89,8 +90,10 @@ def envelope(check, step, mode, what):
         return {}
     check.equal(value.get('schema_version'), 1, f'{what} schema_version')
     check.equal(value.get('mode'), mode, f'{what} mode')
-    if mode == 'preview':
+    if mode == 'preview' and token:
         check(isinstance(value.get('token'), str) and value['token'], f'{what} carries a token')
+    elif mode == 'preview':
+        check('token' not in value, f'{what} carries no token')
     return value
 
 

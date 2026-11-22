@@ -1,5 +1,5 @@
 //! Menu selectors, the automatic-boot countdown and the remote-access hold.
-use super::{Result, at, console, hostid_adopt, menu_connect, menu_view, refuse};
+use super::{Result, at, hostid_adopt, menu_connect, menu_view, refuse};
 use crate::handoff::{HandoffRequest, PairSelection};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -375,22 +375,13 @@ fn resolve_be_selector(
 fn resolve_console_target(
     target: &str,
     entries: &[menu_view::MenuEntry],
-    datasets: &console::DatasetMenu,
 ) -> Result<(String, Option<DatasetIdentity>)> {
     if let Some((dataset, identity)) = resolve_be_selector(target, entries)? {
         return Ok((dataset, Some(identity)));
     }
-    if target.strip_prefix('d').is_some_and(|number| {
-        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-    }) {
-        let (dataset, identity) = datasets
-            .resolve(target)
-            .map_err(|error| refuse(error.to_string()))?;
-        return Ok((dataset, Some(identity)));
-    }
     if !target.contains('/') {
         return Err(refuse(
-            "menu targets require a displayed number or full dataset name",
+            "menu targets require a displayed BE number or full dataset name",
         ));
     }
     Ok((crate::cli::names::resolve(Some(target), None)?, None))
@@ -399,17 +390,16 @@ fn resolve_console_target(
 type DisplayedBindings = Vec<(String, DatasetIdentity)>;
 type ParsedCommand = (crate::cli::grammar::Cli, DisplayedBindings);
 
-/// Resolve only the grammar's target fields, through the displayed tables.
+/// Resolve only the grammar's target fields, through the displayed BE table.
 /// Option values and a chroot tail remain the exact tokens supplied by the
 /// console tokenizer.
 pub(super) fn parsed_menu_command(
     words: &[String],
     entries: &[menu_view::MenuEntry],
-    datasets: &console::DatasetMenu,
 ) -> Result<ParsedCommand> {
     use crate::cli::grammar::Cli;
     let mut cli =
-        Cli::parse_for_menu(std::iter::once("zboot").chain(words.iter().map(String::as_str)))
+        Cli::parse_from_args(std::iter::once("zboot").chain(words.iter().map(String::as_str)))
             .map_err(|error| refuse(error.to_string()))?;
     let mut bindings = Vec::new();
     for target in cli.command.targets_mut() {
@@ -418,7 +408,7 @@ pub(super) fn parsed_menu_command(
             .map_or((target.as_str(), None), |(dataset, snapshot)| {
                 (dataset, Some(snapshot))
             });
-        let (resolved, identity) = resolve_console_target(dataset, entries, datasets)?;
+        let (resolved, identity) = resolve_console_target(dataset, entries)?;
         if let Some(identity) = identity {
             bindings.push((resolved.clone(), identity));
         }
@@ -624,11 +614,6 @@ mod tests {
     use std::os::fd::{AsFd, AsRawFd};
     use std::path::{Path, PathBuf};
 
-    use zfs_tools::engine::{
-        InspectRequest,
-        native::{self},
-    };
-
     #[test]
     fn an_empty_request_holds_for_the_complete_ten_minutes() {
         let start = Instant::now();
@@ -761,7 +746,6 @@ mod tests {
         );
         let bindings = |bound| crate::cli::access::Bindings {
             datasets: vec![bound],
-            ..Default::default()
         };
         bindings(bound).check_state(&state).unwrap();
         entry.candidate.identity.guid = zfs_tools::engine::Guid::new(99999);
@@ -782,8 +766,7 @@ mod tests {
     fn a_menu_line_and_a_command_line_parse_to_the_same_command() {
         use crate::cli::grammar::Cli;
         let words = console::parse_line("cmdline tank/ROOT/be --set 'loglevel=4 quiet'").unwrap();
-        let (menu, bindings) =
-            parsed_menu_command(&words, &[], &console::DatasetMenu::default()).unwrap();
+        let (menu, bindings) = parsed_menu_command(&words, &[]).unwrap();
         let cli = Cli::parse_from_args([
             "zboot",
             "cmdline",
@@ -800,14 +783,10 @@ mod tests {
     fn a_stale_number_is_refused() {
         let displayed = fixture(true);
         let entry = displayed_be(&displayed);
-        let datasets = console::DatasetMenu::from_state(&displayed);
         let words = ["drop", "1"].map(String::from);
         let replaced = fixture_with_be_guid(true, entry.candidate.identity.guid.get() + 1);
-        let (_, datasets) = parsed_menu_command(&words, &[entry], &datasets).unwrap();
-        let bindings = crate::cli::access::Bindings {
-            datasets,
-            ..Default::default()
-        };
+        let (_, datasets) = parsed_menu_command(&words, &[entry]).unwrap();
+        let bindings = crate::cli::access::Bindings { datasets };
         bindings.check_state(&displayed).unwrap();
         let error = bindings.check_state(&replaced).unwrap_err().to_string();
         assert!(error.contains("changed since it was displayed"), "{error}");
@@ -818,13 +797,12 @@ mod tests {
         use crate::cli::grammar::Verb;
         let observed = fixture(true);
         let entries = [displayed_be(&observed)];
-        let datasets = console::DatasetMenu::from_state(&observed);
-        let words = console::parse_line("cmdline 1 --set 'd2 root=2'").unwrap();
-        let (cli, bindings) = parsed_menu_command(&words, &entries, &datasets).unwrap();
+        let words = console::parse_line("cmdline 1 --set '2 root=2'").unwrap();
+        let (cli, bindings) = parsed_menu_command(&words, &entries).unwrap();
         match cli.command {
             Verb::Cmdline { dataset, set, .. } => {
                 assert_eq!(dataset.as_deref(), Some("tank/ROOT/be"));
-                assert_eq!(set.as_deref(), Some("d2 root=2"));
+                assert_eq!(set.as_deref(), Some("2 root=2"));
             }
             _ => panic!("cmdline"),
         }
@@ -832,12 +810,12 @@ mod tests {
             bindings,
             [("tank/ROOT/be".into(), entries[0].candidate.identity.clone())]
         );
-        let words = console::parse_line("chroot 1 -- printf d2 2").unwrap();
-        let (cli, _) = parsed_menu_command(&words, &entries, &datasets).unwrap();
+        let words = console::parse_line("chroot 1 -- printf 1 2").unwrap();
+        let (cli, _) = parsed_menu_command(&words, &entries).unwrap();
         match cli.command {
             Verb::Chroot { dataset, command } => {
                 assert_eq!(dataset, "tank/ROOT/be");
-                assert_eq!(command, ["printf", "d2", "2"]);
+                assert_eq!(command, ["printf", "1", "2"]);
             }
             _ => panic!("chroot"),
         }
@@ -846,32 +824,17 @@ mod tests {
     #[test]
     fn a_short_name_is_refused_in_the_menu() {
         let words = ["drop", "be"].map(String::from);
-        let error = parsed_menu_command(&words, &[], &console::DatasetMenu::default())
-            .err()
-            .unwrap()
-            .to_string();
+        let error = parsed_menu_command(&words, &[]).err().unwrap().to_string();
         assert!(error.contains("full dataset name"), "{error}");
     }
 
     #[test]
-    fn dataset_number_cannot_be_shadowed_by_a_pool_name() {
-        let mut state = fixture(true);
-        let rows = [("d2", "none", 1), ("tank", "none", 2)];
-        let output = rows.iter().map(|(name,mount,id)| format!("{name}\tfilesystem\t{id}\t0\t1000\t0\t{mount}\t-\t{}\t{}\tno\toff\ton\t-\toff\t-\t-\t-\t-\n",id+10,id+20)).collect::<String>();
-        state.inspection = native::inspect_with(
-            &InspectRequest::new(vec![], false).unwrap(),
-            |program, _| {
-                Ok(if program == "zpool" {
-                    "d2\t200\t1000\t0\t1000\tONLINE\t-\ntank\t100\t1000\t0\t1000\tONLINE\t-\n"
-                        .into()
-                } else {
-                    output.clone()
-                })
-            },
-        )
-        .unwrap();
-        let menu = console::DatasetMenu::from_state(&state);
-        assert_eq!(resolve_console_target("d2", &[], &menu).unwrap().0, "tank");
+    fn a_dataset_number_is_not_a_menu_target() {
+        let error = parsed_menu_command(&["drop".into(), "d1".into()], &[])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("full dataset name"), "{error}");
     }
 
     #[test]
@@ -1036,8 +999,7 @@ mod tests {
         entry.asset_refusal = None;
         let entries = vec![entry];
         let words = vec!["boot".into(), "1".into(), "--kernel".into(), "1".into()];
-        let (cli, _) =
-            parsed_menu_command(&words, &entries, &console::DatasetMenu::default()).unwrap();
+        let (cli, _) = parsed_menu_command(&words, &entries).unwrap();
         // The displayed request goes to the handoff as it is: nothing probes
         // every BE again.
         let request = listed_boot_request(&cli, &entries).unwrap().unwrap();
@@ -1067,9 +1029,7 @@ mod tests {
         discover: impl FnOnce() -> Result<Vec<menu_view::MenuEntry>>,
     ) -> Result<HandoffRequest> {
         let words = console::parse_line(line).map_err(|error| refuse(error.to_string()))?;
-        let (cli, _) = parsed_menu_command(&words, entries, &console::DatasetMenu::default())?;
-        cli.validate_complete()
-            .map_err(|error| refuse(error.to_string()))?;
+        let (cli, _) = parsed_menu_command(&words, entries)?;
         let listed = listed_boot_request(&cli, entries)?;
         let crate::cli::grammar::Verb::Boot {
             dataset, kernel, ..

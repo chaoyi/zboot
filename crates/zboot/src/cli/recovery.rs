@@ -319,7 +319,7 @@ pub(super) fn resume(
         debug_assert_eq!(preview.id, id);
         let abandoned = restore::abandon(&mut restore_backend(), &id)?;
         if json {
-            return applied(json, token, &abandoned);
+            return applied(json, Some(token), &abandoned);
         }
         println!("Abandoned restore {id}. Left in place:");
         for left in &abandoned.left {

@@ -804,7 +804,6 @@ impl Fake {
                     "copies",
                     "keylocation",
                     "keyformat",
-                    "zboot:be",
                     "zboot:cmdline",
                     "zboot:placement",
                     "zboot:staging",
@@ -1007,27 +1006,6 @@ impl Backend for Fake {
             candidates,
             running_root: self.running_root.clone(),
         })
-    }
-    fn received(
-        &mut self,
-        root: &str,
-        properties: &[&str],
-    ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-        self.check()?;
-        Ok(self
-            .tree(root)
-            .iter()
-            .map(|d| {
-                (
-                    d.name.clone(),
-                    d.received
-                        .iter()
-                        .filter(|(k, _)| properties.contains(&k.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            })
-            .collect())
     }
     fn disk_identity(&mut self, path: &str) -> Result<DiskIdentity> {
         self.check()?;

@@ -40,10 +40,9 @@ command the refusal prints.
 
 - `N` boots boot environment N, `N.M` its M-th kernel. `boot N -v` prints
   each stage of the handoff.
-- The menu takes the same verbs as the command line, with the numbers
-  `status` (or `ls`) shows: `N` for a boot environment, `dN` for a dataset,
-  `dN@SNAP` for a snapshot. `restore`, `wipe`, `resume` and `abandon` without
-  their disk, source or operation open a numbered picker.
+- The menu takes the same verbs and operands as the command line. A boot
+  environment may be named by the number `N` that `status` (or `ls`) shows;
+  other datasets take their full names.
 - `connect`, `rescan`, `shell`, `reboot`, `poweroff` and `help` are the
   menu's own commands ([CLI.md](CLI.md#in-the-menu)).
 - Any zboot command in the UKI (a menu line, the shell, SSH) plans on the
@@ -180,21 +179,18 @@ datasets are staged on B first and return to their own names on A.
 Everything else on A, its ESP included, is erased. The rules are in
 [DESIGN.md](DESIGN.md#guided-restore).
 
-In the menu, enter `restore`. The menu lists the boot environments that have
-a complete recursive snapshot, with the snapshot each would use, then the
-disks that may be rebuilt (path, model, serial or WWN, size); disks that hold
-the source's pool are not offered. Choose each by number; `cancel` or end of
-input leaves. `restore bpool/ROOT/be1 /dev/disk/by-id/nvme-A` names both; a
-bare boot environment takes its newest complete recursive snapshot, and
-`bpool/ROOT/be1@SNAP` that one. Device names change between boots: check
-model, serial and size.
+`status --devices --snapshots` lists the boot environments on B with their
+snapshots, and the disks with model, serial and size. Device names change
+between boots: identify A by model, serial and size. Then, in the menu, the
+shell or over SSH:
 
-The new pool keeps A's pool name. When A has none, the menu takes the name of
-the source's unimported pair peer, else `rpool` if no imported pool uses it,
-else it asks. Then it lists A's datasets as numbered rows (not the pool root,
-`POOL/ROOT` or the boot environment being restored): enter row numbers to
-toggle them, `all` or `none`, then `done`. Nothing is selected at first; a
-parent keeps its descendants.
+```sh
+zboot restore bpool/ROOT/be1@SNAP /dev/disk/by-id/nvme-A --keep rpool/home
+```
+
+Each `--keep` names a dataset of A to keep, with its descendants; without one
+nothing is kept. The new pool keeps A's pool name, else `rpool`; `--pool NAME`
+sets it.
 
 The plan shows the source snapshot, A's identity and everything it erases,
 the new layout (pool name, ESP and swap sizes, and the hostid A gets: the
@@ -324,8 +320,8 @@ receipt the only record of A's original properties. In this order:
 ## Interrupted operations
 
 `zboot status` and the menu list each interrupted operation with the command
-that continues it. `zboot resume [ID]` (in the menu, `resume` and a number)
-continues it. Before repeating a step, zboot checks what ZFS and the disks
+that continues it. `zboot resume [ID]` continues it; without ID it takes the
+only one. Before repeating a step, zboot checks what ZFS and the disks
 show: the step may have succeeded even if its result was lost. Continuing
 within what you confirmed needs no new answer; an erase still ahead, or a
 loss that changed, asks again.
@@ -449,10 +445,7 @@ features unused, so this follows only a `deploy --tar` from a newer system.
 The menu shows a boot environment as `blocked: unsupported management
 property KEY on DATASET` when it, a dataset above or below it, or its pair
 peer carries a `zboot:` property this zboot does not read: a later zboot's,
-or one an earlier build left. The one exception is `zboot:be`, the marker
-that builds before the markerless menu used: it is ignored, so a host that
-still carries it boots, and `zfs inherit zboot:be DATASET` removes it once no
-loader that old is left. For any other, the
+or one left by a build from before the first release (`zboot:be`, say). The
 menu does not boot it and does not count down; on a running system every
 zboot verb on it is refused the same way. The message names the
 `zfs inherit KEY HOLDER` that removes the property. Run it only when you know

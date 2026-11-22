@@ -3,14 +3,14 @@ default, not booted) has a canmount=on /var child, so the Menu does not count
 down, refuses to boot clean B (naming A's child) and still boots A (stage 3). Booted A mounts only its own /var, the way a stock Debian boot
 does, and repairs the child to noauto. The second Menu then boots B with its
 saved cmdline (stage 5), which mounts only B's /var plus the cross-pool home
-tree, read-only. The real root/kernel pair is discovered without a marker;
-a compatibility-only invalid legacy value is ignored, while a separate real
-root with an unknown zboot role remains blocked. No extra boot is needed."""
+tree, read-only. The real root/kernel pair is discovered without a marker,
+while a separate real root with an unknown zboot role remains blocked. No
+extra boot is needed."""
 import re
 
 from host.case import Boot
 from host.console import last_listing
-from host.lifecycle import prop, source
+from host.lifecycle import prop
 
 ID = 'EFI-HANDOFF-NATIVE'
 GROUP = 'efi'
@@ -65,26 +65,11 @@ def target_cmdline(check, target, root, stage):
     # The BE's saved zboot:cmdline arrives.
     for arg in ('console=ttyS0,115200', 'zt.case=EFI-HANDOFF-NATIVE', f'zt.stage={stage}'):
         check(arg in args, f'saved cmdline argument {arg} arrives')
-    trace = target.step('trace').json
-    check.equal((target.step('trace').rc, trace.get('mode')), (0, 'applied'),
-                'the carried trace is read through the normal command')
-    events = trace.get('result', {}).get('events', [])
-    listing = [event for event in events if event.get('stage') == 'list_boot_environments']
-    check.equal([event.get('complete') for event in listing], [False, True],
-                'the trace carries one complete listing duration')
-    if len(listing) == 2:
-        check.equal(listing[0].get('elapsed_ms'), 0, 'listing begins at the trace origin')
-        check(isinstance(listing[1].get('elapsed_ms'), int)
-              and listing[1]['elapsed_ms'] >= 0, 'listing time is a native nonnegative duration')
+    check(not any(a.startswith('zboot.trace=') for a in args), 'the handoff appends no trace record')
 
 
 def verdict(ev, check):
     setup = ev.stage(1).observe('setup')
-    # Compatibility-only observations: A has no legacy marker; B's arbitrary
-    # old value is inert. Both have actual kernel/initrd files in this case.
-    check.equal(prop(setup, 'e2ea/BE/proof', 'zboot:be'), '-', 'A is a marker-free root')
-    check.equal(prop(setup, 'e2eb/BE/proof', 'zboot:be'), 'legacy-not-authority', 'legacy value is deliberately not authority')
-    check.equal(source(setup, 'e2eb/BE/proof', 'zboot:be'), 'local', 'legacy input source is observed')
     check.equal(prop(setup, UNKNOWN, 'mountpoint'), '/', 'unknown-role clone retains root shape')
     check.equal(prop(setup, UNKNOWN, 'canmount'), 'noauto', 'unknown-role clone creates no automount hazard')
     check.equal(prop(setup, UNKNOWN, UNKNOWN_ROLE), 'fenced', 'unknown role is independently observed')
@@ -97,7 +82,6 @@ def verdict(ev, check):
                 'e2ea/BE/proof [default]  eligible', 'marker-free A is eligible with real kernel assets')
     b_row = dataset_row(menu, 'e2eb/BE/proof')
     check('blocked: ' in b_row and ON_CHILD in b_row, f"B is blocked only by A's automount hazard: {b_row}")
-    check('unsupported management property' not in b_row, 'legacy marker is ignored during role admission')
     unknown_row = dataset_row(menu, UNKNOWN)
     check('blocked: ' in unknown_row and UNKNOWN_ROLE in unknown_row and '[default]' not in unknown_row,
           f'unknown role stays visibly fenced and is not a default: {unknown_row}')
@@ -124,10 +108,6 @@ def verdict(ev, check):
     check.equal(mounts.get('/selected-root/var'), ON_CHILD, "A's /var child mounts when A boots")
     check('e2eb/BE/proof/var' not in mounts.values(), f"B's /var child stays unmounted in A: {mounts}")
     check.equal(a.step('repaired').out.split(), ['noauto', 'local'], "A's child repaired to noauto")
-    check.equal(a.step('legacy-marker-observed').out.split(), ['legacy-not-authority', 'local'],
-                'first discovery did not rewrite the legacy input')
-    check.equal(a.step('legacy-marker-retired').out.split(), ['-', '-'],
-                'B is also marker-free before the actual second handoff')
 
     # Second Menu: nothing blocks B now.
     menu = ev.stage(4)

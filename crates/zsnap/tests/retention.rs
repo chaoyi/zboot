@@ -1,12 +1,21 @@
 use chrono::{DateTime, Duration, Utc};
 use proptest::prelude::*;
 use std::collections::BTreeSet;
-use zsnap::{Keep, Policy, forget, parse_duration, plan, snap_name, snap_time, snapshot_due};
+use zsnap::{Keep, Policy, parse_duration, plan, snap_name, snap_time, snapshot_due};
 
 fn t(text: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(text)
         .unwrap()
         .with_timezone(&Utc)
+}
+
+/// Names `plan` keeps for no reason.
+fn forget(snaps: &[(String, DateTime<Utc>)], keep: &Keep, now: DateTime<Utc>) -> Vec<String> {
+    plan(snaps, keep, now)
+        .into_iter()
+        .filter(|d| !d.kept())
+        .map(|d| d.name)
+        .collect()
 }
 
 fn snapshots(times: &[&str]) -> Vec<(String, DateTime<Utc>)> {

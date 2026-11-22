@@ -278,17 +278,6 @@ pub trait TransferBackend: PairBackend + CaptureBackend + intent::Backend {
         value: Option<&str>,
         operation_id: &str,
     ) -> Result<(), Error>;
-    fn received_properties(
-        &mut self,
-        endpoint: &Endpoint,
-    ) -> Result<BTreeMap<String, String>, Error> {
-        Ok(self
-            .properties(endpoint)?
-            .into_iter()
-            .filter(|(_, p)| p.source == "received")
-            .map(|(k, p)| (k, p.value))
-            .collect())
-    }
     fn create_inert_container(
         &mut self,
         _parent: &Endpoint,
@@ -305,13 +294,14 @@ pub trait TransferBackend: PairBackend + CaptureBackend + intent::Backend {
     ) -> Result<(), Error> {
         Err(refuse("backend cannot rename an identity-bound receive"))
     }
-    fn restore_receive_property(
+    /// Give a new copy, still read-only and `canmount=noauto`, the
+    /// mountpoint SAVED names, as a local value or inherited, and read it back.
+    fn publish_mountpoint(
         &mut self,
         _endpoint: &Endpoint,
-        _key: PropertyKey,
-        _property: &crate::placement::SavedProperty,
+        _saved: &crate::placement::SavedProperty,
     ) -> Result<(), Error> {
-        Err(refuse("backend cannot restore receive placement"))
+        Err(refuse("backend cannot publish a receive mountpoint"))
     }
     fn quiesce_receive_scope(&mut self, _endpoint: &Endpoint, _id: &str) -> Result<(), Error> {
         Err(refuse("backend cannot prove receive device quiescence"))
@@ -343,25 +333,6 @@ pub trait TransferBackend: PairBackend + CaptureBackend + intent::Backend {
     /// marked for deferred destruction. Done once its name no longer resolves.
     fn destroy_snapshot(&mut self, point: &SnapshotRef) -> Result<(), Error>;
 }
-// canmount is non-inheritable. `inherit -S` also restores its native
-// default when no received layer exists; plain inherit is rejected by
-// libzfs/kernel. Never surface a hidden received value as a default.
-fn restore_inherit_received(
-    key: PropertyKey,
-    saved: &crate::placement::SavedProperty,
-) -> Result<bool, Error> {
-    if key == PropertyKey::Canmount && saved.source == "default" {
-        if saved.value != "on" || saved.received.is_some() {
-            return Err(refuse("invalid frozen default canmount provenance"));
-        }
-        return Ok(true);
-    }
-    if key == PropertyKey::Canmount && !matches!(saved.source.as_str(), "local" | "received") {
-        return Err(refuse("invalid frozen canmount source"));
-    }
-    Ok(saved.source == "received")
-}
-
 #[derive(Default)]
 pub struct NativeTransfer {}
 impl NativeTransfer {
@@ -480,44 +451,6 @@ impl TransferBackend for NativeTransfer {
     fn attachments(&mut self) -> impl AttachmentBackend {
         NativeAttachment
     }
-    fn received_properties(
-        &mut self,
-        endpoint: &Endpoint,
-    ) -> Result<BTreeMap<String, String>, Error> {
-        self.properties(endpoint)?;
-        self.without_altroot(endpoint)?;
-        let text = zfs_tools::engine::native::run(
-            "zfs",
-            &[
-                "get".into(),
-                "-H".into(),
-                "-p".into(),
-                "-o".into(),
-                "property,received".into(),
-                crate::placement::PLACEMENT_KEYS.join(","),
-                endpoint.name.clone(),
-            ],
-        )?;
-        let mut received: BTreeMap<String, String> = BTreeMap::new();
-        let mut seen = BTreeSet::new();
-        for line in text.lines() {
-            let (key, value) = line
-                .split_once('\t')
-                .ok_or_else(|| refuse("invalid received placement observation"))?;
-            if !crate::placement::PLACEMENT_KEYS.contains(&key) || !seen.insert(key) {
-                return Err(refuse("received placement scope is ambiguous"));
-            }
-            if value != "-" {
-                received.insert(key.into(), value.into());
-            }
-        }
-        if seen.len() != crate::placement::PLACEMENT_KEYS.len() {
-            return Err(refuse("received placement observation is incomplete"));
-        }
-        self.properties(endpoint)?;
-        self.without_altroot(endpoint)?;
-        Ok(received)
-    }
     fn create_inert_container(
         &mut self,
         parent: &Endpoint,
@@ -594,44 +527,29 @@ impl TransferBackend for NativeTransfer {
                 .unwrap_or_else(|| refuse("receive rename was not verified")))
         }
     }
-    fn restore_receive_property(
+    fn publish_mountpoint(
         &mut self,
         endpoint: &Endpoint,
-        key: PropertyKey,
         saved: &crate::placement::SavedProperty,
     ) -> Result<(), Error> {
-        let inherit_received = restore_inherit_received(key, saved)?;
-        let value = match key {
-            PropertyKey::Mountpoint => PropertyValue::Mountpoint(saved.value.clone()),
-            PropertyKey::Readonly if matches!(saved.value.as_str(), "on" | "off") => {
-                PropertyValue::Readonly(saved.value == "on")
-            }
-            PropertyKey::Canmount => PropertyValue::Canmount(match saved.value.as_str() {
-                "on" => MountMode::On,
-                "off" => MountMode::Off,
-                "noauto" => MountMode::NoAuto,
-                _ => return Err(refuse("invalid saved canmount")),
-            }),
-            PropertyKey::Volmode => PropertyValue::Volmode(saved.value.clone()),
-            _ => return Err(refuse("unsupported saved placement property")),
-        };
+        if !(saved.source == "local"
+            || saved.source == "default"
+            || saved.source.starts_with("inherited from "))
+        {
+            return Err(refuse("invalid frozen mountpoint source"));
+        }
+        let value = PropertyValue::Mountpoint(saved.value.clone());
         value.encode(endpoint)?;
         let before = self.properties(endpoint)?;
         self.without_altroot(endpoint)?;
-        if self.received_properties(endpoint)?.get(key.native()) != saved.received.as_ref() {
-            return Err(refuse(
-                "original received placement layer changed; receiver remains inactive",
-            ));
-        }
         if before
-            .get(key.native())
+            .get("mountpoint")
             .is_some_and(|p| p.value == saved.value && p.source == saved.source)
         {
             return Ok(());
         }
-        if key == PropertyKey::Mountpoint
-            && (before.get("readonly").is_none_or(|p| p.value != "on")
-                || before.get("canmount").is_none_or(|p| p.value != "noauto"))
+        if before.get("readonly").is_none_or(|p| p.value != "on")
+            || before.get("canmount").is_none_or(|p| p.value != "noauto")
         {
             return Err(refuse(
                 "mountpoint restoration requires a verified inactive receive role",
@@ -640,27 +558,17 @@ impl TransferBackend for NativeTransfer {
         if saved.source == "local" {
             self.set_property(endpoint, &value)?;
         } else {
-            if saved.source == "received"
-                && self.received_properties(endpoint)?.get(key.native()) != Some(&saved.value)
-            {
-                return Err(refuse(
-                    "saved received placement is no longer recoverable; receiver stays inactive",
-                ));
-            }
-            zfs_tools::engine::mutation::NativeMutation::new().inherit_native(
-                endpoint,
-                key,
-                inherit_received,
-            )?;
+            zfs_tools::engine::mutation::NativeMutation::new()
+                .inherit_native(endpoint, PropertyKey::Mountpoint)?;
         }
         let after = self.properties(endpoint)?;
         self.without_altroot(endpoint)?;
         if after
-            .get(key.native())
+            .get("mountpoint")
             .is_none_or(|p| p.value != saved.value || p.source != saved.source)
         {
             return Err(refuse(
-                "native receive placement value/source restoration differs from receipt",
+                "native receive mountpoint value/source restoration differs from receipt",
             ));
         }
         Ok(())
@@ -1616,6 +1524,18 @@ fn preflight(
         )));
     }
     let source_role = management::ownership(state, &request.source)?;
+    // A sync copies a pair's working copy into its fenced secondary, never
+    // the other way: switching which copy works is `primary`.
+    if let Ownership::Secondary { record } = &source_role {
+        let (source, peer) = (
+            zfs_tools::engine::escape_display(&request.source),
+            zfs_tools::engine::escape_display(&record.peer.name),
+        );
+        return Err(refuse(format!(
+            "{source} is the secondary of {peer}; sync copies only a pair's primary into its \
+             secondary. To make {source} the working copy, run `zboot primary {source}`"
+        )));
+    }
     let target = if state
         .inspection
         .datasets
@@ -1648,7 +1568,6 @@ fn preflight(
                 )));
             }
             (Ownership::Primary { record: a }, Ownership::Secondary { record: b })
-            | (Ownership::Secondary { record: a }, Ownership::Primary { record: b })
                 if a.endpoint.name == request.source
                     && b.endpoint.name == request.destination
                     && a.counterpart() == b => {}
@@ -1846,10 +1765,7 @@ fn validate_parent(state: &NativeState, parent: &str) -> Result<(), Error> {
         .ok_or_else(|| refuse("bootstrap parent pool properties are incomplete"))?;
     if props.get("guid").map(|p| p.value.as_str())
         != Some(bound.identity.pool_guid.to_string().as_str())
-        || props.keys().any(|key| {
-            // A retired marker is inert wherever it remains (`management`).
-            key != management::RETIRED_MARKER && management::managed_key(key)
-        })
+        || props.keys().any(|key| management::managed_key(key))
     {
         return Err(refuse(
             "bootstrap parent pool identity or management properties changed",
@@ -2211,6 +2127,11 @@ fn validate_plan(plan: &TransferPlan) -> Result<(), Error> {
         record.validate()?;
         if record.endpoint != plan.source.endpoint || record.peer.name != plan.destination.name() {
             return Err(refuse("frozen transfer pair scope differs"));
+        }
+        if record.role != Role::Primary {
+            return Err(refuse(
+                "a transfer from a pair's secondary is not supported; use `zboot primary`",
+            ));
         }
     }
     match &plan.destination {
@@ -3486,68 +3407,6 @@ fn clear_markers(
     }
     Ok(())
 }
-/// A sync into the fenced copy leaves it fenced. A sync from the fenced copy
-/// into the working copy (`sync SECONDARY PRIMARY`) gives the working copy its
-/// saved roles back (`receive::activate`) and remounts what was mounted.
-fn restore_placement(
-    operation: &TransferOperation,
-    backend: &mut impl TransferBackend,
-) -> Result<(), Error> {
-    let target = operation.received.as_ref().unwrap();
-    let secondary = operation
-        .plan
-        .source_pair
-        .as_ref()
-        .is_some_and(|record| record.role == Role::Primary);
-    if secondary {
-        verify_fenced(&PairBackend::observe(backend)?, target)?;
-        return Ok(());
-    }
-    receive::activate(operation, backend)?;
-    for member in target.members.values() {
-        let state = PairBackend::observe(backend)?;
-        let dataset = state
-            .inspection
-            .datasets
-            .iter()
-            .find(|d| d.name == member.bound.endpoint.name)
-            .ok_or_else(|| refuse("restored receiver disappeared"))?;
-        if dataset.identity != member.bound.endpoint.identity
-            || dataset.readonly != member.bound.placement.readonly
-            || dataset.canmount.map(|mode| match mode {
-                zfs_tools::engine::CanMount::On => MountMode::On,
-                zfs_tools::engine::CanMount::Off => MountMode::Off,
-                zfs_tools::engine::CanMount::NoAuto => MountMode::NoAuto,
-            }) != member.bound.placement.canmount
-        {
-            return Err(refuse("receiver placement restoration was not verified"));
-        }
-        if member.mounted && dataset.mounted != Some(true) {
-            if let Some(path) = &member.bound.mountpoint
-                && state.inspection.datasets.iter().any(|other| {
-                    other.mounted == Some(true)
-                        && other.mountpoint.as_ref() == Some(path)
-                        && other.name != member.bound.endpoint.name
-                })
-            {
-                return Err(refuse("restored receiver mountpoint is occupied"));
-            }
-            let error = backend.mount(&member.bound.endpoint).err();
-            let after = PairBackend::observe(backend)?;
-            if endpoint(&after, &member.bound.endpoint.name)? != member.bound.endpoint
-                || after
-                    .inspection
-                    .datasets
-                    .iter()
-                    .find(|d| d.name == member.bound.endpoint.name)
-                    .is_none_or(|d| d.mounted != Some(true))
-            {
-                return Err(error.unwrap_or_else(|| refuse("receiver remount was not verified")));
-            }
-        }
-    }
-    backend.sync(&target.endpoint)
-}
 fn release_exact(
     point: &SnapshotRef,
     tag: &str,
@@ -4028,7 +3887,11 @@ fn execute(
             let clean = clean_state(&PairBackend::observe(backend)?, operation, id)?;
             verify_existing_pair(&clean, &operation.plan)?;
             rotate_anchors(operation, backend)?;
-            restore_placement(operation, backend)?;
+            // The secondary stays fenced with what it received.
+            verify_fenced(
+                &PairBackend::observe(backend)?,
+                operation.received.as_ref().unwrap(),
+            )?;
         }
         receive::retire(record, operation, id, backend)?;
         operation.progress.phase = Phase::Complete;

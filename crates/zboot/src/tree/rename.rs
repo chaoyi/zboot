@@ -223,10 +223,7 @@ fn preserved(state: &NativeState, root: &str, tree: &[&Dataset]) -> Vec<Preserve
     }
     found
 }
-pub fn consent(plan: &MovePlan) -> std::io::Result<String> {
-    crate::consent::token(&(KIND, plan))
-}
-pub fn describe(plan: &MovePlan, _token: &str) -> String {
+pub fn describe(plan: &MovePlan) -> String {
     match plan {
         MovePlan::Rename(p) => {
             let mut text = format!(

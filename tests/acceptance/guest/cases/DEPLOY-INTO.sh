@@ -1,4 +1,4 @@
-# Add a BE while every pool default remains fixed, then cut a second addition
+# deploy into: add a BE while every pool default remains fixed, then cut a second addition
 # after its real @factory snapshot. Boot 2 inspects and explicitly Drops that
 # fenced name before a fresh retry. Boot 3 starts D's own ESP and the new BE.
 . /acceptance/share.sh
@@ -6,7 +6,7 @@
 POOL=e2ed BE=e2ed/ROOT/new HALF=e2ed/ROOT/interrupted
 TAR=/fixtures/e2e-factory.tar.zst OVERLAY=/run/deploy-into-overlay
 
-into() { name=$1 be=$2; shift 2; step "$name" zboot deploy --into "$POOL" --tar "$TAR" --overlay "$OVERLAY" --be "$be" --hostname into-proof --json "$@"; }
+into() { name=$1 be=$2; shift 2; step "$name" zboot deploy into "$POOL" --tar "$TAR" --overlay "$OVERLAY" --be "$be" --hostname into-proof --json "$@"; }
 
 stage_1() {
     fixture_hostid
@@ -22,10 +22,9 @@ stage_1() {
     must defaults-before zpool get -H -o name,value bootfs
     must disk-before sfdisk --json "$d"
     deploy_boot_overlay "$OVERLAY" "$BE"
-    into preview new --dry-run || fail 'into preview failed'
-    token=$(json .token) || fail 'into preview has no token'
-    into preview-again new --dry-run || fail 'repeated into preview failed'
-    into apply new --confirm "$token" || fail 'into apply failed'
+    into preview new --dry-run || fail 'deploy into preview failed'
+    into preview-again new --dry-run || fail 'repeated deploy into preview failed'
+    into apply new || fail 'deploy into apply failed'
     must defaults-after zpool get -H -o name,value bootfs
     must disk-after sfdisk --json "$d"
     must successful-native zfs get -H -p -o name,property,value,source canmount,mountpoint,readonly,zboot:pending "$BE"

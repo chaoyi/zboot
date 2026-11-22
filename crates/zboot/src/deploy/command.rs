@@ -25,8 +25,7 @@ use std::{io, path::PathBuf};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
     Disk { disk: String },
-    Image { file: PathBuf, size: Option<u64> },
-    Into { pool: String },
+    Image { file: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,9 +102,6 @@ pub trait Backend {
 /// Without `--hostid` the BE takes the running host's (effective) hostid, so
 /// the disks of one host share it; a host without one gets a new random hostid.
 pub fn request(args: &Args, running_hostid: u32, attempt: PathBuf) -> io::Result<DeployRequest> {
-    if matches!(args.target, Target::Into { .. }) {
-        return Err(refuse("--into uses the imported-pool planner"));
-    }
     if args.portable
         && (args.hostid.is_some()
             || args.swap.is_some()
@@ -161,7 +157,7 @@ pub fn request(args: &Args, running_hostid: u32, attempt: PathBuf) -> io::Result
         schema_version: 3,
         disk: match &args.target {
             Target::Disk { disk } => disk.clone(),
-            Target::Image { .. } | Target::Into { .. } => String::new(),
+            Target::Image { .. } => String::new(),
         },
         overlays: args.overlay.clone(),
         portable: args.portable,

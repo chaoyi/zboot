@@ -1416,9 +1416,7 @@ pub(crate) fn admit_with(
     let observed = pool_properties_with(&[pool_name.into()], &mut *run)?;
     let pool_properties = &observed[pool_name];
     for property in pool_properties.keys() {
-        if property != crate::engine::management::RETIRED_MARKER
-            && crate::engine::management::managed_key(property)
-        {
+        if crate::engine::management::managed_key(property) {
             return Err(Error::Inconsistent(format!(
                 "managed pool property requires its owning adapter: {pool_name} {property}"
             )));
@@ -1446,9 +1444,7 @@ pub(crate) fn admit_with(
     let properties = dataset_properties_with(&ancestors, &mut *run)?;
     for (name, props) in &properties {
         for property in props.keys() {
-            if property != crate::engine::management::RETIRED_MARKER
-                && crate::engine::management::managed_key(property)
-            {
+            if crate::engine::management::managed_key(property) {
                 return Err(Error::Inconsistent(format!(
                     "managed property requires its owning adapter: {name} {property}"
                 )));
@@ -1645,6 +1641,7 @@ mod tests {
             "tank\tguid\t123\n",
             "tank\tguid\t123\t-\ntank\tzboot:role\troot\tlocal\n",
             "tank\tguid\t123\t-\ntank\tzboot:future\t-\tlocal\n",
+            "tank\tguid\t123\t-\ntank\tzboot:be\t1\tlocal\n",
         ] {
             let output = [POOL, DATA, SNAP, POOL, properties];
             assert!(

@@ -92,7 +92,7 @@ pub(crate) fn print(args: std::fmt::Arguments, newline: bool) {
     }
 }
 
-/// `eprint!` and `eprintln!`.
+/// `eprintln!`.
 pub(crate) fn eprint(args: std::fmt::Arguments, newline: bool) {
     if cfg!(test) {
         if newline {
@@ -123,10 +123,6 @@ macro_rules! print {
 macro_rules! println {
     () => { $crate::output::print(format_args!(""), true) };
     ($($arg:tt)*) => { $crate::output::print(format_args!($($arg)*), true) };
-}
-
-macro_rules! eprint {
-    ($($arg:tt)*) => { $crate::output::eprint(format_args!($($arg)*), false) };
 }
 
 macro_rules! eprintln {

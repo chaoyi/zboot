@@ -565,6 +565,7 @@ mod tests {
                     "zboot:staging",
                     "zboot:pending",
                     "zboot:future",
+                    "zboot:be",
                 ] {
                     let (i, mut d, p) = fixture();
                     d.get_mut(name).unwrap().insert(

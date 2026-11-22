@@ -20,11 +20,11 @@ def refusal(check, s, step, before, after, needle, what):
 
 def verdict(ev, check):
     s = ev.stage(1)
-    equal = envelope(check, s.step('preview-left'), 'preview', 'equal pair preview with ordered primary')
+    equal = envelope(check, s.step('preview-left'), 'preview', 'equal pair preview with ordered primary', token=False)
     check.equal(equal['result']['primary'], 'left', 'equal pair keeps the first operand primary')
-    default = envelope(check, s.step('preview-default'), 'preview', 'equal pair preview')
+    default = envelope(check, s.step('preview-default'), 'preview', 'equal pair preview', token=False)
     check.equal(default['result']['primary'], 'left', 'equal histories default to the first endpoint')
-    pruned = envelope(check, s.step('preview-pruned'), 'preview', 'pair with a copy missing an older snapshot')
+    pruned = envelope(check, s.step('preview-pruned'), 'preview', 'pair with a copy missing an older snapshot', token=False)
     check.equal([(a['name'], b['name']) for a, b in pruned['result']['anchors']],
                 [(L + '@common', 'e2ea/pruned@common')], 'the newest common snapshot anchors the pruned copy')
 
@@ -38,7 +38,7 @@ def verdict(ev, check):
             f'a pair joins leaf datasets, but {L} or {R} has child datasets (child)', 'pair with a child')
     refusal(check, s, 'right-pair', 'right-before', 'right-after',
             'initial pair primary must be the containing/ahead copy', 'pair with the ahead source as the second operand')
-    ahead = envelope(check, s.step('preview-ahead'), 'preview', 'ahead pair preview')['result']
+    ahead = envelope(check, s.step('preview-ahead'), 'preview', 'ahead pair preview', token=False)['result']
     check.equal(ahead['primary'], 'left', 'ahead source selected as primary')
     check.equal(len(ahead['anchors']), 1, 'one leaf, one common anchor')
 

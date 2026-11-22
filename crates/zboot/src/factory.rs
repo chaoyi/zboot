@@ -101,8 +101,6 @@ pub struct Request {
     /// snapshot.debian.org timestamp applied to every archive.
     pub snapshot: Option<String>,
     pub packages: Vec<String>,
-    /// The suite the whole OpenZFS package cohort comes from.
-    pub zfs_from_suite: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -115,7 +113,6 @@ pub struct Outcome {
     pub packages: usize,
     pub suite: String,
     pub snapshot: Option<String>,
-    pub zfs_from_suite: Option<String>,
     pub seconds: u64,
 }
 
@@ -125,7 +122,6 @@ pub struct Outcome {
 pub(crate) struct Stage {
     /// Sources the deployed root updates from (never a snapshot).
     pub sources: String,
-    pub zfs_from_suite: Option<String>,
 }
 
 pub(crate) fn atom(value: &str) -> bool {
@@ -160,12 +156,7 @@ fn released(suite: &str) -> bool {
 /// archive with `--snapshot` (snapshot.debian.org serves expired Release
 /// files, so only those lines skip the Valid-Until check), else the mirror.
 /// Signatures are always checked.
-pub(crate) fn build_sources(
-    suite: &str,
-    mirror: &str,
-    snapshot: Option<&str>,
-    donor: Option<&str>,
-) -> Vec<String> {
+pub(crate) fn build_sources(suite: &str, mirror: &str, snapshot: Option<&str>) -> Vec<String> {
     let (debian, security, options) = match snapshot {
         Some(time) => (
             format!("{SNAPSHOT}/debian/{time}"),
@@ -183,50 +174,24 @@ pub(crate) fn build_sources(
             "deb {options}{security} {suite}-security {COMPONENTS}"
         ));
     }
-    if let Some(donor) = donor {
-        lines.push(format!("deb {options}{debian} {donor} {COMPONENTS}"));
-    }
     lines
 }
 
 /// The deb822 sources a deployed root updates from: the live mirror, never
-/// a snapshot, with the donor suite kept behind its pin.
-pub(crate) fn deployed_sources(suite: &str, mirror: &str, donor: Option<&str>) -> String {
+/// a snapshot.
+pub(crate) fn deployed_sources(suite: &str, mirror: &str) -> String {
     let stanza = |uri: &str, suites: &str| {
         format!(
             "Types: deb\nURIs: {uri}\nSuites: {suites}\nComponents: {COMPONENTS}\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
         )
     };
-    let mut text = if released(suite) {
+    if released(suite) {
         stanza(mirror, &format!("{suite} {suite}-updates"))
             + "\n"
             + &stanza(SECURITY_MIRROR, &format!("{suite}-security"))
     } else {
         stanza(mirror, suite)
-    };
-    if let Some(donor) = donor {
-        text += "\n";
-        text += &stanza(mirror, donor);
     }
-    text
-}
-
-/// The OpenZFS package cohort. With a donor suite, all of it comes from
-/// there and nothing else does.
-pub(crate) const OPENZFS_COHORT: &str = "zfs-dkms zfsutils-linux zfs-zed zfs-initramfs zfs-dracut zfs-test libzfs* libzpool* libnvpair* libuutil* libpam-zfs python3-pyzfs pyzfs-doc";
-
-pub(crate) fn donor_preferences(donor: &str) -> String {
-    let release = if matches!(
-        donor,
-        "stable" | "testing" | "unstable" | "oldstable" | "experimental"
-    ) {
-        format!("a={donor}")
-    } else {
-        format!("n={donor}")
-    };
-    format!(
-        "Package: {OPENZFS_COHORT}\nPin: release {release}\nPin-Priority: 990\n\nPackage: *\nPin: release {release}\nPin-Priority: -1\n"
-    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -461,10 +426,8 @@ pub fn build(request: &Request) -> io::Result<Outcome> {
     let jobs = factory_jobs(std::env::var_os("ZBOOT_JOBS").as_deref())?;
     let started = Instant::now();
     let suite = &request.suite;
-    if !atom(suite) || request.zfs_from_suite.as_deref().is_some_and(|s| !atom(s)) {
-        return Err(refuse(
-            "--suite and --zfs-from-suite take a Debian suite name",
-        ));
+    if !atom(suite) {
+        return Err(refuse("--suite takes a Debian suite name"));
     }
     let epoch = match &request.snapshot {
         Some(time) => Some(snapshot_epoch(time)?),
@@ -502,8 +465,7 @@ pub fn build(request: &Request) -> io::Result<Outcome> {
     copy_input(&executable, &stage.join("zboot-factory"), 0o755)?;
     package(&pieces, &work.0.join("package"), &stage.join(PACKAGE))?;
     let plan = Stage {
-        sources: deployed_sources(suite, &mirror, request.zfs_from_suite.as_deref()),
-        zfs_from_suite: request.zfs_from_suite.clone(),
+        sources: deployed_sources(suite, &mirror),
     };
     fs::write(
         stage.join("stage.json"),
@@ -535,12 +497,6 @@ pub fn build(request: &Request) -> io::Result<Outcome> {
         .arg(format!(
             "--essential-hook=mkdir -p \"$1/etc/dkms/framework.conf.d\" && printf 'parallel_jobs={jobs}\\nsign_file=/nonexistent/zboot-factory-unsigned\\n' > \"$1/etc/dkms/framework.conf.d/zboot-factory.conf\"",
         ));
-    if let Some(donor) = &request.zfs_from_suite {
-        command.arg(format!(
-            "--setup-hook=mkdir -p \"$1/etc/apt/preferences.d\" && printf %s {} > \"$1/etc/apt/preferences.d/zboot-openzfs.pref\"",
-            shell_quote(&donor_preferences(donor))
-        ));
-    }
     command
         .arg(format!(
             "--customize-hook={quoted}/zboot-factory factory-finish \"$1\" {quoted}"
@@ -552,12 +508,7 @@ pub fn build(request: &Request) -> io::Result<Outcome> {
         .arg("--customize-hook=rm -f \"$1/tmp/zboot-factory.packages\" \"$1/etc/dkms/framework.conf.d/zboot-factory.conf\"")
         .arg(suite)
         .arg(&tar)
-        .args(build_sources(
-            suite,
-            &mirror,
-            request.snapshot.as_deref(),
-            request.zfs_from_suite.as_deref(),
-        ))
+        .args(build_sources(suite, &mirror, request.snapshot.as_deref()))
         // No caller environment reaches the build or its log.
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
@@ -584,7 +535,6 @@ pub fn build(request: &Request) -> io::Result<Outcome> {
         packages: packages.len(),
         suite: suite.clone(),
         snapshot: request.snapshot.clone(),
-        zfs_from_suite: request.zfs_from_suite.clone(),
         seconds: started.elapsed().as_secs(),
     })
 }
@@ -1027,12 +977,7 @@ pub(crate) mod tests {
 
     #[test]
     fn one_snapshot_timestamp_covers_every_archive_and_only_it_skips_expiry() {
-        let lines = build_sources(
-            "forky",
-            DEFAULT_MIRROR,
-            Some("20261108T022935Z"),
-            Some("sid"),
-        );
+        let lines = build_sources("forky", DEFAULT_MIRROR, Some("20261108T022935Z"));
         let snapshot = "https://snapshot.debian.org/archive";
         assert_eq!(
             lines,
@@ -1046,12 +991,9 @@ pub(crate) mod tests {
                 format!(
                     "deb [check-valid-until=no] {snapshot}/debian-security/20261108T022935Z forky-security {COMPONENTS}"
                 ),
-                format!(
-                    "deb [check-valid-until=no] {snapshot}/debian/20261108T022935Z sid {COMPONENTS}"
-                ),
             ]
         );
-        let live = build_sources("sid", "https://mirror.example/debian", None, None);
+        let live = build_sources("sid", "https://mirror.example/debian", None);
         assert_eq!(
             live,
             [format!(
@@ -1059,26 +1001,11 @@ pub(crate) mod tests {
             )]
         );
         // The deployed root updates from the live mirror, never the snapshot.
-        let deployed = deployed_sources("forky", DEFAULT_MIRROR, Some("sid"));
+        let deployed = deployed_sources("forky", DEFAULT_MIRROR);
         assert!(!deployed.contains("snapshot") && !deployed.contains("trusted"));
         assert!(deployed.contains("Suites: forky forky-updates\n"));
         assert!(deployed.contains("Suites: forky-security\n"));
-        assert!(deployed.contains("Suites: sid\n"));
-    }
-
-    #[test]
-    fn the_donor_suite_supplies_the_openzfs_cohort_and_nothing_else() {
-        let pref = donor_preferences("sid");
-        let stanzas: Vec<_> = pref.split("\n\n").collect();
-        assert_eq!(stanzas.len(), 2);
-        assert!(stanzas[0].starts_with("Package: zfs-dkms zfsutils-linux"));
-        assert!(stanzas[0].contains("libzfs*") && stanzas[0].contains("Pin: release n=sid\n"));
-        assert!(stanzas[0].ends_with("Pin-Priority: 990"));
-        assert_eq!(
-            stanzas[1],
-            "Package: *\nPin: release n=sid\nPin-Priority: -1\n"
-        );
-        assert!(donor_preferences("testing").contains("Pin: release a=testing\n"));
+        assert!(!deployed.contains("Suites: sid\n"));
     }
 
     #[test]
@@ -1090,7 +1017,6 @@ pub(crate) mod tests {
             mirror: DEFAULT_MIRROR.into(),
             snapshot: None,
             packages: vec![],
-            zfs_from_suite: None,
         };
         for broken in [
             Request {
@@ -1107,10 +1033,6 @@ pub(crate) mod tests {
             },
             Request {
                 mirror: "ftp://x".into(),
-                ..base.clone()
-            },
-            Request {
-                zfs_from_suite: Some("sid'".into()),
                 ..base.clone()
             },
         ] {

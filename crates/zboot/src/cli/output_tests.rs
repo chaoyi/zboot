@@ -1,4 +1,4 @@
-use super::run::{Incomplete, consent_to, defer_writer, finish, json_response, review, run};
+use super::run::{Incomplete, consent_to, defer_writer, finish, json_response, lossless, run};
 use crate::consent::{Envelope, Outcome, Typed};
 use std::{fs, io::Write, os::unix::fs::PermissionsExt, process::Command};
 
@@ -254,14 +254,23 @@ fn child(name: &str) -> ! {
             finish(Ok(()), true, "test")
         }
         "writer_admission" => {
-            // Exercise the shared consent/review -> writer gate. No pools are
-            // selected here: native pool reopening/cleanup has separate backend tests.
-            for lossless in [false, true] {
-                for (dry_run, confirm, expected) in [
-                    (true, None, vec!["plan"]),
-                    (false, Some("stale".to_owned()), vec!["plan"]),
-                    (false, Some(TOKEN.to_owned()), vec!["plan", "lock refused"]),
-                ] {
+            // Exercise the shared consent and lossless -> writer gates. No pools
+            // are selected here: native pool reopening/cleanup has separate
+            // backend tests. A lossless change takes the lock before it plans.
+            for lossless_verb in [false, true] {
+                let cases = if lossless_verb {
+                    vec![
+                        (true, None, vec!["plan"]),
+                        (false, None, vec!["lock refused"]),
+                    ]
+                } else {
+                    vec![
+                        (true, None, vec!["plan"]),
+                        (false, Some("stale".to_owned()), vec!["plan"]),
+                        (false, Some(TOKEN.to_owned()), vec!["plan", "lock refused"]),
+                    ]
+                };
+                for (dry_run, confirm, expected) in cases {
                     ADMISSION_ORDER.set(Vec::new());
                     zfs_tools::engine::effect::reset();
                     defer_writer("test direct mutation".into(), refuse_admission_lock);
@@ -270,15 +279,9 @@ fn child(name: &str) -> ! {
                         assert!(!super::run::writer_is_held_for_test());
                         Ok(7u8)
                     };
-                    let selected = if lossless {
-                        review(
-                            dry_run,
-                            confirm.clone(),
-                            true,
-                            plan,
-                            |_| Ok(TOKEN.into()),
-                            |_, _| String::new(),
-                        )
+                    let selected = if lossless_verb {
+                        lossless(dry_run, true, plan, |_| String::new())
+                            .map(|selected| selected.map(|plan| (plan, String::new())))
                     } else {
                         consent_to(
                             dry_run,
@@ -356,35 +359,6 @@ fn child(name: &str) -> ! {
             assert_eq!(run(args, |_| Ok(None)), code);
             assert!(zfs_tools::engine::native::set_verbose(false));
             code
-        }
-        "trace_success" => {
-            let trace = crate::trace::Trace {
-                schema_version: 1,
-                kernel_sha256: None,
-                initrd_sha256: None,
-                omitted_events: 0,
-                events: vec![crate::trace::Event {
-                    stage: crate::trace::Stage::ImportReadonly,
-                    complete: true,
-                    elapsed_ms: 1,
-                }],
-            };
-            let cmdline = root.join("cmdline");
-            fs::write(
-                &cmdline,
-                format!("zboot.trace={}\n", trace.token(1024).unwrap().unwrap()),
-            )
-            .unwrap();
-            run(
-                vec![
-                    "zboot".into(),
-                    "trace".into(),
-                    "--cmdline".into(),
-                    cmdline.to_string_lossy().into_owned(),
-                    "--json".into(),
-                ],
-                |_| Ok(None),
-            )
         }
         "lock" => run(args, |_| {
             Err(zfs_tools::engine::lock::LockError::Io(
@@ -476,17 +450,16 @@ fn child(name: &str) -> ! {
             );
             finish(result.map(|_| ()), true, "primary")
         }
-        "review_changed" | "review_confirm_changed" | "review_dry_run" => {
+        "lossless_apply" | "lossless_dry_run" => {
             defer_writer("snapshot".into(), |_| {
                 let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
                 fs::write(root.join("review-lock"), b"held").unwrap();
                 Ok(None)
             });
-            let dry_run = name == "review_dry_run";
+            let dry_run = name == "lossless_dry_run";
             let calls = std::cell::Cell::new(0);
-            let result = review(
+            let result = lossless(
                 dry_run,
-                (name == "review_confirm_changed").then(|| crate::consent::token(&1u8).unwrap()),
                 true,
                 || {
                     calls.set(calls.get() + 1);
@@ -496,19 +469,17 @@ fn child(name: &str) -> ! {
                         1u8
                     })
                 },
-                crate::consent::token,
-                |_, _| String::new(),
+                |_| String::new(),
             );
-            assert_eq!(calls.get(), if dry_run { 1 } else { 2 });
+            assert_eq!(calls.get(), 1);
             assert_eq!(root.join("review-lock").exists(), !dry_run);
             assert!(!zfs_tools::engine::effect::any());
             let result = result.and_then(|planned| {
-                if let Some((plan, token)) = planned {
-                    assert_eq!(name, "review_changed");
+                if let Some(plan) = planned {
+                    assert_eq!(name, "lossless_apply");
                     assert_eq!(plan, 2);
-                    assert_eq!(token, crate::consent::token(&2u8).unwrap());
-                    fs::write(root.join("changed"), b"applied fresh locked plan")?;
-                    json_response(Envelope::new(Outcome::Applied, Some(token), plan))?;
+                    fs::write(root.join("changed"), b"applied the locked plan")?;
+                    json_response(Envelope::new(Outcome::Applied, None, plan))?;
                 }
                 Ok(())
             });
@@ -601,34 +572,20 @@ fn preview_and_token_confirmation_work_with_closed_stdin() {
 }
 
 #[test]
-fn an_ordinary_lossless_review_adopts_the_fresh_locked_plan_and_token() {
-    let result = case("review_changed", &[]);
+fn a_lossless_change_plans_once_under_the_lock_and_prints_no_token() {
+    let result = case("lossless_apply", &[]);
     let value = result.envelope(0, "applied");
     assert_eq!(value["result"], 2);
-    assert_eq!(value["token"], crate::consent::token(&2u8).unwrap());
+    assert!(value.get("token").is_none());
     assert!(result.changed);
 }
 
 #[test]
-fn a_confirmed_lossless_review_refuses_a_locked_plan_change_without_a_new_token() {
-    let result = case("review_confirm_changed", &[]);
-    let value = result.envelope(3, "refused");
-    assert_eq!(value["result"]["reason"], "stale_token");
-    assert!(value.get("token").is_none());
-    assert!(
-        !result
-            .stderr
-            .contains(&crate::consent::token(&2u8).unwrap())
-    );
-    assert!(!result.changed);
-}
-
-#[test]
 fn a_lossless_dry_run_keeps_the_unlocked_preview_without_acting() {
-    let result = case("review_dry_run", &[]);
+    let result = case("lossless_dry_run", &[]);
     let value = result.envelope(0, "preview");
     assert_eq!(value["result"], 1);
-    assert_eq!(value["token"], crate::consent::token(&1u8).unwrap());
+    assert!(value.get("token").is_none());
     assert!(!result.changed);
 }
 
@@ -704,7 +661,14 @@ fn a_refusal_with_json_prints_one_refused_envelope() {
     }
     let result = case(
         "run",
-        &["zboot", "trace", "--cmdline", "ROOT/missing", "--json"],
+        &[
+            "zboot",
+            "esp",
+            "/dev/test-partition",
+            "--efi",
+            "ROOT/missing",
+            "--json",
+        ],
     );
     let value = result.envelope(1, "refused");
     assert_eq!(value["result"]["reason"], "error");
@@ -714,7 +678,6 @@ fn a_refusal_with_json_prints_one_refused_envelope() {
 #[test]
 fn every_json_output_is_the_envelope() {
     for args in [
-        vec!["trace", "--cmdline", "ROOT/missing"],
         vec!["status"],
         vec!["snapshot", "testpool/data"],
         vec!["fork", "testpool/data@s", "testpool/copy"],
@@ -738,6 +701,7 @@ fn every_json_output_is_the_envelope() {
             "--efi",
             "ROOT/missing",
         ],
+        vec!["deploy", "into", "testpool", "--tar", "ROOT/missing"],
         vec!["esp", "/dev/test-partition", "--efi", "ROOT/missing"],
     ] {
         let args = std::iter::once("zboot")
@@ -746,8 +710,6 @@ fn every_json_output_is_the_envelope() {
             .collect::<Vec<_>>();
         case("run", &args).envelope(1, "refused");
     }
-    let value = case("trace_success", &[]).envelope(0, "applied");
-    assert_eq!(value["result"]["events"][0]["stage"], "import_readonly");
 }
 
 #[test]
@@ -783,7 +745,7 @@ fn a_stale_locked_plan_after_the_first_effect_returns_partial_without_a_new_toke
 }
 
 #[test]
-fn a_verb_without_loss_still_checks_a_token_it_is_given() {
+fn a_loss_capable_verb_without_loss_this_time_still_checks_a_token_it_is_given() {
     let result = case("nonloss_stale", &[]);
     assert_eq!(
         result.envelope(3, "refused")["result"]["reason"],

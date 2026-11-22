@@ -34,7 +34,6 @@ mod esp;
 mod handoff;
 mod reboot;
 mod remote_access;
-mod trace;
 
 mod factory;
 

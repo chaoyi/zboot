@@ -7,7 +7,7 @@
 use super::grammar::Verb;
 use crate::menu::{RecoveryError, Result, pool_access};
 use std::collections::{BTreeMap, BTreeSet};
-use zfs_tools::engine::{DatasetIdentity, Guid, SnapshotRef, intent, pool_of, state::NativeState};
+use zfs_tools::engine::{DatasetIdentity, Guid, intent, pool_of, state::NativeState};
 
 fn refuse(message: impl Into<String>) -> RecoveryError {
     RecoveryError::Refused(message.into())
@@ -88,48 +88,27 @@ impl Reopen {
     }
 }
 
-/// The native identities a menu line was resolved against: its numbered
-/// datasets and its pickers' datasets, snapshots and disks, as displayed.
+/// The native identities a menu line was resolved against: the datasets its
+/// numbers named, as displayed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Bindings {
     pub(crate) datasets: Vec<(String, DatasetIdentity)>,
-    pub(crate) snapshots: Vec<SnapshotRef>,
-    pub(crate) disks: Vec<crate::device::DiskIdentity>,
 }
 impl Bindings {
     const fn new() -> Self {
         Self {
             datasets: Vec::new(),
-            snapshots: Vec::new(),
-            disks: Vec::new(),
         }
     }
 
     fn check(&self) -> Result<()> {
-        if self == &Self::new() {
+        if self.datasets.is_empty() {
             return Ok(());
         }
-        self.check_disks(crate::device::observe_identity)?;
         self.check_state(&zfs_tools::engine::state::observe()?)
     }
 
-    /// Every picked disk path still holds the disk that was displayed.
-    fn check_disks<E: Into<RecoveryError>>(
-        &self,
-        observe: impl Fn(&str) -> std::result::Result<crate::device::DiskIdentity, E>,
-    ) -> Result<()> {
-        for disk in &self.disks {
-            if &observe(&disk.path).map_err(Into::into)? != disk {
-                return Err(refuse(format!(
-                    "{} changed since it was displayed; choose the disk again",
-                    zfs_tools::engine::escape_display(&disk.path)
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Every displayed dataset and snapshot is still that native incarnation.
+    /// Every displayed dataset is still that native incarnation.
     pub(crate) fn check_state(&self, observed: &NativeState) -> Result<()> {
         for (name, expected) in &self.datasets {
             if observed
@@ -142,20 +121,6 @@ impl Bindings {
                 return Err(refuse(format!(
                     "{} changed since it was displayed; run status or rescan",
                     zfs_tools::engine::escape_display(name)
-                )));
-            }
-        }
-        for expected in &self.snapshots {
-            if observed
-                .inspection
-                .snapshots
-                .as_ref()
-                .and_then(|points| points.iter().find(|p| p.name == expected.name))
-                .is_none_or(|p| p.point() != *expected)
-            {
-                return Err(refuse(format!(
-                    "{} changed since it was displayed; run status or rescan",
-                    zfs_tools::engine::escape_display(&expected.name)
                 )));
             }
         }
@@ -612,7 +577,7 @@ pub(crate) mod tests {
             &["sync", "--all"],
             &["default", "a/ROOT/be"],
             &["restore", "a/ROOT/be@s", "/dev/sdz"],
-            &["deploy", "--into", "a", "--tar", "/root.tar"],
+            &["deploy", "into", "a", "--tar", "/root.tar"],
         ] {
             assert_eq!(
                 Reopen::of(Env::Uki, &command(args)),
@@ -813,60 +778,24 @@ pub(crate) mod tests {
     #[test]
     fn displayed_identities_are_checked_against_native_state() {
         let mut fake = fixture();
-        fake.snap("a/ROOT/be@base");
         let state = fake.observe().unwrap();
         let bindings = Bindings {
             datasets: vec![("a/ROOT/be".into(), fake.identity("a/ROOT/be"))],
-            snapshots: vec![fake.point("a/ROOT/be@base")],
-            disks: vec![],
         };
         bindings.check_state(&state).unwrap();
         let mut replaced = fake.clone();
         replaced.datasets.get_mut("a/ROOT/be").unwrap().guid += 1;
-        assert!(bindings.check_state(&replaced.observe().unwrap()).is_err());
-        let mut replaced = fake.clone();
-        replaced.snapshots.get_mut("a/ROOT/be@base").unwrap().guid += 1;
         let error = bindings
             .check_state(&replaced.observe().unwrap())
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("a/ROOT/be@base changed since it was displayed"),
+            error.contains("a/ROOT/be changed since it was displayed"),
             "{error}"
         );
         let mut gone = fake.clone();
-        gone.snapshots.remove("a/ROOT/be@base");
         gone.datasets.remove("a/ROOT/be");
         assert!(bindings.check_state(&gone.observe().unwrap()).is_err());
-    }
-
-    #[test]
-    fn a_picked_disk_cannot_be_replaced_by_another_disk() {
-        let disk = crate::device::DiskIdentity {
-            path: "/dev/test-a".into(),
-            device_number: "8:0".into(),
-            sysfs_path: "/sys/devices/test-a".into(),
-            bytes: 1024,
-            logical_sector: 512,
-            physical_sector: 512,
-            serial: Some("selected".into()),
-            wwn: None,
-            model: None,
-        };
-        let bindings = Bindings {
-            disks: vec![disk.clone()],
-            ..Bindings::default()
-        };
-        bindings
-            .check_disks(|_| Ok::<_, RecoveryError>(disk.clone()))
-            .unwrap();
-        let mut other = disk.clone();
-        other.serial = Some("other".into());
-        assert!(
-            bindings
-                .check_disks(|_| Ok::<_, RecoveryError>(other.clone()))
-                .is_err()
-        );
     }
 
     /// A sync record from apool/BE/be1 into DESTINATION, naming POOL's GUID

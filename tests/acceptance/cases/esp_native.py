@@ -1,8 +1,9 @@
-"""One reviewed ESP batch rewrites zboot's files directly in EFI/zboot under
-their names and the fallback, never adopts a loader elsewhere, and adds the
-canonical name only to an ESP without one of zboot's files in EFI/zboot. The two boots
-retain mounted-RW cold durability and exercise both imported-pool disks,
-untouched rescue media, typed installation and a real late readonly ESP."""
+"""One reviewed ESP batch writes zboot's two fixed paths, EFI/zboot/zboot.efi
+and the fallback, never adopts a loader elsewhere, and reports a zboot loader
+left under an older name in EFI/zboot as stale while leaving it untouched.
+The two boots retain mounted-RW cold durability and exercise both
+imported-pool disks, untouched rescue media, typed installation and a real
+late readonly ESP."""
 import json
 
 from host.case import Boot
@@ -15,8 +16,10 @@ DISKS = {'A': 2, 'B': 2, 'D': 2}
 # udev: `status --devices` reads lsblk PARTTYPE.
 BOOTS = [Boot(1, cut='esp-published', udev=True), Boot(2, udev=True)]
 
-LOADERS = ('EFI/zboot/zboot-recovery.efi', 'EFI/BOOT/BOOTX64.EFI')
 CANONICAL = 'EFI/zboot/zboot.efi'
+FALLBACK = 'EFI/BOOT/BOOTX64.EFI'
+LOADERS = (CANONICAL, FALLBACK)
+STALE = 'EFI/zboot/zboot-recovery.efi'
 OUTSIDE = 'EFI/Linux/zboot.efi'
 OLD = {'EFI/vendor/loader.efi': 'unrelated-loader-preserved',
        'operator.txt': 'unrelated-root-file-preserved'}
@@ -28,6 +31,12 @@ def files(step):
 
 def sums(step):
     return {line.split()[1]: line.split()[0] for line in step.out.splitlines()}
+
+
+def stale_note(partition):
+    """The exact report docs/CLI.md (esp) shows for a stale loader."""
+    return (f'ESP {partition}: {STALE} is a stale zboot loader; zboot no longer refreshes it. '
+            f'Point the firmware boot entry at {CANONICAL} (efibootmgr), then remove {STALE}.')
 
 
 def verdict(ev, check):
@@ -48,9 +57,10 @@ def verdict(ev, check):
     check.equal([target['review']['target']['disk']['serial'] for target in auto_targets],
                 ['ZFS-E2E-A', 'ZFS-E2E-B'], 'both selected disks retain exact native serials')
     for target in auto_targets:
-        check.equal(list(target['review']['previous']), ['EFI/zboot/host.efi'],
-                    'auto updates the owned name and preserves the foreign fallback')
+        check.equal(list(target['review']['previous']), [CANONICAL],
+                    'auto updates the canonical name and preserves the foreign fallback')
         check.equal(target['foreign_replacements'], [], 'auto grants no foreign replacement')
+    check.equal(automatic.get('stale_loaders'), [], 'the imported-pool ESPs hold no stale loader')
     pairs = []
     for line in s.step('pair-records').out.splitlines():
         name, key, value, provenance = line.split('\t')
@@ -126,14 +136,16 @@ def verdict(ev, check):
     review = target['review']
     check.equal((review['target']['disk']['serial'], review['target']['number']), ('ZFS-E2E-D', 1),
                 'cold refresh is identity-bound to D partition 1')
-    check.equal(target['foreign_replacements'], [], "a refresh of zboot's own files replaces nothing foreign")
-    # zboot's files directly in EFI/zboot keep their names, no canonical copy
-    # is added beside them, and a zboot UKI under EFI/Linux is not adopted
-    # (docs/CLI.md esp).
-    check.equal(set(review['previous']), set(LOADERS), "the plan writes zboot's existing files only")
-    for path in LOADERS:
-        check((review['previous'].get(path) or {}).get('bytes', 0) > 0, f'review binds previous bytes at {path}')
+    check.equal(target['foreign_replacements'], [], "writing over zboot's own fallback replaces nothing foreign")
+    # zboot writes its two fixed paths only: the old name is reported, not
+    # written, and a zboot UKI under EFI/Linux is not adopted (docs/CLI.md esp).
+    check.equal(list(review['previous']), [FALLBACK, CANONICAL], "the plan writes zboot's two paths only")
+    check((review['previous'].get(FALLBACK) or {}).get('bytes', 0) > 0, 'review binds the previous fallback bytes')
+    check.equal(review['previous'].get(CANONICAL, 'missing'), None, 'review binds the canonical name as absent')
     check('legacy_entries' not in target, 'the plan carries no legacy record cleanup')
+    check.equal(preview['result'].get('stale_loaders'), [{'partition': partition, 'path': STALE}],
+                'the JSON preview names the stale loader')
+    check.contains(s.step('preview-text').out, stale_note(partition), 'the text preview names the stale loader and the fix')
     wrong = s.step('wrong-token')
     stale_token(check, wrong, 'ESP install with a wrong token', token)
     check.equal(s.step('esp-refused').out.split()[0], s.step('esp-before').out.split()[0],
@@ -148,6 +160,8 @@ def verdict(ev, check):
     check.equal(result['partitions'], [partition], 'outcome names the refreshed partition')
     check('operation' not in applied and 'operation_id' not in result, 'ESP publication carries no fabricated operation identity')
     check.equal(result['efi_sha256'], uki, 'result names the supplied UKI')
+    check.equal(result.get('stale_loaders'), [{'partition': partition, 'path': STALE}],
+                'the result names the stale loader it left in place')
 
     check.equal(ev.boots[0].get('killed'), -9, 'host power-cuts immediately after successful ESP publication')
     check.equal(s.step('writeback-disabled').out.strip(), '0', 'only guest periodic writeback is disabled before publication')
@@ -170,7 +184,6 @@ def verdict(ev, check):
           'ro,nosuid,nodev,noexec' in cold.step('installed-mount').argv,
           'cold verification mounts the ESP read-only')
     check.equal(cold.step('cold-legacy-record').out.strip(), 'legacy-record', 'the old operations record is left alone')
-    check.equal(cold.step('cold-no-canonical').rc, 0, 'no canonical copy is added beside the existing loader')
     check.equal(cold.step('cold-temporaries').out, '', 'completed publication leaves no staged ESP file')
 
     status = cold.step('status').json
@@ -192,21 +205,21 @@ def verdict(ev, check):
     if check.equal(len(esps), 1, 'status --devices lists the ESP'):
         check.equal(esps[0].get('target', {}).get('number'), 1, 'status binds the ESP partition identity')
         loaders = {loader['path']: loader for loader in esps[0].get('loaders', [])}
-        check.equal(set(loaders), {*LOADERS, CANONICAL},
-                    "status lists zboot's directory and both fixed paths, not EFI/Linux or vendor files")
-        canonical = loaders.get(CANONICAL, {})
-        check.equal((canonical.get('owner'), canonical.get('identity')), (None, None),
-                    'status reports the canonical name as empty')
-        check.equal((loaders.get('EFI/BOOT/BOOTX64.EFI', {}).get('identity') or {}).get('sha256'), uki,
+        check.equal(set(loaders), {*LOADERS, STALE},
+                    "status lists both fixed paths and the stale loader, not EFI/Linux or vendor files")
+        stale = loaders.get(STALE, {})
+        check.equal((stale.get('owner'), stale.get('stale')), ('zboot', True), 'status marks the old name stale')
+        check.equal((loaders.get(FALLBACK, {}).get('identity') or {}).get('sha256'), uki,
                     'durable fixed fallback status hash')
         attention = status['result'].get('attention', [])
+        check(stale_note(partition) in attention, 'status attention names the stale loader and the fix')
         for path in LOADERS:
             check(path in loaders, f'status inventories the installed loader {path}')
             if path in loaders:
                 check.equal(loaders[path].get('owner'), 'zboot', f'{path} has verified zboot ownership')
                 check(loaders[path].get('matches_installed') is True,
                       f'{path} matches the supplied shipped comparison loader')
-            check(not any(path in item for item in attention),
+            check(not any(path in item for item in attention if item != stale_note(partition)),
                   f'the matching installed loader {path} receives no attention')
         check(not any(OUTSIDE in item or 'EFI/vendor' in item for item in attention),
               'loaders outside zboot\'s paths receive no outdated-zboot attention')
@@ -214,6 +227,8 @@ def verdict(ev, check):
     for path in LOADERS:
         check.equal(installed.get(path), uki, f'cold native readback of {path}')
     check.equal(installed.get(OUTSIDE), outside, 'the zboot UKI under EFI/Linux keeps its bytes')
+    check.equal(installed.get(STALE), sums(s.step('seed-sha256')).get(STALE),
+                'the stale loader keeps its seeded bytes')
     check.equal(files(cold.step('installed-files')),
                 {k: v for k, v in OLD.items() if k not in LOADERS}, 'unrelated files preserved')
     check.equal(cold.step('mountinfo-after').out, cold.step('mountinfo-before').out, 'cold verification leaks no mount')

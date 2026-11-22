@@ -75,8 +75,8 @@ and refuses a tree or pool that changed between its queries.
    `deploy` installs it as a host, or with `--portable` as a rescue stick;
    `boot --tar` runs it in RAM. Nothing about a tar is special to its use.
 4. One grammar serves the operator, a script and the menu: the same verbs,
-   `--dry-run`, `--confirm TOKEN`, `--json`. Confirmation exists only where
-   data can be lost.
+   `--dry-run` and `--json`. Confirmation, and `--confirm TOKEN`, exist only
+   where data can be lost.
 5. A normal boot never writes to a pool.
 
 ## Model
@@ -144,9 +144,20 @@ and refuses a tree or pool that changed between its queries.
   line and a menu line. *Why:* "the menu takes the same verbs" then holds by
   construction.
 - **Shared options.** Every verb that changes a pool, a disk or an ESP takes
-  `--dry-run` and `--confirm TOKEN`; every verb but the two interactive ones
-  takes `--json`. *Why:* one sentence replaces a per-verb table, and a script
-  can always run exactly what it previewed.
+  `--dry-run`; every verb but the two interactive ones takes `--json`. Only a
+  verb whose plan can lose data, always or in some cases, takes
+  `--confirm TOKEN`, and it checks the token even when this plan loses
+  nothing. A verb that cannot lose data plans once, under the writer lock,
+  and prints no token. *Why:* a script can run exactly what it previewed
+  wherever that binding protects data; on a creation or metadata verb a
+  token bound nothing worth binding and cost a second plan on every run.
+- **Each form carries only its legal options.** `deploy DISK` and
+  `deploy --image` make a disk or an image with its own ESP and pool;
+  `deploy into POOL`, a subcommand, adds a boot environment to an imported
+  pool. *Why a subcommand:* the two share the content options and nothing
+  else; as one flat form every pool, ESP and hostid option needed a conflict
+  rule and a refusal for the pool form. A disk path starts with `/dev/`, so
+  it is never read as `into`.
 - **A token that no longer matches is refused**, with no new token. *Why:* a
   caller that retries with whatever token the output contains would otherwise
   confirm a plan nobody reviewed. Generated values (a snapshot name, a random
@@ -195,7 +206,8 @@ Only one cooperating zboot or zsnap writer runs at a time on a host: they share
 one `flock` at `/run/zfs-tools/writer.lock`. It does not exclude another host
 or direct `zfs` and `zpool` commands. Read-only and session commands never take
 it. A zboot writer plans, previews and asks without it and takes it when it is
-about to act, where its engine plans again. A zsnap writer takes it at entry,
+about to act, where its engine plans again; a writer that cannot lose data
+takes it first and plans once under it. A zsnap writer takes it at entry,
 except a `prune` that asks, which takes it after the answer and plans again
 under it, refusing if what it would delete has changed. A preview or a
 prompt never holds it, so a zsnap timer never waits on a prompt.
@@ -396,6 +408,12 @@ under that record.
   so the operator moves it out before a switch needs that.
 - **Only an absent DEST is created.** `sync SRC DEST` into an existing DEST
   needs DEST to be SRC's peer; an existing unpaired DEST is refused.
+- **A sync receives only into the fenced copy.** From a pair's secondary it
+  is refused before any effect, and the message names `primary SRC`, which
+  is how the working copy changes. *Why:* receiving into the working copy
+  meant unmounting and fencing it, then restoring its placement and any
+  received property layer and mounting it again, machinery nothing else
+  needs.
 - **A takeover loses exactly what was reviewed.** It checks the digest of its
   planned peer loss again once the peer is fenced, so a write between plan and
   fence is never rolled back unconfirmed. Activation needs the peer fenced, so
@@ -441,9 +459,7 @@ A transfer copies one leaf into one dataset through the host's own
 or `-p` the stream carries no properties, so the receive changes no property
 of an existing dataset: only the data, a volume's `volsize`, and for an
 encrypted dataset its key material. zboot sets the copy's properties itself.
-The usual direction is into the fenced copy; `sync SECONDARY PRIMARY` brings a
-working copy that is behind up to date the same way, and the roles do not
-change.
+The receiver is always fenced: a pair's secondary, or a new copy.
 
 The steps: fence the receiver, its placement saved with the frozen plan
 (local `readonly=on`, a volume `volmode=none`, a filesystem `canmount=noauto`
@@ -456,10 +472,9 @@ one the receiver names differently; reconcile properties and prove the key
 wrapping; stream one incremental to the boundary; verify; publish. Publishing
 restores a new copy's mountpoint and drops its filesystems' `volmode` (a copy
 made by an earlier build keeps a local `volmode=none` until its next
-`primary`), gives a fenced copy its at-rest role, and gives a working copy
-that received its saved placement back, its `volmode` included, and mounts
-it again. A new copy saves the source's placement, so activating it alone
-gives it the source's `volmode` set by hand.
+`primary`) and leaves the copy fenced at rest. A new copy saves the source's
+placement, so activating it alone gives it the source's `volmode` set by
+hand.
 
 Every step before data runs again on every attempt. A retry recomputes the
 stream from native state: OpenZFS discards a receive that a crash cut, and the
@@ -502,10 +517,7 @@ iterations; a key file by `zfs load-key -n` opening both roots. A prompted raw
 or hex key cannot be proved and refuses.
 
 A new root-shaped copy gets an explicit empty `zboot:cmdline` when its source
-sets none. A leftover `zboot:be`, the marker by which builds before the
-markerless menu knew a boot environment, is ignored wherever it remains and
-nothing writes it: a host that still carries it boots, and the marker can be
-removed afterwards.
+sets none.
 
 ## Trees
 
@@ -733,8 +745,8 @@ from. A host adds its network and firmware with `--packages`.
 | `deploy` options | disk, pool, BE, ESP, swap, hostid, hostname, portable | zboot itself uses the value |
 
 - Overlays apply left to right, files then hook; a later file replaces an
-  earlier one, nothing is merged. The token binds every entry's digest,
-  built-ins included. Writes never follow a symlink already in the root. After
+  earlier one, nothing is merged. The plan, and a `deploy DISK` token, bind
+  every entry's digest, built-ins included. Writes never follow a symlink already in the root. After
   all hooks, `deploy` enforces `/etc/hostid` and an explicit `--hostname`.
   `builtin:` overlays are files only, so `boot --tar` applies them as deploy
   does.
@@ -750,9 +762,9 @@ from. A host adds its network and firmware with `--packages`.
 ### deploy
 
 `deploy` unpacks a root tar as a boot environment on a disk (erased, then
-partitioned), on a new image file through a loop device, or in an existing
-pool (`--into`). It sets only the new pool's `bootfs` and never clears
-another's. A host deploy writes `/etc/hostid` and rebuilds no initrd, because
+partitioned) or on a new image file through a loop device, sized to its
+content; `deploy into` unpacks one in an existing pool. `deploy` sets only
+the new pool's `bootfs` and never clears another's; `deploy into` sets none. A host deploy writes `/etc/hostid` and rebuilds no initrd, because
 the UKI passes the hostid at every kexec.
 
 - **Deploy keeps no record and has no resume.** The token binds the erase
@@ -761,7 +773,7 @@ the UKI passes the hostid at every kexec.
   again on the erased disk, which must still be bare and pass every usage
   guard, and proceeds only if the binding is unchanged. After a failure it is
   rerun with a fresh plan and confirmation. Its attempt directory under
-  `/run/zboot/deploy/` holds only the post-install hook logs; `deploy --into`
+  `/run/zboot/deploy/` holds only the post-install hook logs; `deploy into`
   has no attempt directory and writes its hook logs directly in `/run`.
 - **One zap before partitioning.** Deploy runs `sgdisk --zap-all` on the erased
   disk. *Why:* after an NVMe sanitize, LBA 0 holds whatever the controller
@@ -771,14 +783,14 @@ the UKI passes the hostid at every kexec.
   overlays; check the boot files, snapshot `BE@deployed` and set `bootfs`
   last. A hook runs in a chroot in its own PID namespace, with service starts
   refused and its output in a 0600 log, `deploy-ID-post-install-N.log`
-  (`zboot-into-ID-post-install-N.log` for `--into`). A
+  (`zboot-deploy-into-ID-post-install-N.log` for `deploy into`). A
   failed overlay or hook rolls the unpublished BE back to `@factory`; hooks
   are never replayed.
 - `--image` creates its file exclusively and holds it throughout; on failure
   it removes the file only after proving its loop device detached.
-- `--esp-partition PART` writes zboot's files on another disk's ESP as
-  `esp PART` would, except that it never writes the fallback, and refuses when
-  the canonical name or the fallback holds another system's file.
+- `--esp-partition PART` writes `EFI/zboot/zboot.efi` on another disk's ESP,
+  never the fallback, and refuses when either path holds another system's
+  file.
 
 ### deploy --portable
 
@@ -811,34 +823,39 @@ writing to its pool; changes live in RAM until the next boot.
 
 ### esp
 
-zboot's paths on an ESP are the firmware fallback `EFI/BOOT/BOOTX64.EFI` and
-the files directly in `EFI/zboot/`. A file there is zboot's when it is a UKI
-whose `.osrel` has `ID=zboot`.
-Nothing else on the ESP is read or written; subdirectories of `EFI/zboot/` are
-ignored.
+zboot writes two paths on an ESP: `EFI/zboot/zboot.efi` and the firmware
+fallback `EFI/BOOT/BOOTX64.EFI`. A file there is zboot's when it is a UKI
+whose `.osrel` has `ID=zboot`. Nothing else on the ESP is written.
 
-- **Refresh (`esp`)** takes every ESP holding one of zboot's files on a disk
-  that also holds an imported pool. That covers a pair's second disk and
+- **Refresh (`esp`)** takes every ESP holding one of zboot's loaders on a
+  disk that also holds an imported pool. That covers a pair's second disk and
   leaves a rescue stick alone, so the fallback medium is never updated in the
   same step. It also takes the ESP this boot came from when the root is on a
   writable pool and that ESP is on a fixed NVMe or SATA disk. *Why:* a host
   whose firmware starts the menu from another internal disk would otherwise
   keep booting the old menu, while a stick booted after a bad update is the
-  fallback. On each ESP it rewrites zboot's files in `EFI/zboot/` under their
-  names (firmware entries point at them) and the fallback when it is zboot's
-  or empty, and leaves another system's file at either fixed path in place
-  and names it. It needs no confirmation.
-- **Install (`esp PART`).** On an ESP with none of zboot's files directly in
-  `EFI/zboot/` it writes `EFI/zboot/zboot.efi` and the fallback; replacing
-  another system's file at either is typed. The fallback is written first, so
-  a rerun after a failure finishes the install. On an ESP that already has
-  one of zboot's files there it refreshes, adding no second copy beside a
-  loader firmware already boots. A zboot fallback alone does not count as
-  installed.
+  fallback. On each ESP it writes each of the two paths that holds zboot's
+  loader or nothing, and leaves another system's file at either in place and
+  names it. It needs no confirmation.
+- **Install (`esp PART`).** Where `EFI/zboot/zboot.efi` is not zboot's it
+  writes both paths; replacing another system's file at either is typed. The
+  fallback is written first, so a rerun after a failure finishes the
+  install. Where zboot is installed it refreshes. A zboot fallback alone does
+  not count as installed.
+- **Fixed names.** zboot's own UKIs under other names directly in
+  `EFI/zboot/` (earlier builds refreshed them in place, and older installs
+  wrote `zboot-recovery.efi`) are stale: `esp` and `status --devices` name
+  each and say to point the firmware entry at `EFI/zboot/zboot.efi` and then
+  remove it. *Why not refresh or remove them:* refreshing every name took
+  directory scanning, case matching and a bounded write set for little use,
+  and removing one could take away the file firmware boots. An ESP holding
+  only a stale loader still counts as zboot's, so `esp` adds the canonical
+  name there.
 - One plan covers all the ESPs and binds every partition, path and finding;
-  free space is checked when it is made. Each file is replaced atomically. A
-  failure after an earlier ESP changed is partial (exit 4); `esp` keeps no
-  record and is rerun. It writes no firmware boot entry.
+  free space is checked when it is made. Each ESP is checked against the plan
+  again as it is written, and each file is replaced atomically. A failure
+  after an earlier ESP changed is partial (exit 4); `esp` keeps no record and
+  is rerun. It writes no firmware boot entry.
 
 ### Building the UKI
 
@@ -946,9 +963,8 @@ stays on B until the operator drops it. Decryption is never exercised, so a
 raw-send bug visible only in decrypted data's MAC would go undetected.
 
 The source is an explicit recursive `BE@SNAP` or the running BE, snapshotted
-now. Only the menu's picker chooses a snapshot for a bare BE, because the plan
-it leads to names that snapshot to the person who then types the disk's
-serial. A returns with the source BE's own `/etc/hostid`, and every import of
+now; nothing chooses a snapshot for a bare BE, so the snapshot the disk's
+serial is typed for is the one the operator named. A returns with the source BE's own `/etc/hostid`, and every import of
 A runs under it.
 
 State is one `zboot:operation` record on B. Staging is `B/zboot-restore-<id>`,
@@ -1032,7 +1048,7 @@ RESTORE-PROPERTIES-NATIVE.
 - **Snapshot timers and backup jobs** use zsnap's policy and supervised reader
   contracts.
 - **Loader paths and the kernel command line** keep zboot's ESP paths and the
-  handoff tokens (`boot=zfs`, `root=ZFS=`, `zboot.trace=`, `spl.spl_hostid=`).
+  handoff tokens (`boot=zfs`, `root=ZFS=`, `spl.spl_hostid=`).
 
 All active writers touching the same target must be tested together, stay
 compatible when changing shared state, and leave interrupted work recoverable
@@ -1066,9 +1082,10 @@ no open operation; no persistent writer epoch enforces this across builds.
 - **Fork leftovers.** A fork leaves in place a staging container that holds
   something zboot did not make, another tool's snapshot for one, and names
   it; `drop` removes it after listing what it holds.
-- **ESP copies elsewhere.** A zboot UKI outside `EFI/zboot/` and the fallback
-  (in `EFI/Linux/`, say) is neither refreshed nor reported. Old
-  `EFI/zboot/operations/*.json` files are inert; remove them by hand.
+- **ESP copies elsewhere.** A zboot UKI outside zboot's two paths and
+  `EFI/zboot/` itself (in `EFI/Linux/` or a subdirectory, say) is neither
+  refreshed nor reported. Old `EFI/zboot/operations/*.json` files are inert;
+  remove them by hand.
 - **User property values in tab-separated output.** OpenZFS validates user
   property names, not values, and `zfs get -H` cannot delimit a value that
   holds a tab and a newline. The library's inventory keeps user properties

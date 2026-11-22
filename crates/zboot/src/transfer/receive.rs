@@ -9,7 +9,6 @@ use zfs_tools::engine::pool_of;
 #[serde(deny_unknown_fields)]
 pub struct Session {
     pub source: BTreeMap<String, ReceivePlacement>,
-    pub existing: BTreeMap<String, ReceivePlacement>,
     pub container: Option<Container>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +73,6 @@ pub(super) fn capture(
                     return Err(refuse("placement source import view changed"));
                 }
                 let props = backend.properties(&member.bound.endpoint)?;
-                let received = backend.received_properties(&member.bound.endpoint)?;
                 let after = PairBackend::observe(backend)?;
                 refuse_altroot(&after, &member.bound.endpoint.name)?;
                 if endpoint(&after, &member.bound.endpoint.name)? != member.bound.endpoint {
@@ -84,14 +82,23 @@ pub(super) fn capture(
                 }
                 Ok((
                     relative.clone(),
-                    ReceivePlacement::capture(
-                        member.kind == history::Kind::Volume,
-                        &props,
-                        &received,
-                    )?,
+                    ReceivePlacement::capture(member.kind == history::Kind::Volume, &props)?,
                 ))
             })
             .collect()
+    }
+    // An existing receiver is the one the plan bound, on a pool without an
+    // altroot, before the commit records anything; only that is read of it.
+    if let Some(receiver) = plan.destination.existing() {
+        let state = PairBackend::observe(backend)?;
+        for member in receiver.members.values() {
+            refuse_altroot(&state, &member.bound.endpoint.name)?;
+            if endpoint(&state, &member.bound.endpoint.name)? != member.bound.endpoint {
+                return Err(refuse(
+                    "the receiving copy was replaced since the plan; nothing was recorded",
+                ));
+            }
+        }
     }
     let container = match &plan.destination {
         Destination::Existing { .. } => None,
@@ -109,12 +116,6 @@ pub(super) fn capture(
     };
     Ok(Session {
         source: tree(&plan.source, backend)?,
-        existing: plan
-            .destination
-            .existing()
-            .map(|t| tree(t, backend))
-            .transpose()?
-            .unwrap_or_default(),
         container,
     })
 }
@@ -126,11 +127,6 @@ pub(super) fn validate(
     plan: &TransferPlan,
     id: &str,
 ) -> Result<(), Error> {
-    let existing: BTreeSet<_> = plan
-        .destination
-        .existing()
-        .map(|tree| tree.members.keys().cloned().collect())
-        .unwrap_or_default();
     let container_matches = match (&plan.destination, &session.container) {
         (Destination::Existing { .. }, None) => true,
         (Destination::Absent { name, parent }, Some(container)) => {
@@ -142,10 +138,7 @@ pub(super) fn validate(
         }
         _ => false,
     };
-    if session.source.keys().ne(plan.source.members.keys())
-        || session.existing.keys().ne(existing.iter())
-        || !container_matches
-    {
+    if session.source.keys().ne(plan.source.members.keys()) || !container_matches {
         return Err(refuse(
             "receive session differs from the frozen transfer scope",
         ));
@@ -659,7 +652,12 @@ pub(super) fn finish(
             let parent = (!relative.is_empty())
                 .then(|| relative.rsplit_once('/').map_or("", |(parent, _)| parent));
             let parent_name = parent.map(|p| mapped(&destination, p));
-            if operation.receive.existing.contains_key(relative) {
+            if operation
+                .plan
+                .destination
+                .existing()
+                .is_some_and(|tree| tree.members.contains_key(relative))
+            {
                 // An existing copy's mountpoint was never changed.
                 continue;
             }
@@ -675,11 +673,7 @@ pub(super) fn finish(
                             .map(|value| (parent_name.as_deref().unwrap(), value))
                     }),
                 );
-                backend.restore_receive_property(
-                    &member.bound.endpoint,
-                    PropertyKey::Mountpoint,
-                    &value,
-                )?;
+                backend.publish_mountpoint(&member.bound.endpoint, &value)?;
                 points.insert(relative.clone(), value);
             }
             let e = &member.bound.endpoint;
@@ -817,83 +811,4 @@ pub(super) fn retire(
         save(record, operation, backend)?;
     }
     Ok(())
-}
-
-/// Restore writable-side roles only after every member's data and inactive
-/// placement was verified, preserving existing native property provenance.
-pub(super) fn activate(
-    operation: &TransferOperation,
-    backend: &mut impl TransferBackend,
-) -> Result<(), Error> {
-    let session = &operation.receive;
-    let target = operation.received.as_ref().unwrap();
-    for (relative, member) in &target.members {
-        if let Some(original) = session.existing.get(relative) {
-            if let Some(canmount) = &original.canmount {
-                backend.restore_receive_property(
-                    &member.bound.endpoint,
-                    PropertyKey::Canmount,
-                    canmount,
-                )?;
-            }
-        } else if let Some(mode) = member.bound.placement.canmount {
-            backend.set_property(&member.bound.endpoint, &PropertyValue::Canmount(mode))?;
-        }
-    }
-    // A volume that receives as the working copy gets its device back.
-    for (relative, member) in &target.members {
-        if member.kind == history::Kind::Volume
-            && let Some(original) = session.existing.get(relative)
-        {
-            backend.restore_receive_property(
-                &member.bound.endpoint,
-                PropertyKey::Volmode,
-                &original.volmode,
-            )?;
-        }
-    }
-    // No descendant can inherit a writable role until every final canmount
-    // role and recorded target incarnation has passed native readback.
-    let state = PairBackend::observe(backend)?;
-    for member in target.members.values() {
-        if endpoint(&state, &member.bound.endpoint.name)? != member.bound.endpoint {
-            return Err(refuse("receive activation target incarnation changed"));
-        }
-        if let Some(mode) = member.bound.placement.canmount
-            && backend
-                .properties(&member.bound.endpoint)?
-                .get("canmount")
-                .is_none_or(|p| p.value != mode.native())
-        {
-            return Err(refuse("receive activation canmount role was not verified"));
-        }
-    }
-    let mut readonly: BTreeMap<String, SavedProperty> = BTreeMap::new();
-    for (relative, member) in &target.members {
-        let value = if let Some(original) = session.existing.get(relative) {
-            original.readonly.clone()
-        } else {
-            let parent = (!relative.is_empty())
-                .then(|| relative.rsplit_once('/').map_or("", |(parent, _)| parent));
-            let parent_name = parent.map(|p| mapped(&target.endpoint.name, p));
-            crate::placement::new_member_property(
-                "readonly",
-                &session.source[relative].readonly,
-                if member.bound.placement.readonly {
-                    "on"
-                } else {
-                    "off"
-                },
-                &member.bound.endpoint.name,
-                parent.and_then(|p| {
-                    readonly
-                        .get(p)
-                        .map(|value| (parent_name.as_deref().unwrap(), value))
-                }),
-            )
-        };
-        backend.restore_receive_property(&member.bound.endpoint, PropertyKey::Readonly, &value)?;
-        readonly.insert(relative.clone(), value);
-    }
-    backend.sync(&target.endpoint)
 }

@@ -954,13 +954,14 @@ pub(crate) mod semantic_tests {
             "zboot:peer",
             "zboot:paired",
             "zboot:passive",
+            "zboot:be",
         ] {
             let mut fixture = Fixture::new(1);
             fixture.metadata = Some(property.into());
             assert!(fixture.protect(&fixture.request()).is_err(), "{property}");
             assert_eq!(fixture.effects, 0);
         }
-        for property in ["zboot:role", "zboot:future"] {
+        for property in ["zboot:role", "zboot:future", "zboot:be"] {
             let mut fixture = Fixture::new(1);
             fixture.pool_metadata = Some(property.into());
             assert!(fixture.protect(&fixture.request()).is_err(), "{property}");
@@ -976,14 +977,6 @@ pub(crate) mod semantic_tests {
         fixture.snapshots[0].defer_destroy = true;
         assert!(fixture.protect(&fixture.request()).is_err());
         assert_eq!(fixture.effects, 0);
-    }
-    #[test]
-    fn a_retired_boot_marker_does_not_require_a_management_adapter() {
-        let mut fixture = Fixture::new(1);
-        fixture.metadata = Some("zboot:be".into());
-        fixture.pool_metadata = Some("zboot:be".into());
-        fixture.protect(&fixture.request()).unwrap();
-        assert!(fixture.effects > 0);
     }
     #[test]
     fn deferred_release_reports_protection_ended_and_possible_completion() {

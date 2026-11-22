@@ -410,8 +410,9 @@ pub fn plan(snaps: &[(String, DateTime<Utc>)], keep: &Keep, now: DateTime<Utc>) 
     out
 }
 
-/// Retention candidates (those `plan` keeps for no reason), never delete authority.
-pub fn forget(snaps: &[(String, DateTime<Utc>)], keep: &Keep, now: DateTime<Utc>) -> Vec<String> {
+/// Retention candidates (those `plan` keeps for no reason), for unit tests.
+#[cfg(test)]
+fn forget(snaps: &[(String, DateTime<Utc>)], keep: &Keep, now: DateTime<Utc>) -> Vec<String> {
     plan(snaps, keep, now)
         .into_iter()
         .filter(|d| !d.kept())

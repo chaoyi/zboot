@@ -82,10 +82,9 @@ build_image() { # KIND: current identity route is deliberately outside zboot
     must "$build_kind-preview" zboot deploy --image "$image" --portable \
         --tar /fixtures/e2e-factory.tar.zst --overlay builtin:rescue --overlay "$ACCESS" \
         --be rescue --esp 512M --dry-run --json
-    token=$(json .token) || fail 'image preview lacks token'
     must "$build_kind-apply" zboot deploy --image "$image" --portable \
         --tar /fixtures/e2e-factory.tar.zst --overlay builtin:rescue --overlay "$ACCESS" \
-        --be rescue --esp 512M --confirm "$token" --json
+        --be rescue --esp 512M --json
     applied=$ZT_LAST.out
     directory=$(jq -er '.result.outcome.journal_directory' "$applied") || fail 'no image attempt directory'
     operation=$(jq -er '.result.outcome.operation_id' "$applied") || fail 'no image operation id'

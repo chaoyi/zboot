@@ -121,7 +121,6 @@ fn restore_rebuilds_a_with_kept_data_and_original_properties() {
 
     // The BE, as B has it, is A's one boot default.
     let be = "rpool/ROOT/debian";
-    assert_eq!(value(&fake, be, "zboot:be"), None);
     assert_eq!(value(&fake, be, "mountpoint").unwrap().0, "/");
     assert_eq!(value(&fake, be, "canmount").unwrap().0, "noauto");
     assert_eq!(value(&fake, be, "readonly").unwrap().0, "off");
@@ -3170,7 +3169,6 @@ fn restored_but_unconfigured_abandon_preserves_original_member_metadata_and_keep
         &alice.volmode,
     ] {
         assert_eq!(saved.source, "received");
-        assert_eq!(saved.received.as_deref(), Some(saved.value.as_str()));
     }
     assert_eq!(
         manifest.kept["home"].members["bob"]
@@ -4107,11 +4105,7 @@ fn unknown_managed_receipt_properties_and_live_management_still_refuse() {
     let mut fake = before_publication();
     let state = active_restore_state(&mut fake);
     let original = super::receipt::read(&mut fake, &state, ID).unwrap();
-    // The retired boot marker never enters a receipt this zboot captures.
-    for key in [
-        "zboot:future-role",
-        zfs_tools::engine::management::RETIRED_MARKER,
-    ] {
+    for key in ["zboot:future-role", "zboot:be"] {
         let mut receipt = original.clone();
         receipt
             .source_tree

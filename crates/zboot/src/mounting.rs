@@ -99,7 +99,6 @@ pub(crate) fn owned_automounts(state: &NativeState) -> Vec<(&str, &str)> {
 mod tests {
     use super::*;
     use crate::tree::{Backend, fake::Fake};
-    use zfs_tools::engine::native::NativeProperty;
 
     fn fixture() -> Fake {
         let mut fake = Fake::new();
@@ -190,36 +189,6 @@ mod tests {
         let reason = refusal(&state, Some("a/ROOT/b")).unwrap();
         assert!(reason.contains("a/ROOT/be/var has canmount=on and would mount over a/ROOT/b"));
         assert!(reason.contains("`zfs set canmount=noauto a/ROOT/be/var`"));
-    }
-
-    #[test]
-    fn legacy_markers_neither_create_roots_nor_steal_ownership() {
-        for (value, source) in [
-            ("1", "local"),
-            ("0", "local"),
-            ("anything", "received"),
-            ("1", "inherited from a/ROOT/be"),
-        ] {
-            let mut fake = fixture();
-            fake.set("a/ROOT/be/var/log", "canmount", "on");
-            fake.set("a/data/files", "canmount", "on");
-            let mut state = fake.observe().unwrap();
-            for name in ["a/ROOT/be/var", "a/data"] {
-                state.dataset_properties.get_mut(name).unwrap().insert(
-                    "zboot:be".into(),
-                    NativeProperty {
-                        value: value.into(),
-                        source: source.into(),
-                    },
-                );
-            }
-            assert_eq!(
-                automount_in_boot_environments(&state),
-                ["a/ROOT/be/var/log"]
-            );
-            assert_eq!(refusal(&state, Some("a/ROOT/be")), None);
-            assert!(refusal(&state, Some("a/ROOT/be/var")).is_some());
-        }
     }
 
     #[test]

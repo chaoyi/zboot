@@ -192,7 +192,6 @@ fn set_with(
 fn inherit_with(
     endpoint: &Endpoint,
     key: PropertyKey,
-    received: bool,
     mut properties: impl FnMut(
         &Endpoint,
     ) -> Result<std::collections::BTreeMap<String, NativeProperty>, Error>,
@@ -208,11 +207,7 @@ fn inherit_with(
         return Err(refuse("unsupported receive placement property"));
     }
     properties(endpoint)?;
-    let mut args = vec!["inherit".into()];
-    if received {
-        args.push("-S".into());
-    }
-    args.extend([key.native().into(), endpoint.name.clone()]);
+    let args = ["inherit".into(), key.native().into(), endpoint.name.clone()];
     let result = command(&args);
     let mut after = properties(endpoint)?;
     let property = after.remove(key.native());
@@ -236,16 +231,15 @@ impl NativeMutation {
         })
     }
 
-    /// Restore an inherited/default or received native property after a
-    /// verified inert receive. The caller keeps canmount=noauto during a
-    /// mountpoint inherit, because native inherit has no -u option.
+    /// Restore an inherited or default native property after a verified
+    /// inert receive. The caller keeps canmount=noauto during a mountpoint
+    /// inherit, because native inherit has no -u option.
     pub fn inherit_native(
         &mut self,
         endpoint: &Endpoint,
         key: PropertyKey,
-        received: bool,
     ) -> Result<Option<NativeProperty>, Error> {
-        inherit_with(endpoint, key, received, bound_properties, |args| {
+        inherit_with(endpoint, key, bound_properties, |args| {
             native::run_mutating("zfs", args)
         })
     }
@@ -352,7 +346,7 @@ mod tests {
         );
         // The attachment backend refuses exactly these semantic writes,
         // including the valid empty command-line value, before any native I/O.
-        for key in ["mountpoint", "zboot:be", "zboot:cmdline"] {
+        for key in ["mountpoint", "zboot:cmdline"] {
             let error = crate::engine::attachment::NativeAttachment
                 .set(&endpoint, &[(key.into(), "1".into())])
                 .unwrap_err()
@@ -460,32 +454,32 @@ mod tests {
     }
 
     #[test]
-    fn canmount_received_inherit_route_restores_default_without_local_set() {
+    fn placement_inherit_is_verified_from_native_state() {
         use std::{cell::RefCell, collections::BTreeMap};
         let endpoint = endpoint();
-        let props = RefCell::new(BTreeMap::from([(
-            "canmount".into(),
-            NativeProperty {
-                value: "noauto".into(),
-                source: "local".into(),
-            },
-        )]));
-        let mut commands = vec![];
+        let local = |key: &str, value: &str| {
+            RefCell::new(BTreeMap::from([(
+                key.to_string(),
+                NativeProperty {
+                    value: value.into(),
+                    source: "local".into(),
+                },
+            )]))
+        };
+        let props = local("mountpoint", "/data");
         let restored = inherit_with(
             &endpoint,
-            PropertyKey::Canmount,
-            true,
+            PropertyKey::Mountpoint,
             |ep| {
                 assert_eq!(ep, &endpoint);
                 Ok(props.borrow().clone())
             },
             |args| {
-                commands.push(args.to_vec());
-                assert_eq!(args, ["inherit", "-S", "canmount", "tank/data"]);
+                assert_eq!(args, ["inherit", "mountpoint", "tank/data"]);
                 props.borrow_mut().insert(
-                    "canmount".into(),
+                    "mountpoint".into(),
                     NativeProperty {
-                        value: "on".into(),
+                        value: "/tank/data".into(),
                         source: "default".into(),
                     },
                 );
@@ -494,23 +488,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(restored.value, "on");
         assert_eq!(restored.source, "default");
-        assert_eq!(commands.len(), 1);
-        // libzfs rejects the plain-inherit route for this non-inheritable
-        // property; command success is never fabricated from a receipt.
-        props.borrow_mut().insert(
-            "canmount".into(),
-            NativeProperty {
-                value: "noauto".into(),
-                source: "local".into(),
-            },
-        );
+        // libzfs rejects inheriting this non-inheritable property; command
+        // success is never fabricated from a receipt.
+        let props = local("canmount", "noauto");
         assert!(
             inherit_with(
                 &endpoint,
                 PropertyKey::Canmount,
-                false,
                 |_| Ok(props.borrow().clone()),
                 |args| {
                     assert_eq!(args, ["inherit", "canmount", "tank/data"]);

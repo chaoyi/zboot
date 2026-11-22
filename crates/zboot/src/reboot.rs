@@ -21,7 +21,7 @@ fn refuse(message: impl ToString) -> io::Error {
 }
 
 /// Which ESP the request goes to: the one this boot was loaded from, or the
-/// one `--esp` names. Bound by the token with the ESP's identity.
+/// one `--esp` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Chosen {
@@ -165,10 +165,7 @@ pub fn plan(key: Option<&Path>, esp: Option<&str>) -> io::Result<Review> {
     )?;
     review(target, chosen, keys)
 }
-pub fn consent(review: &Review) -> io::Result<String> {
-    crate::consent::token(review)
-}
-pub fn describe(review: &Review, token: &str) -> String {
+pub fn describe(review: &Review) -> String {
     let keys = if review.fingerprints.is_empty() {
         "no SSH; temporary menu wait".into()
     } else {
@@ -179,7 +176,7 @@ pub fn describe(review: &Review, token: &str) -> String {
         Chosen::Esp => "given by --esp",
     };
     format!(
-        "Reboot into menu via {} (PARTUUID {}), {chosen}\nKeys: {keys}\nToken: {token}\n",
+        "Reboot into menu via {} (PARTUUID {}), {chosen}\nKeys: {keys}\n",
         zfs_tools::engine::escape_display(&review.target.partition.path),
         zfs_tools::engine::escape_display(
             review
@@ -263,8 +260,7 @@ fn publish_at(
     result
 }
 
-pub fn apply(review: &Review, token: &str) -> io::Result<()> {
-    crate::consent::unchanged(token, &consent(review)?)?;
+pub fn apply(review: &Review) -> io::Result<()> {
     match review.chosen {
         Chosen::Booted => {
             if remote_access::loader_esp()?.as_ref() != Some(&review.target) {
@@ -484,28 +480,15 @@ mod tests {
         );
     }
     #[test]
-    fn the_token_binds_the_chosen_esp_and_how_it_was_chosen() {
+    fn the_plan_names_the_chosen_esp_and_how_it_was_chosen() {
         let keys = || read_keys(None).unwrap();
-        let booted = consent(&review(target(), Chosen::Booted, keys()).unwrap()).unwrap();
-        let given = consent(&review(target(), Chosen::Esp, keys()).unwrap()).unwrap();
-        let other = consent(&review(stick(), Chosen::Esp, keys()).unwrap()).unwrap();
-        let mut reformatted = target();
-        reformatted.partition.filesystem_uuid = Some("1234-5678".into());
-        let reformatted = consent(&review(reformatted, Chosen::Esp, keys()).unwrap()).unwrap();
-        assert_ne!(booted, given);
-        assert_ne!(given, other);
-        assert_ne!(given, reformatted);
-        assert_eq!(
-            given,
-            consent(&review(target(), Chosen::Esp, keys()).unwrap()).unwrap()
-        );
         let planned = review(target(), Chosen::Booted, keys()).unwrap();
-        assert!(describe(&planned, &booted).starts_with(
+        assert!(describe(&planned).starts_with(
             "Reboot into menu via /dev/test1 (PARTUUID 12345678-1234-1234-1234-123456789abc), \
                  the ESP this system booted from\n"
         ));
         let planned = review(target(), Chosen::Esp, keys()).unwrap();
-        assert!(describe(&planned, &given).contains("), given by --esp\n"));
+        assert!(describe(&planned).contains("), given by --esp\n"));
     }
     #[test]
     fn a_missing_key_file_is_named() {

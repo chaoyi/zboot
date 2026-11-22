@@ -57,11 +57,10 @@ pub(crate) struct ProtectOptions {
     /// Forward this named non-loader environment variable to the reader.
     #[arg(long = "env")]
     pub environment: Vec<String>,
-    #[arg(long, default_value_t = 30)]
+    /// Test-only: seconds to wait for a stopped reader subtree.
+    #[arg(long, default_value_t = 30, hide = true)]
     pub stop_timeout: u64,
-    #[arg(long)]
-    pub dry_run: bool,
-    #[arg(last=true, num_args=1.., required_unless_present="dry_run")]
+    #[arg(last = true, num_args = 1.., required = true)]
     pub command: Vec<OsString>,
 }
 #[derive(Debug, Args)]
@@ -79,7 +78,8 @@ pub(crate) struct RecoverOptions {
     pub dry_run: bool,
     #[arg(long)]
     pub json: bool,
-    #[arg(long, default_value_t = 30)]
+    /// Test-only: seconds to wait for a stopped reader subtree.
+    #[arg(long, default_value_t = 30, hide = true)]
     pub stop_timeout: u64,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -359,33 +359,18 @@ fn prepare_request(options: &ProtectOptions) -> Result<ReaderRequest> {
     } else {
         let mut sources = Vec::new();
         for source in &options.sources {
-            if options.capture {
-                let observed = zfs_tools::observe_dataset(source)?;
-                if *observed.kind() != DatasetKind::Filesystem {
-                    bail!("file readers require exact filesystem targets");
-                }
-                sources.push(SourceInput::Capture {
+            sources.push(if options.capture {
+                SourceInput::Capture {
                     dataset: source.clone(),
-                    identity: observed.identity().clone(),
+                    identity: admit_filesystem(source)?,
                     alias: None,
-                });
+                }
             } else {
-                let snapshot = zfs_tools::observe_snapshot(source)?;
-                let parent = snapshot.name.split_once('@').map_or("", |(ds, _)| ds);
-                let observed = zfs_tools::observe_dataset(parent)?;
-                if *observed.kind() != DatasetKind::Filesystem {
-                    bail!("file readers require filesystem targets");
-                }
-                if snapshot.dataset_guid != observed.identity().guid
-                    || snapshot.identity.pool_guid != observed.identity().pool_guid
-                {
-                    bail!("reviewed reader snapshot incarnation changed");
-                }
-                sources.push(SourceInput::Snapshot {
-                    snapshot,
+                SourceInput::Snapshot {
+                    snapshot: admit_snapshot(source)?,
                     alias: None,
-                });
-            }
+                }
+            });
         }
         ReaderRequest {
             schema_version: 1,
@@ -407,22 +392,16 @@ fn prepare_request(options: &ProtectOptions) -> Result<ReaderRequest> {
     reader_view::validate_layout(&options.view, &aliases)?;
     if from_json {
         for source in &request.sources {
-            let observed = zfs_tools::observe_dataset(source.dataset())?;
-            if *observed.kind() != DatasetKind::Filesystem {
-                bail!("file readers require filesystem targets");
-            }
             match source {
                 SourceInput::Snapshot { snapshot, .. } => {
-                    let exact = zfs_tools::observe_snapshot(&snapshot.name)?;
-                    if &exact != snapshot
-                        || exact.dataset_guid != observed.identity().guid
-                        || exact.identity.pool_guid != observed.identity().pool_guid
-                    {
+                    if &admit_snapshot(&snapshot.name)? != snapshot {
                         bail!("reviewed reader snapshot incarnation changed");
                     }
                 }
-                SourceInput::Capture { identity, .. } => {
-                    if observed.identity() != identity {
+                SourceInput::Capture {
+                    dataset, identity, ..
+                } => {
+                    if &admit_filesystem(dataset)? != identity {
                         bail!("reviewed capture dataset incarnation changed");
                     }
                 }
@@ -430,6 +409,25 @@ fn prepare_request(options: &ProtectOptions) -> Result<ReaderRequest> {
         }
     }
     Ok(request)
+}
+/// The current identity of an exact filesystem a reader may use.
+fn admit_filesystem(dataset: &str) -> Result<DatasetIdentity> {
+    let observed = zfs_tools::observe_dataset(dataset)?;
+    if *observed.kind() != DatasetKind::Filesystem {
+        bail!("file readers require filesystem targets");
+    }
+    Ok(observed.identity().clone())
+}
+/// The current snapshot, admitted only while its parent filesystem is the
+/// incarnation that owns it.
+fn admit_snapshot(name: &str) -> Result<SnapshotRef> {
+    let snapshot = zfs_tools::observe_snapshot(name)?;
+    let parent = snapshot.name.split_once('@').map_or("", |(ds, _)| ds);
+    let parent = admit_filesystem(parent)?;
+    if snapshot.dataset_guid != parent.guid || snapshot.identity.pool_guid != parent.pool_guid {
+        bail!("reviewed reader snapshot incarnation changed");
+    }
+    Ok(snapshot)
 }
 fn capture_points(
     session: &mut WriterSession,
@@ -545,11 +543,6 @@ fn protect_inner(options: &ProtectOptions) -> Result<(u8, serde_json::Value)> {
         bail!("invalid reader consumer label");
     }
     let request = prepare_request(options)?;
-    if options.dry_run {
-        let value = serde_json::json!({"schema_version":1,"status":"preview","sources":request.sources,"release":request.release,"view":options.view});
-        println!("{value}");
-        return Ok((0, value));
-    }
     let mut launch = ReaderLaunch::prepare(
         &options.command,
         options.user.as_deref(),

@@ -1,7 +1,6 @@
 use crate::{Config, Keep, parse_duration};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Change-aware ZFS snapshots and tiered retention through the shared ZFS executor.
@@ -148,23 +147,14 @@ impl KeepArgs {
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
-    load_config_from(
-        explicit,
-        std::env::var_os("ZSNAP_CONFIG").as_deref(),
-        Path::new("/etc/zsnap/zsnap.toml"),
-    )
+    load_config_from(explicit, Path::new("/etc/zsnap/zsnap.toml"))
 }
 
-fn load_config_from(
-    explicit: Option<&Path>,
-    environment: Option<&OsStr>,
-    default: &Path,
-) -> Result<Config> {
-    let chosen = explicit.or_else(|| environment.map(Path::new));
-    let path = chosen.unwrap_or(default);
+fn load_config_from(explicit: Option<&Path>, default: &Path) -> Result<Config> {
+    let path = explicit.unwrap_or(default);
     match std::fs::read_to_string(path) {
         Ok(text) => Config::from_override(Some(&text)),
-        Err(error) if chosen.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if explicit.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
             Config::from_override(None)
         }
         Err(error) => Err(error).with_context(|| format!("read policy config {}", path.display())),
@@ -270,8 +260,7 @@ mod tests {
     fn only_absent_default_uses_builtins() {
         let missing =
             Path::new("/nonexistent/zsnap-config-test-81069d32-75dd-4cb2-a159-27d1970e64af");
-        assert!(load_config_from(None, None, missing).is_ok());
-        assert!(load_config_from(Some(missing), None, missing).is_err());
-        assert!(load_config_from(None, Some(missing.as_os_str()), missing).is_err());
+        assert!(load_config_from(None, missing).is_ok());
+        assert!(load_config_from(Some(missing), missing).is_err());
     }
 }

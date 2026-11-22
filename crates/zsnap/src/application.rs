@@ -38,19 +38,22 @@ pub fn execute(command: Command) -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
                 return Ok(());
             }
-            if dataset.is_some() {
+            if let Some(dataset) = dataset.as_deref() {
                 print!(
                     "{}",
-                    status::render(
+                    status::render_dataset(
                         &state.inspection,
                         &state.dataset_properties,
                         &config,
-                        dataset.as_deref(),
+                        dataset,
                         now
                     )?
                 );
             }
-            print!("{}", status::render_diagnostics(&report)?);
+            print!(
+                "{}",
+                status::render_diagnostics(&report, dataset.is_none())?
+            );
         }
         Command::Snap { datasets, dry_run } => snap(&datasets, dry_run)?,
         Command::Assign {

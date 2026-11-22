@@ -579,11 +579,7 @@ pub(crate) fn discovery_imports_allowed(
     Ok(!writable)
 }
 
-thread_local! {
-    pub(crate) static LISTING_MS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-}
-
-/// Deploy into an imported pool uses the authenticated UKI adoption.
+/// `deploy into` an imported pool uses the authenticated UKI adoption.
 pub(crate) fn deployment_hostid(pool: zfs_tools::engine::Guid) -> Result<u32> {
     prove_ram()?;
     let (hostid, pools) = hostid_adopt::binding()?;
@@ -596,27 +592,16 @@ pub(crate) fn deployment_hostid(pool: zfs_tools::engine::Guid) -> Result<u32> {
 }
 
 pub(crate) struct NativeRecovery {
-    trace: crate::trace::Recorder,
     /// Booting a root tar in RAM (`boot --tar`), not an installed BE.
     ram_root: bool,
 }
 impl NativeRecovery {
     pub(crate) fn new() -> Self {
-        Self {
-            trace: LISTING_MS
-                .get()
-                .map_or_else(crate::trace::Recorder::new, |elapsed| {
-                    crate::trace::Recorder::new().with_listing(elapsed)
-                }),
-            ram_root: false,
-        }
+        Self { ram_root: false }
     }
     /// For `boot --tar`, whose progress names the tar, not an installed system.
     pub(crate) fn for_ram_root() -> Self {
-        Self {
-            ram_root: true,
-            ..Self::new()
-        }
+        Self { ram_root: true }
     }
 }
 
@@ -705,19 +690,10 @@ impl RecoveryBackend for NativeRecovery {
     fn action(&mut self, action: &Action) -> Result<()> {
         prove_ram()?;
         let description = describe_action(action, self.ram_root);
-        use crate::trace::Stage;
-        let stage = match action {
-            Action::MountReadonly { .. } => Stage::MountReadonly,
-            Action::Unmount { .. } => Stage::Unmount,
-            Action::Export { .. } => Stage::Export,
-            Action::Load { .. } => Stage::LoadKernel,
-            Action::Execute => Stage::ExecuteKernel,
-        };
-        self.trace.mark(stage, false);
         let started = std::time::Instant::now();
         eprintln!("{description}...");
         // The serial controller distinguishes a successful kexec disconnect
-        // from a returned command. Other stage timings travel in the trace.
+        // from a returned command.
         if matches!(action, Action::Execute) {
             diagnostic!("ZBOOT_HANDOFF_ACTION_BEGIN kexec-execute");
         }
@@ -757,13 +733,7 @@ impl RecoveryBackend for NativeRecovery {
                         "--load".into(),
                         path_string(&assets.kernel)?,
                         format!("--initrd={}", path_string(&assets.initrd)?),
-                        format!(
-                            "--command-line={}",
-                            self.trace
-                                .snapshot()
-                                .attach(&assets.command_line)
-                                .map_err(refuse)?
-                        ),
+                        format!("--command-line={}", assets.command_line),
                     ],
                 )
             }
@@ -787,7 +757,6 @@ impl RecoveryBackend for NativeRecovery {
         if matches!(action, Action::Execute) {
             diagnostic!("ZBOOT_HANDOFF_ACTION_READY kexec-execute");
         }
-        self.trace.mark(stage, true);
         Ok(())
     }
     fn verify_mount(&mut self, dataset: &str, target: &Path) -> Result<()> {
@@ -811,7 +780,6 @@ impl RecoveryBackend for NativeRecovery {
         request: &HandoffRequest,
         command_line: &str,
     ) -> Result<StagedKernel> {
-        self.trace.mark(crate::trace::Stage::Assets, false);
         if let Some(booted) = command_line
             .rsplit_once(" spl.spl_hostid=0x")
             .and_then(|(_, hex)| u32::from_str_radix(hex, 16).ok())
@@ -821,11 +789,7 @@ impl RecoveryBackend for NativeRecovery {
                 eprintln!("{note}");
             }
         }
-        let staged = stage_kernel(root, work, request, command_line)?;
-        self.trace
-            .assets(&staged.kernel_sha256, &staged.initrd_sha256);
-        self.trace.mark(crate::trace::Stage::Assets, true);
-        Ok(staged)
+        stage_kernel(root, work, request, command_line)
     }
     fn cleanup(&mut self, work: &Path) -> Result<()> {
         // Never recursively delete a directory that could still be a BE mount.
@@ -2062,50 +2026,6 @@ pub(crate) mod tests {
         assert!(countdown_refusal(&state, None).is_some());
         // The host-wide check does not block the owner itself.
         assert_eq!(crate::mounting::refusal(&state, Some("tank/ROOT/be")), None);
-    }
-    #[test]
-    fn a_legacy_marker_on_a_nonroot_cannot_steal_automount_ownership() {
-        // Retired metadata on /var has no authority over root ownership.
-        // Its canmount=on child still belongs to the native / root.
-        for (value, source) in [("0", "local"), ("1", "received")] {
-            let mut state = fixture_rows(
-                true,
-                &[
-                    ("tank", "none", 1),
-                    ("tank/ROOT", "none", 2),
-                    ("tank/ROOT/be", "/", 3),
-                    ("tank/ROOT/be/var", "/var", 4),
-                    ("tank/ROOT/be/var/log", "/var/log", 5),
-                    ("tank/ROOT/b", "/", 6),
-                ],
-            );
-            state
-                .dataset_properties
-                .get_mut("tank/ROOT/be/var")
-                .unwrap()
-                .insert(
-                    "zboot:be".into(),
-                    NativeProperty {
-                        value: value.into(),
-                        source: source.into(),
-                    },
-                );
-            for dataset in &mut state.inspection.datasets {
-                dataset.canmount = Some(if dataset.name == "tank/ROOT/be/var/log" {
-                    zfs_tools::engine::CanMount::On
-                } else {
-                    zfs_tools::engine::CanMount::NoAuto
-                });
-            }
-            assert_eq!(
-                crate::mounting::automount_in_boot_environments(&state),
-                vec!["tank/ROOT/be/var/log"],
-                "{value} {source}"
-            );
-            // The real owner is not blocked by its own grandchild; B is.
-            assert_eq!(crate::mounting::refusal(&state, Some("tank/ROOT/be")), None);
-            assert!(crate::mounting::refusal(&state, Some("tank/ROOT/b")).is_some());
-        }
     }
     #[test]
     fn two_bes_with_canmount_on_children_block_each_other_and_the_refusal_says_the_fix() {

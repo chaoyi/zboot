@@ -289,8 +289,7 @@ It needs:
 
 It builds the package `zboot` from that installation, at the version above,
 and installs it in the root with `dpkg -i`; mmdebstrap installs the package's
-`Depends` first. The root's OpenZFS packages must be one version;
-`--zfs-from-suite` takes them from another suite.
+`Depends` first. The root's OpenZFS packages must be one version.
 
 A deployed root keeps Debian's kernel, its `zfs-initramfs` initrds and the
 stock `zfs-mount.service`, ZED and mount generator. A kernel update runs

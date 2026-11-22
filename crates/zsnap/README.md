@@ -21,10 +21,9 @@ zsnap assign DATASET POLICY [--config FILE] [--dry-run | --request-json FILE]
 zsnap unassign DATASET [--dry-run | --request-json FILE]
 zsnap protect ([--capture] SOURCE... [--end-protection] | --request-json FILE)
               [--user ACCOUNT] [--env NAME]... [--view DIR] [--consumer NAME]
-              [--result FILE] [--state-dir DIR] [--stop-timeout SECONDS]
-              (-- COMMAND... | --dry-run [-- COMMAND...])
+              [--result FILE] [--state-dir DIR] -- COMMAND...
 zsnap recover [JOB [--stop]] [--dry-run | --confirm TOKEN] [--json]
-              [--state-dir DIR] [--stop-timeout SECONDS]
+              [--state-dir DIR]
 ```
 
 `-c` is short for `--config`. `--confirm` needs JOB.
@@ -70,10 +69,13 @@ for zboot's unconfirmed loss verbs.
 override and reports the resulting effective value/source: an ancestor's policy
 may become active. Assignment never writes boot/pair metadata.
 
-Config precedence is explicit `--config`, then `ZSNAP_CONFIG`, then
-`/etc/zsnap/zsnap.toml`. Only a missing default file uses built-ins silently. Named
-definitions replace complete built-in definitions; unknown fields and invalid
-retention refuse loading. Built-ins are in [policies.toml](src/policies.toml).
+`status` prints one diagnostic row per dataset, the configured policies and a
+legend. `status DATASET` instead starts with that dataset's policy and the
+retention decision for each owned snapshot, then its row and the legend.
+
+The config is explicit `--config`, else `/etc/zsnap/zsnap.toml`. Only a missing
+default file uses built-ins silently. Named definitions replace complete
+built-in definitions; unknown fields and invalid retention refuse loading. Built-ins are in [policies.toml](src/policies.toml).
 
 Writes take the shared host writer lock;
 [DESIGN.md](../../docs/DESIGN.md#writer-lock) gives its scope. Capture and
@@ -183,8 +185,7 @@ zsnap recover JOB --dry-run --json
 zsnap recover JOB --confirm TOKEN --json
 ```
 
-`--dry-run` checks the reviewed identities and view layout without creating
-snapshots or holds.
+`recover JOB --dry-run` reviews the job and changes nothing.
 
 Without `--json`, `recover` prints plain text: one line per outstanding job with
 its id, phase and failure; for `JOB --dry-run` the status, each reviewed

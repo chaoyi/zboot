@@ -13,23 +13,17 @@ use zfs_tools::engine::{
     pool_of,
 };
 
-/// Displayed menu labels stay attached to the exact native dataset incarnation.
+/// The menu's displayed BE numbers, each attached to the exact native
+/// dataset incarnation it showed.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Numbering {
     pub(crate) boot: BTreeMap<String, (String, zfs_tools::engine::DatasetIdentity)>,
-    pub(crate) datasets: BTreeMap<String, (String, zfs_tools::engine::DatasetIdentity)>,
 }
 
 impl Numbering {
-    fn prefix(
-        &self,
-        name: &str,
-        identity: &zfs_tools::engine::DatasetIdentity,
-        boot_only: bool,
-    ) -> String {
+    fn prefix(&self, name: &str, identity: &zfs_tools::engine::DatasetIdentity) -> String {
         self.boot
             .get(name)
-            .or_else(|| (!boot_only).then(|| self.datasets.get(name)).flatten())
             .filter(|(_, shown)| shown == identity)
             .map_or_else(String::new, |(label, _)| format!("{}: ", esc(label)))
     }
@@ -541,18 +535,20 @@ fn inspect_kernels(dataset: &str) -> KernelInventory {
 fn loader_attention(esps: &[Esp]) -> Vec<String> {
     esps.iter()
         .flat_map(|esp| {
-            esp.loaders
-                .iter()
-                .filter(|loader| {
-                    loader.owner == Some(crate::esp::LoaderOwner::Zboot)
-                        && loader.matches_installed == Some(false)
-                })
-                .map(|loader| {
-                    format!(
-                        "ESP {} loader {} differs from installed zboot.efi",
-                        esp.path, loader.path
-                    )
-                })
+            esp.loaders.iter().filter_map(|loader| {
+                if loader.stale {
+                    Some(crate::esp::stale_note(&esp.path, &loader.path))
+                } else {
+                    (loader.owner == Some(crate::esp::LoaderOwner::Zboot)
+                        && loader.matches_installed == Some(false))
+                    .then(|| {
+                        format!(
+                            "ESP {} loader {} differs from installed zboot.efi",
+                            esp.path, loader.path
+                        )
+                    })
+                }
+            })
         })
         .collect()
 }
@@ -647,7 +643,7 @@ impl Status {
                 }
                 annotations.push(self.kernel_evidence(name).into());
                 let label = numbers.map_or_else(String::new, |numbers| {
-                    numbers.prefix(name, &dataset.identity, true)
+                    numbers.prefix(name, &dataset.identity)
                 });
                 let _ = writeln!(out, "  {}{}  {}", label, esc(name), annotations.join(", "));
             }
@@ -796,6 +792,7 @@ impl Status {
                     None => "absent or unreadable",
                 };
                 let compared = match loader.matches_installed {
+                    _ if loader.stale => "stale, no longer refreshed",
                     Some(true) => "matches installed zboot.efi",
                     Some(false) => "differs from installed zboot.efi",
                     None => "",
@@ -1158,11 +1155,8 @@ impl Status {
                     out,
                     "{}{}{}  [{}]",
                     "  ".repeat(depth),
-                    numbers.map_or_else(String::new, |numbers| numbers.prefix(
-                        &ds.name,
-                        &ds.identity,
-                        false
-                    )),
+                    numbers.map_or_else(String::new, |numbers| numbers
+                        .prefix(&ds.name, &ds.identity)),
                     esc(&ds.name),
                     annotations.join(", ")
                 );
@@ -1484,12 +1478,10 @@ mod tests {
         };
         let mut numbers = Numbering {
             boot: BTreeMap::from([("a/ROOT/one".into(), ("1".into(), identity("a/ROOT/one")))]),
-            datasets: BTreeMap::from([("a/home".into(), ("d8".into(), identity("a/home")))]),
         };
         let status = status_with(&state, vec![], BTreeMap::new());
         let short = status.render_short_numbered(Some(&numbers));
         assert!(short.contains("  1: a/ROOT/one  running, default"));
-        assert!(!short.contains("d8:"));
         // Attention, child datasets included, carries names and no numbers:
         // only the rows above bind a number to a native identity.
         let attention = |text: &str| text[text.find("Attention\n").unwrap()..].to_owned();
@@ -1498,11 +1490,10 @@ mod tests {
         assert!(!attention(&short).contains("1: "));
         let full = status.render_numbered(Some(&numbers));
         assert!(full.contains("1: a/ROOT/one  ["));
-        assert!(full.contains("d8: a/home  ["));
+        assert!(full.contains("  a/home  ["));
         numbers.boot.get_mut("a/ROOT/one").unwrap().1.guid = zfs_tools::engine::Guid::new(99999);
-        numbers.datasets.get_mut("a/home").unwrap().1.guid = zfs_tools::engine::Guid::new(99998);
         assert!(!status.render_short_numbered(Some(&numbers)).contains("1: "));
-        assert!(!status.render_numbered(Some(&numbers)).contains("d8: "));
+        assert!(!status.render_numbered(Some(&numbers)).contains("1: "));
         assert_eq!(status.render_short_numbered(None), status.render_short());
         assert_eq!(status.render_numbered(None), status.render());
     }
@@ -1772,6 +1763,7 @@ mod tests {
             owner,
             matches_installed: compared,
             error: None,
+            stale: false,
         };
         let esps = vec![Esp {
             path: "/dev/test1".into(),
@@ -1785,7 +1777,7 @@ mod tests {
                     Some(true),
                 ),
                 loader(
-                    "EFI/zboot/zboot-recovery.efi",
+                    "EFI/BOOT/BOOTX64.EFI",
                     Some(crate::esp::LoaderOwner::Zboot),
                     Some(false),
                 ),
@@ -1797,8 +1789,36 @@ mod tests {
             ],
         }];
         let attention = loader_attention(&esps);
-        assert_eq!(attention.len(), 1);
-        assert!(attention[0].contains("EFI/zboot/zboot-recovery.efi"));
+        assert_eq!(
+            attention,
+            ["ESP /dev/test1 loader EFI/BOOT/BOOTX64.EFI differs from installed zboot.efi"]
+        );
+    }
+
+    #[test]
+    fn a_stale_zboot_loader_is_attention_naming_the_firmware_fix() {
+        let esps = vec![Esp {
+            path: "/dev/test1".into(),
+            target: None,
+            error: None,
+            comparison_error: None,
+            loaders: vec![crate::esp::Loader {
+                path: "EFI/zboot/zboot-recovery.efi".into(),
+                identity: None,
+                owner: Some(crate::esp::LoaderOwner::Zboot),
+                matches_installed: None,
+                error: None,
+                stale: true,
+            }],
+        }];
+        assert_eq!(
+            loader_attention(&esps),
+            [
+                "ESP /dev/test1: EFI/zboot/zboot-recovery.efi is a stale zboot loader; \
+                 zboot no longer refreshes it. Point the firmware boot entry at \
+                 EFI/zboot/zboot.efi (efibootmgr), then remove EFI/zboot/zboot-recovery.efi."
+            ]
+        );
     }
 
     #[test]

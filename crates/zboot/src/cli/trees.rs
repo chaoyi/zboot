@@ -1,4 +1,4 @@
-use super::run::{Incomplete, applied_operation, consent_to, dialogue, json_response, review};
+use super::run::{Incomplete, applied_operation, consent_to, dialogue, json_response, lossless};
 
 pub(super) fn rollback_command(
     target: String,
@@ -65,16 +65,13 @@ pub(super) fn rename_command(
     source: String,
     destination: String,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::rename;
-    let Some((plan, token)) = review(
+    let Some(plan) = lossless(
         dry_run,
-        confirm,
         json,
         || Ok(rename::plan(&source, &destination)?),
-        rename::consent,
         rename::describe,
     )?
     else {
@@ -89,19 +86,17 @@ pub(super) fn rename_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, Some(token), Some(&id), outcome.complete, outcome)
+    applied_operation(json, None, Some(&id), outcome.complete, outcome)
 }
 pub(super) fn fork_command(
     source: String,
     destination: String,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::fork;
-    let Some((plan, token)) = review(
+    let Some(plan) = lossless(
         dry_run,
-        confirm,
         json,
         || {
             Ok(if source.contains('@') {
@@ -110,8 +105,7 @@ pub(super) fn fork_command(
                 fork::plan_running(&source, &destination)?
             })
         },
-        crate::consent::token,
-        |plan, token| format!("{}Token {token}\n", fork::describe(plan)),
+        fork::describe,
     )?
     else {
         return Ok(());
@@ -125,7 +119,7 @@ pub(super) fn fork_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, Some(token), Some(&id), outcome.complete, outcome)
+    applied_operation(json, None, Some(&id), outcome.complete, outcome)
 }
 fn default_snapshot_name(now: std::time::SystemTime) -> String {
     crate::tree::snapshot_name("zboot", now)
@@ -134,7 +128,6 @@ fn default_snapshot_name(now: std::time::SystemTime) -> String {
 pub(super) fn default(
     dataset: Option<String>,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(dataset) = dataset else {
@@ -165,15 +158,13 @@ pub(super) fn default(
         }
         return Ok(());
     };
-    let Some((plan, token)) = review(
+    let Some(plan) = lossless(
         dry_run,
-        confirm,
         json,
         || Ok(crate::boot_support::default::plan(&dataset)?),
-        crate::consent::token,
-        |_, token| {
+        |_| {
             format!(
-                "Select {} as the host boot default.\nToken {token}\n",
+                "Select {} as the host boot default.\n",
                 zfs_tools::engine::escape_display(&dataset)
             )
         },
@@ -196,7 +187,7 @@ pub(super) fn default(
             println!("{}", zfs_tools::engine::escape_display(detail));
         }
     }
-    applied_operation(json, Some(token), None, result.complete, result)
+    applied_operation(json, None, None, result.complete, result)
 }
 
 pub(super) fn cmdline(
@@ -204,19 +195,16 @@ pub(super) fn cmdline(
     set: Option<String>,
     clear: bool,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(value) = set.or(clear.then(String::new)) {
-        let Some((plan, token)) = review(
+        let Some(plan) = lossless(
             dry_run,
-            confirm,
             json,
             || Ok(crate::boot_support::cmdline_plan(&dataset, &value)?),
-            crate::consent::token,
-            |_, token| {
+            |_| {
                 format!(
-                    "Set kernel additions for {} to {:?}.\nToken {token}\n",
+                    "Set kernel additions for {} to {:?}.\n",
                     zfs_tools::engine::escape_display(&dataset),
                     zfs_tools::engine::escape_display(&value)
                 )
@@ -240,7 +228,7 @@ pub(super) fn cmdline(
                 println!("{}", zfs_tools::engine::escape_display(detail));
             }
         }
-        applied_operation(json, Some(token), None, result.complete, result)
+        applied_operation(json, None, None, result.complete, result)
     } else {
         let result = crate::boot_support::saved_cmdline(&dataset)?;
         if json {
@@ -327,12 +315,10 @@ pub(super) fn snapshot_plan(
 pub(super) fn snapshot(
     datasets: Vec<String>,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some((groups, token)) = review(
+    let Some(groups) = lossless(
         dry_run,
-        confirm,
         json,
         || {
             Ok(snapshot_plan(
@@ -340,8 +326,7 @@ pub(super) fn snapshot(
                 &datasets,
             )?)
         },
-        crate::consent::token,
-        |groups, token| {
+        |groups| {
             let mut text = String::new();
             for group in groups {
                 text.push_str(&format!(
@@ -350,7 +335,6 @@ pub(super) fn snapshot(
                     group.name.as_deref().unwrap_or("a generated snapshot name")
                 ));
             }
-            text.push_str(&format!("Token {token}\n"));
             text
         },
     )?
@@ -368,7 +352,7 @@ pub(super) fn snapshot(
                 if json && !outcomes.is_empty() {
                     json_response(crate::consent::Envelope::new(
                         crate::consent::Outcome::Partial,
-                        Some(token),
+                        None,
                         &outcomes,
                     ))?;
                 }
@@ -394,7 +378,7 @@ pub(super) fn snapshot(
             if json {
                 json_response(crate::consent::Envelope::new(
                     crate::consent::Outcome::Partial,
-                    Some(token),
+                    None,
                     &outcomes,
                 ))?;
             }
@@ -410,7 +394,7 @@ pub(super) fn snapshot(
     if json {
         json_response(crate::consent::Envelope::new(
             crate::consent::Outcome::Applied,
-            Some(token),
+            None,
             outcomes,
         ))?;
     }
@@ -435,8 +419,8 @@ mod tests {
         let generated = snapshot_plan(&state, &["a/data".into()]).unwrap();
         assert!(generated[0].name.is_none());
         assert_eq!(
-            crate::consent::token(&generated).unwrap(),
-            crate::consent::token(&snapshot_plan(&state, &["a/data".into()]).unwrap()).unwrap()
+            generated,
+            snapshot_plan(&state, &["a/data".into()]).unwrap()
         );
         assert_eq!(fake.writes, 0);
         fake.snap("a/data@before");

@@ -302,22 +302,18 @@ impl TransferBackend for World {
     fn attachments(&mut self) -> impl AttachmentBackend {
         self.t.attachments()
     }
-    fn received_properties(&mut self, e: &Endpoint) -> Result<BTreeMap<String, String>, Error> {
-        self.t.received_properties(e)
-    }
     fn create_inert_container(&mut self, p: &Endpoint, n: &str, id: &str) -> Result<(), Error> {
         self.t.create_inert_container(p, n, id)
     }
     fn rename_received(&mut self, s: &Endpoint, p: &Endpoint, n: &str) -> Result<(), Error> {
         self.t.rename_received(s, p, n)
     }
-    fn restore_receive_property(
+    fn publish_mountpoint(
         &mut self,
         e: &Endpoint,
-        k: PropertyKey,
         p: &crate::placement::SavedProperty,
     ) -> Result<(), Error> {
-        self.t.restore_receive_property(e, k, p)
+        self.t.publish_mountpoint(e, p)
     }
     fn quiesce_receive_scope(&mut self, e: &Endpoint, id: &str) -> Result<(), Error> {
         self.t.quiesce_receive_scope(e, id)
@@ -4552,37 +4548,50 @@ fn the_primary_token_binds_the_volmode_it_sets() {
     assert_eq!(w.effects(), before);
 }
 
-/// `sync SECONDARY PRIMARY` fences the working copy for its transfer and gives
-/// it its own `volmode` back; the receipt it leaves saves that value, so a
-/// later `primary` retires it and keeps the value.
+/// `sync SECONDARY PRIMARY` is refused before any effect: the working copy
+/// keeps its hand-set `volmode` and is never fenced for a receive.
 #[test]
-fn a_working_copy_that_receives_keeps_its_hand_set_volmode() {
+fn a_sync_into_the_working_copy_is_refused_before_any_effect() {
     let mut w = switched_volumes();
     w.diverge("a/data", 900);
     let back = TransferRequest {
         source: "a/data".into(),
         destination: "b/data".into(),
     };
-    sync::sync_one(&back, RERUN, &[], &mut w).unwrap();
+    let before = w.effects();
+    let error = sync::sync_one(&back, RERUN, &[], &mut w)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`zboot primary a/data`"), "{error}");
+    let error = sync_plan_with(
+        &SyncTarget::Between {
+            source: "a/data".into(),
+            destination: "b/data".into(),
+        },
+        &mut w,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
-        w.guids("b/data").contains(&900),
-        "the working copy received"
+        error.contains("a/data is the secondary of b/data"),
+        "{error}"
     );
+    assert_eq!(w.effects(), before);
+    assert!(!w.guids("b/data").contains(&900));
     assert!(primary_is(&mut w, "b/data"));
     assert_eq!(volmode_of(&w, "b/data"), local_value("dev"));
-    assert_eq!(saved_volmode(&w, "b/data").as_deref(), Some("dev"));
-    let result = primary_now(&mut w, "b/data").unwrap();
-    assert!(result.already_primary);
     assert!(local_placements(&mut w, "b/data").is_empty());
-    assert_eq!(volmode_of(&w, "b/data"), local_value("dev"));
+}
 
-    // A receipt an earlier build left there, without the field, is retired
-    // the same way: the value set by hand stays.
+/// A saved placement an earlier build left on the working copy, without the
+/// `volmode` field, is retired by `primary`: the value set by hand stays.
+#[test]
+fn an_earlier_builds_saved_placement_on_the_working_copy_is_retired() {
+    let mut w = switched_volumes();
     let state = w.state();
     let e = endpoint(&state, "b/data").unwrap();
     let old = Placement::from_dataset(dataset(&state, "b/data").unwrap());
     set(&mut w, &e, PropertyValue::Placement(old)).unwrap();
-    w.op = OP;
     assert!(primary_now(&mut w, "b/data").unwrap().already_primary);
     assert!(local_placements(&mut w, "b/data").is_empty());
     assert_eq!(volmode_of(&w, "b/data"), local_value("dev"));

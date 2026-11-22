@@ -112,11 +112,9 @@ pub struct Applied {
     pub loop_detached: bool,
 }
 
-fn image_size(
-    request: &request::DeployRequest,
-    inputs: &request::Inputs,
-    selected: Option<u64>,
-) -> io::Result<u64> {
+/// The ESP plus swap plus the unpacked content with headroom, rounded up to
+/// a whole GiB.
+fn image_size(request: &request::DeployRequest, inputs: &request::Inputs) -> io::Result<u64> {
     let request::Boot::OnTarget { esp_bytes } = request.boot else {
         return Err(refuse("an image cannot name an existing ESP"));
     };
@@ -154,14 +152,10 @@ fn image_size(
         .and_then(|v| v.checked_add(swap))
         .and_then(|v| v.checked_add(2 << 20))
         .ok_or_else(|| refuse("image size overflow"))?;
-    let default = minimum
+    let bytes = minimum
         .checked_add((1 << 30) - 1)
         .map(|v| v / (1 << 30) * (1 << 30))
         .ok_or_else(|| refuse("image size overflow"))?;
-    let bytes = selected.unwrap_or(default);
-    if bytes < minimum || !bytes.is_multiple_of(1 << 20) {
-        return Err(refuse("image size is too small or not a whole MiB"));
-    }
     let geometry = DiskIdentity {
         path: String::new(),
         device_number: String::new(),
@@ -192,7 +186,7 @@ fn image_size(
 }
 
 pub fn plan_with(args: &command::Args, backend: &mut impl Backend) -> io::Result<Plan> {
-    let command::Target::Image { file, size } = &args.target else {
+    let command::Target::Image { file } = &args.target else {
         return Err(refuse("image planner needs --image"));
     };
     let destination = Destination::inspect(file)?;
@@ -212,7 +206,7 @@ pub fn plan_with(args: &command::Args, backend: &mut impl Backend) -> io::Result
         .take(request.overlays.len())
         .map(|o| o.source.clone())
         .collect();
-    let bytes = image_size(&request, &inputs, *size)?;
+    let bytes = image_size(&request, &inputs)?;
     Ok(Plan {
         schema_version: 1,
         destination,
@@ -221,10 +215,7 @@ pub fn plan_with(args: &command::Args, backend: &mut impl Backend) -> io::Result
         inputs,
     })
 }
-pub fn consent(plan: &Plan) -> io::Result<String> {
-    crate::consent::token(&("zboot-new-image-1", plan))
-}
-pub fn describe(plan: &Plan, token: &str) -> String {
+pub fn describe(plan: &Plan) -> String {
     let mut text = format!(
         "Deploy into new image {} ({})\n  Pool: {}{}\n",
         zfs_tools::engine::escape_display(&plan.destination.path.display().to_string()),
@@ -290,7 +281,6 @@ pub fn describe(plan: &Plan, token: &str) -> String {
             ));
         }
     }
-    text.push_str(&format!("  Token: {token}\n"));
     text
 }
 
@@ -876,7 +866,7 @@ pub fn apply_with(plan: &Plan, backend: &mut impl Backend) -> io::Result<Applied
     command::validate_cli_request(&plan.request)?;
     if request::inputs(&plan.request)? != plan.inputs
         || !plan.request.fresh_image
-        || image_size(&plan.request, &plan.inputs, Some(plan.bytes))? != plan.bytes
+        || image_size(&plan.request, &plan.inputs)? != plan.bytes
     {
         return Err(refuse("image inputs or parameters changed since preview"));
     }
@@ -1045,7 +1035,6 @@ mod tests {
         command::Args {
             target: command::Target::Image {
                 file: root.join("image"),
-                size: Some(8 << 30),
             },
             efi: root.join("missing.efi"),
             factory: Some(root.join("missing.tar")),

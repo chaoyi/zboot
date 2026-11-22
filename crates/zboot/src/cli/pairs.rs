@@ -1,10 +1,11 @@
-//! `pair`, `unpair`, `sync` and `primary` on the command line. Each runs
-//! directly unless its plan can lose data or rests on the operator's word
-//! (†): a takeover, a one-sided unpair or released anchors. Those print the
-//! plan and take the typed target or `--confirm TOKEN`. `sync` runs either
-//! way; only its pending deletions wait for the typed summary or the token.
+//! `pair`, `unpair`, `sync` and `primary` on the command line. `pair` loses
+//! nothing and takes no token. The others run directly unless their plan can
+//! lose data or rests on the operator's word (†): a takeover, a one-sided
+//! unpair or released anchors. Those print the plan and take the typed target
+//! or `--confirm TOKEN`. `sync` runs either way; only its pending deletions
+//! wait for the typed summary or the token.
 use super::run::{
-    applied_operation, consent_to, dialogue, json_response, review, writer_for, writer_for_replan,
+    applied_operation, consent_to, dialogue, json_response, lossless, writer_for, writer_for_replan,
 };
 use crate::{
     consent::{self, Envelope, Outcome, Typed},
@@ -72,26 +73,18 @@ fn dataset_target(name: &str) -> Typed {
     }
 }
 
-pub(super) fn pair(
-    left: String,
-    right: String,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
-) -> Result {
+pub(super) fn pair(left: String, right: String, dry_run: bool, json: bool) -> Result {
     let request = crate::pairs::plan::PairRequest {
         left,
         right,
         primary: Some(crate::history::Side::Left),
     };
-    let Some((plan, token)) = review(
+    let Some(plan) = lossless(
         dry_run,
-        confirm,
         json,
         // The plan's own refusal says when to swap PRIMARY and SECONDARY.
         || crate::pairs::plan::plan(&request).map_err(Into::into),
-        consent::token,
-        |plan, token| format!("{}Token {token}\n", pairs::describe::pair(plan)),
+        pairs::describe::pair,
     )?
     else {
         return Ok(());
@@ -100,7 +93,7 @@ pub(super) fn pair(
     let o = &result.outcome;
     let human = pairs::describe::paired(&result);
     let operation = (!o.already_paired).then(|| o.operation_id.clone());
-    report(json, Some(token), operation, true, &result, human)
+    report(json, None, operation, true, &result, human)
 }
 pub(super) fn unpair(
     dataset: String,

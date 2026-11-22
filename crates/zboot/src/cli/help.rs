@@ -6,7 +6,7 @@ use std::fmt::Write;
 pub(crate) fn command() -> clap::Command {
     let command = Cli::command().disable_help_subcommand(true);
     let groups: &[(&str, &[&str])] = &[
-        ("Look", &["status", "trace"]),
+        ("Look", &["status"]),
         (
             "Boot environments and trees",
             &[

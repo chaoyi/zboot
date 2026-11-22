@@ -1,5 +1,5 @@
 //! Provisioning command glue.
-use super::run::{applied, applied_operation, consent_to, json_response};
+use super::run::{applied, applied_operation, consent_to, json_response, lossless};
 use std::error::Error;
 
 #[derive(serde::Serialize)]
@@ -85,20 +85,9 @@ pub(super) fn deploy(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::deploy::command;
-    // Every form changes disks or pools, mounts filesystems and reads raw
-    // devices. Say so, rather than fail at whichever step first lacks the
-    // privilege. A preview changes nothing and plans as far as it can.
-    if !dry_run && !rustix::process::geteuid().is_root() {
-        return Err(std::io::Error::other(
-            "deploy needs root: it changes disks, creates pools and datasets, and mounts them",
-        )
-        .into());
-    }
-    if matches!(&args.target, command::Target::Into { .. }) {
-        return deploy_into(args, dry_run, confirm, json);
-    }
+    require_root(dry_run, "deploy")?;
     let command::Target::Disk { disk } = &args.target else {
-        return deploy_image(args, dry_run, confirm, json);
+        return deploy_image(args, dry_run, json);
     };
     let scope = disk_scope(disk)?;
     let Some((plan, token)) = consent_to(
@@ -131,26 +120,36 @@ pub(super) fn deploy(
             zfs_tools::engine::escape_display(&done.outcome.disk.path)
         );
     }
-    applied(json, token, done)
+    applied(json, Some(token), done)
 }
 
-fn deploy_into(
-    args: crate::deploy::command::Args,
+/// Every deploy changes disks or pools, mounts filesystems and
+/// reads raw devices. Say so, rather than fail at whichever step first lacks
+/// the privilege. A preview changes nothing and plans as far as it can.
+fn require_root(dry_run: bool, verb: &str) -> Result<(), Box<dyn Error>> {
+    if !dry_run && !rustix::process::geteuid().is_root() {
+        return Err(std::io::Error::other(format!(
+            "{verb} needs root: it changes disks or pools, creates datasets, and mounts them"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn deploy_into(
+    request: crate::deploy::into::Request,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     use crate::deploy::into;
-    let request = into::Request::from_args(&args)?;
-    let Some((plan, token)) = super::run::review(
+    require_root(dry_run, "deploy into")?;
+    let Some(plan) = lossless(
         dry_run,
-        confirm,
         json,
         || {
             crate::deploy::require_on_path(&["zfs", "zpool", "zdb"], "deployment")?;
             Ok(into::plan_with(&request, &mut into::Native)?)
         },
-        into::consent,
         into::describe,
     )?
     else {
@@ -163,44 +162,27 @@ fn deploy_into(
             zfs_tools::engine::escape_display(&outcome.dataset.name)
         );
     }
-    applied(json, token, outcome)
+    applied(json, None, outcome)
 }
 
+/// A new image file loses nothing, so it needs no typing and no token. It is
+/// planned under the same writer boundary as a disk deploy, before the
+/// exclusive create or the loop attachment.
 fn deploy_image(
     args: crate::deploy::command::Args,
     dry_run: bool,
-    confirm: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    use crate::{consent, deploy::image};
-    use std::io::Write;
-    let mut plan = image::plan_with(&args, &mut image::Native)?;
-    let token = image::consent(&plan)?;
-    if let Some(given) = confirm {
-        consent::unchanged(&given, &token)?;
-    }
-    if json {
-        eprint!("{}", image::describe(&plan, &token));
-    } else {
-        print!("{}", image::describe(&plan, &token));
-        crate::output::stdout().flush()?;
-    }
-    if dry_run {
-        if json {
-            json_response(consent::Envelope::new(
-                consent::Outcome::Preview,
-                Some(token),
-                &plan,
-            ))?;
-        }
+    use crate::deploy::image;
+    let Some(plan) = lossless(
+        dry_run,
+        json,
+        || Ok(image::plan_with(&args, &mut image::Native)?),
+        image::describe,
+    )?
+    else {
         return Ok(());
-    }
-    // No typing is required to create a new file. Replan under the same writer
-    // boundary as disk deployment before exclusive create or loop attachment.
-    super::run::writer_for(&plan)?;
-    let fresh = image::plan_with(&args, &mut image::Native)?;
-    consent::unchanged(&token, &image::consent(&fresh)?)?;
-    plan = fresh;
+    };
     let done = image::apply_with(&plan, &mut image::Native)?;
     if !json {
         println!(
@@ -209,7 +191,7 @@ fn deploy_image(
             crate::device::size(done.bytes)
         );
     }
-    applied(json, token, done)
+    applied(json, None, done)
 }
 
 pub(super) fn esp(
@@ -222,8 +204,11 @@ pub(super) fn esp(
     let plan = || -> Result<crate::esp::RefreshPlan, Box<dyn std::error::Error>> {
         Ok(crate::esp::refresh_plan(&partitions, efi)?)
     };
+    // A refresh loses nothing and runs at once. A plan that replaces another
+    // system's file asks; a preview or a token takes the same path, so a
+    // script can bind either kind to what it previewed.
     let initial = plan()?;
-    let selected = if initial.needs_confirmation() {
+    let selected = if initial.needs_confirmation() || dry_run || confirm.is_some() {
         consent_to(
             dry_run,
             confirm,
@@ -251,9 +236,8 @@ pub(super) fn esp(
             },
         )?
     } else {
-        super::run::review(
-            dry_run,
-            confirm,
+        lossless(
+            false,
             json,
             || {
                 let fresh = plan()?;
@@ -262,9 +246,10 @@ pub(super) fn esp(
                 }
                 Ok(fresh)
             },
-            crate::esp::refresh_consent,
-            crate::esp::describe_refresh,
+            |_| String::new(),
         )?
+        .map(|plan| crate::esp::refresh_consent(&plan).map(|token| (plan, token)))
+        .transpose()?
     };
     let Some((plan, token)) = selected else {
         return Ok(());
@@ -283,11 +268,20 @@ pub(super) fn esp(
                 zfs_tools::engine::escape_display(&kept.path)
             );
         }
+        for stale in &outcome.stale_loaders {
+            println!(
+                "{}",
+                zfs_tools::engine::escape_display(&crate::esp::stale_note(
+                    &stale.partition,
+                    &stale.path
+                ))
+            );
+        }
         if let Some(note) = crate::esp::loader_note(&plan) {
             println!("{note}");
         }
     }
-    applied(json, token, outcome)
+    applied(json, Some(token), outcome)
 }
 
 pub(super) fn factory(

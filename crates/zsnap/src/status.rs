@@ -6,106 +6,75 @@ use chrono::{DateTime, Utc};
 use std::fmt::Write;
 use zfs_tools::engine::{Inspection, escape_display, native::PropertyInventory};
 
-pub fn render(
+/// One dataset's policy and the retention decision for each owned snapshot.
+pub fn render_dataset(
     inspection: &Inspection,
     properties: &PropertyInventory,
     config: &Config,
-    dataset: Option<&str>,
+    dataset: &str,
     now: DateTime<Utc>,
 ) -> Result<String> {
     let snapshots = inspection
         .snapshots
         .as_ref()
         .ok_or_else(|| anyhow!("snapshot history was not observed"))?;
-    if let Some(dataset) = dataset {
-        zfs_tools::engine::validate_dataset_name(dataset)?;
-        if !inspection.datasets.iter().any(|d| d.name == dataset) {
-            bail!("dataset was not observed: {}", escape_display(dataset));
-        }
-        let names: Vec<_> = snapshots
-            .iter()
-            .filter(|s| s.name.split_once('@').map(|(ds, _)| ds) == Some(dataset))
-            .map(|s| s.name.clone())
-            .collect();
-        let assignment = assignment(properties, dataset)?;
-        let mut output = String::new();
-        let policy = assignment.and_then(|name| config.policies.get(name));
-        match (assignment, policy) {
-            (Some(name), Some(policy)) => writeln!(
-                output,
-                "{} — policy '{}': every {}; keep {}",
-                escape_display(dataset),
-                escape_display(name),
-                canon_duration(policy.frequency),
-                policy.keep.describe()
-            )?,
-            (Some(name), None) => writeln!(
-                output,
-                "{} — unknown policy '{}'",
-                escape_display(dataset),
-                escape_display(name)
-            )?,
-            _ => writeln!(
-                output,
-                "{} — no active snapshot policy",
-                escape_display(dataset)
-            )?,
-        }
-        if let Some(policy) = policy {
-            let decisions = dataset_plan(dataset, &names, &policy.keep, now)?;
-            if decisions.is_empty() {
-                writeln!(output, "  (no owned snapshots)")?;
-            }
-            for decision in decisions {
-                let why = if decision.kept() {
-                    decision.reasons.join(", ")
-                } else {
-                    "retention candidate".into()
-                };
-                writeln!(output, "  {}  {why}", escape_display(&decision.name))?;
-            }
-        } else {
-            for name in names
-                .iter()
-                .filter(|name| owned_snap_time(name, dataset).is_some())
-            {
-                writeln!(
-                    output,
-                    "  {}  (no retention decision)",
-                    escape_display(name)
-                )?;
-            }
-        }
-        return Ok(output);
+    zfs_tools::engine::validate_dataset_name(dataset)?;
+    if !inspection.datasets.iter().any(|d| d.name == dataset) {
+        bail!("dataset was not observed: {}", escape_display(dataset));
     }
+    let names: Vec<_> = snapshots
+        .iter()
+        .filter(|s| s.name.split_once('@').map(|(ds, _)| ds) == Some(dataset))
+        .map(|s| s.name.clone())
+        .collect();
+    let assignment = assignment(properties, dataset)?;
     let mut output = String::new();
-    let mut datasets: Vec<_> = inspection.datasets.iter().collect();
-    datasets.sort_by(|a, b| a.name.cmp(&b.name));
-    for dataset in datasets {
-        let Some(name) = assignment(properties, &dataset.name)? else {
-            continue;
-        };
-        let mut times: Vec<_> = snapshots
-            .iter()
-            .filter_map(|s| owned_snap_time(&s.name, &dataset.name))
-            .collect();
-        times.sort();
-        let newest = times
-            .last()
-            .map_or_else(|| "-".into(), |time| time.to_rfc3339());
-        let policy = config.policies.get(name);
-        writeln!(
+    let policy = assignment.and_then(|name| config.policies.get(name));
+    match (assignment, policy) {
+        (Some(name), Some(policy)) => writeln!(
             output,
-            "{}  policy={}{}  snapshots={}  newest={}",
-            escape_display(&dataset.name),
+            "{} — policy '{}': every {}; keep {}",
+            escape_display(dataset),
             escape_display(name),
-            if policy.is_none() { "?" } else { "" },
-            times.len(),
-            newest
-        )?;
+            canon_duration(policy.frequency),
+            policy.keep.describe()
+        )?,
+        (Some(name), None) => writeln!(
+            output,
+            "{} — unknown policy '{}'",
+            escape_display(dataset),
+            escape_display(name)
+        )?,
+        _ => writeln!(
+            output,
+            "{} — no active snapshot policy",
+            escape_display(dataset)
+        )?,
     }
-    if output.is_empty() {
-        output.push_str("no datasets carry an active zsnap:policy\n");
+    if let Some(policy) = policy {
+        let decisions = dataset_plan(dataset, &names, &policy.keep, now)?;
+        if decisions.is_empty() {
+            writeln!(output, "  (no owned snapshots)")?;
+        }
+        for decision in decisions {
+            let why = if decision.kept() {
+                decision.reasons.join(", ")
+            } else {
+                "retention candidate".into()
+            };
+            writeln!(output, "  {}  {why}", escape_display(&decision.name))?;
+        }
+    } else {
+        for name in names
+            .iter()
+            .filter(|name| owned_snap_time(name, dataset).is_some())
+        {
+            writeln!(
+                output,
+                "  {}  (no retention decision)",
+                escape_display(name)
+            )?;
+        }
     }
     Ok(output)
 }
@@ -123,7 +92,13 @@ pub fn assignment<'a>(properties: &'a PropertyInventory, dataset: &str) -> Resul
     Ok((!is_disabled_policy(value)).then_some(value))
 }
 
-pub fn render_diagnostics(report: &crate::transport::PolicyStatusReport) -> Result<String> {
+/// Diagnostic rows and legend. `policy_table` lists every configured policy;
+/// a single-dataset view omits it because `render_dataset` already describes
+/// that dataset's policy.
+pub fn render_diagnostics(
+    report: &crate::transport::PolicyStatusReport,
+    policy_table: bool,
+) -> Result<String> {
     let mut output = String::new();
     for row in &report.datasets {
         let age = |seconds: Option<i64>| {
@@ -176,15 +151,17 @@ pub fn render_diagnostics(report: &crate::transport::PolicyStatusReport) -> Resu
             writeln!(output, "  {}", escape_display(error))?;
         }
     }
-    writeln!(output, "Policies (frequency; retention):")?;
-    for (name, policy) in &report.policies {
-        writeln!(
-            output,
-            "  {}: every {}; keep {}",
-            escape_display(name),
-            canon_duration(policy.frequency),
-            policy.keep.describe()
-        )?;
+    if policy_table {
+        writeln!(output, "Policies (frequency; retention):")?;
+        for (name, policy) in &report.policies {
+            writeln!(
+                output,
+                "  {}: every {}; keep {}",
+                escape_display(name),
+                canon_duration(policy.frequency),
+                policy.keep.describe()
+            )?;
+        }
     }
     writeln!(
         output,
@@ -228,16 +205,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn summary_and_detail_scope_only_owned_snapshots() {
+    fn detail_scopes_only_owned_snapshots() {
         let (inspection, properties) = fixture();
         let config = Config::from_override(None).unwrap();
         let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        let summary = render(&inspection, &properties, &config, None, now).unwrap();
-        assert!(summary.contains("tank/data  policy=guard  snapshots=1"));
-        let detail = render(&inspection, &properties, &config, Some("tank/data"), now).unwrap();
+        let detail = render_dataset(&inspection, &properties, &config, "tank/data", now).unwrap();
         assert!(detail.contains("within"));
         assert!(!detail.contains("manual"));
-        assert!(render(&inspection, &properties, &config, Some("tank/missing"), now).is_err());
+        assert!(render_dataset(&inspection, &properties, &config, "tank/missing", now).is_err());
     }
 
     #[test]
@@ -249,11 +224,11 @@ pub(crate) mod tests {
             .get_mut(POLICY_PROPERTY)
             .unwrap()
             .value = "unknown\u{202e}".into();
-        let output = render(
+        let output = render_dataset(
             &inspection,
             &properties,
             &Config::from_override(None).unwrap(),
-            Some("tank/data"),
+            "tank/data",
             DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
         )
         .unwrap();
