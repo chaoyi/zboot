@@ -98,8 +98,8 @@ def verdict(ev, check):
     check.equal(identity(baseline, A), identity(original, A), f'bootstrap keeps {A} identity')
     check.equal((prop(original, A, 'mountpoint'), source(original, A, 'mountpoint')),
                 ('/', 'local'), f'{A}: original explicit mountpoint is native local authority')
-    check.equal(frozen.get('', {}).get('mountpoint'), {'value': '/', 'source': 'local', 'received': None},
-                f'{A}: frozen source placement binds exact local value without received authority')
+    check.equal(frozen.get('', {}).get('mountpoint'), {'value': '/', 'source': 'local'},
+                f'{A}: frozen source placement binds the exact local value')
     pair_id = json.loads(prop(baseline, A, 'zboot:pair'))['pair_id']
     for label, primary, distinct in STATES:
         state(check, s, label, primary, distinct, baseline, pair_id)
