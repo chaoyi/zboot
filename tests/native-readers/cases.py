@@ -11,7 +11,8 @@ OUT = Path("/evidence")
 CONTROL = Path("/proof/control")
 STATE = Path("/proof/state/jobs")
 TOOLS = "/usr/bin/zsnap"
-OPERATION_TIMEOUT = json.loads(Path("/fixtures/proof-config.json").read_text())["operation_timeout_seconds"]
+# Liveness guard for one guest command; product timing contracts use their own values.
+OPERATION_TIMEOUT = 20
 events = []
 owned = []
 
@@ -32,11 +33,6 @@ def failure_diagnostics():
     (OUT / "failure-processes.json").write_text(json.dumps(processes, indent=2) + "\n")
     for path in STATE.glob("*/intent.json"):
         (OUT / (path.parent.name + "-failure-record.json")).write_bytes(path.read_bytes())
-
-
-def wait_budget(seconds):
-    """Scale liveness guards only; product timing contracts use fixed values."""
-    return seconds * OPERATION_TIMEOUT / 20
 
 
 def command(args, codes=(0,), timeout=None, **kwargs):
@@ -68,7 +64,7 @@ def holds(snapshot):
 
 def wait_file(path, process=None, timeout=10):
     start = time.monotonic()
-    while time.monotonic() - start < wait_budget(timeout):
+    while time.monotonic() - start < timeout:
         if path.exists() and path.stat().st_size:
             return path
         if process is not None and process.poll() is not None:
@@ -91,9 +87,6 @@ def protect(label, mode="wait", snapshot="readerproof/data@first", expected="fir
     if end:
         args.append("--end-protection")
     args += ["--", "/fixtures/python3", "/fixtures/reader.py", mode, label, expected]
-    if label == "basic" and Path("/fixtures/strace").exists():
-        args = ["/fixtures/strace", "-f", "-qq", "-o", "/evidence/basic-strace.log",
-                "-e", "trace=clone,clone3,execve,execveat,unshare,mount,umount2,openat,openat2,newfstatat,fstat,fstatfs,statx,getdents64,fsync,readlink,readlinkat,write", *args]
     output = (OUT / (label + "-stdout.log")).open("w")
     error = (OUT / (label + "-stderr.log")).open("w")
     env = {**os.environ, "CREDENTIALS_DIRECTORY": "/proof/control/credentials", "PROOF_SHOULD_NOT_LEAK": "not-forwarded"}
@@ -110,7 +103,7 @@ def ready(label, process):
 
 def finish(label, process, result, codes=(0,)):
     (CONTROL / (label + ".release")).touch()
-    assert process.wait(timeout=wait_budget(15)) in codes
+    assert process.wait(timeout=15) in codes
     return read_json(result)
 
 
@@ -158,7 +151,7 @@ def main():
     assert Path("/proc/self/cgroup").read_text() == "0::/\n"
     STATE.parent.chmod(0o755)
     process, result = protect("basic", mode="inspect")
-    assert process.wait(timeout=wait_budget(20)) == 0
+    assert process.wait(timeout=20) == 0
     observed = read_json(CONTROL / "basic.json")
     completed = read_json(result)
     assert completed["status"] == "complete" and completed["cleanup_complete"]
@@ -184,7 +177,7 @@ def main():
     before = set(native("list", "-H", "-r", "-t", "snapshot", "-o", "name", "readerproof").splitlines())
     process, result = protect("capture", mode="inspect", snapshot="readerproof/data",
                               expected="second-content\n", capture=True)
-    assert process.wait(timeout=wait_budget(20)) == 0
+    assert process.wait(timeout=20) == 0
     completed = read_json(result)
     after = set(native("list", "-H", "-r", "-t", "snapshot", "-o", "name", "readerproof").splitlines())
     new = after - before
@@ -227,7 +220,7 @@ def main():
     process, result = protect("native-orphan")
     reached = CONTROL / "fault-reached"
     start = time.monotonic()
-    while not reached.exists() and time.monotonic() - start < wait_budget(10):
+    while not reached.exists() and time.monotonic() - start < 10:
         assert process.poll() is None
         time.sleep(0.02)
     assert reached.exists()

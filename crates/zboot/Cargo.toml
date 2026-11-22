@@ -7,7 +7,7 @@ license.workspace = true
 description = "Standalone ZFS boot and data management"
 
 [dependencies]
-zfs-tools = { path = "../zfs-tools", default-features = false, features = ["internal"] }
+zfs-tools = { path = "../zfs-tools" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

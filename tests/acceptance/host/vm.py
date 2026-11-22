@@ -7,11 +7,9 @@ only the test channel (see channel.py). The QEMU process is this Popen's own
 child: kill and reap go through that handle, never a PID lookup.
 """
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 import re
-import stat
 from pathlib import Path
 import shutil
 import socket
@@ -30,19 +28,6 @@ APPEND = 'console=tty0 console=ttyS0,115200 loglevel=4'
 # A network boot's HTTP server: a slirp guest forward that starts http.py
 # for each connection. Only the guest reaches it.
 PXE_SERVER = '10.0.2.100'
-
-
-def accelerator_config():
-    """Require an explicit experimental choice for software emulation; never fallback."""
-    backend = os.environ.get('ZBOOT_VM_ACCEL', 'kvm')
-    if backend not in ('kvm', 'tcg'):
-        raise ValueError('ZBOOT_VM_ACCEL must be kvm or tcg (experimental)')
-    return {'backend': backend, 'cpu': 'host' if backend == 'kvm' else 'max',
-            'experimental': backend == 'tcg'}
-
-
-def accelerator_args(config):
-    return ['-machine', f"q35,accel={config['backend']}", '-cpu', config['cpu']]
 
 
 def default_memory_mib(case_id):
@@ -75,7 +60,8 @@ class ImageInput:
 
 
 def copy_image(root, image, destination):
-    """Seal a guest-produced regular file; never attach a supplied host path."""
+    """Copy a file a previous boot of this case wrote under ROOT, the case's
+    own resolved directory, and check the copy's size and full SHA-256."""
     parts = image.relative.split('/')
     if not parts or any(part in ('', '.', '..') for part in parts):
         raise ValueError('case image path must be canonical and relative')
@@ -83,49 +69,13 @@ def copy_image(root, image, destination):
         raise ValueError('case image lacks a bounded full content identity')
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,40}', image.serial) or image.serial in (*DISKS, 'C', 'N'):
         raise ValueError('case image serial is invalid or collides with a stock disk')
-    root = Path(root)
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        for part in parts[:-1]:
-            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                dir_fd=directory)
-            os.close(directory)
-            directory = following
-        source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
-        with os.fdopen(source_fd, 'rb') as source:
-            before = os.fstat(source.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size != image.bytes:
-                raise RuntimeError('case image is not the reviewed regular file size')
-            digest = hashlib.sha256()
-            with open(destination, 'xb') as output:
-                remaining = image.bytes
-                while remaining:
-                    block = source.read(min(remaining, 8 << 20))
-                    if not block:
-                        break
-                    remaining -= len(block)
-                    digest.update(block)
-                    # Preserve sparse zero extents without weakening the full
-                    # byte hash; no reflink or external copy tool is assumed.
-                    if block.count(0) == len(block):
-                        output.seek(len(block), os.SEEK_CUR)
-                    else:
-                        output.write(block)
-                if remaining or source.read(1):
-                    raise RuntimeError('case image length changed while it was sealed')
-                output.truncate(image.bytes)
-                output.flush()
-                os.fsync(output.fileno())
-            after = os.fstat(source.fileno())
-            current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
-            identity = lambda item: (item.st_dev, item.st_ino, item.st_size,
-                                     item.st_mtime_ns, item.st_ctime_ns)
-            if identity(before) != identity(after) or identity(before) != identity(current):
-                raise RuntimeError('case image changed while it was sealed')
-            if digest.hexdigest() != image.sha256:
-                raise RuntimeError('case image bytes differ from the guest-recorded full SHA256')
-    finally:
-        os.close(directory)
+    # The guest wrote this tree through 9p and could have left symlinks.
+    source = Path(root, *parts)
+    if source.resolve() != source.absolute():
+        raise RuntimeError('case image path leaves the case directory')
+    subprocess.run(['cp', '--sparse=always', '--', regular(source), destination], check=True, timeout=1800)
+    if Path(destination).stat().st_size != image.bytes or sha256(destination) != image.sha256:
+        raise RuntimeError('case image bytes differ from the guest-recorded size and SHA256')
     return {'source_relative': image.relative, 'sha256': image.sha256,
             'bytes': image.bytes, 'serial': image.serial, 'boot': image.boot,
             'copy': str(destination), 'allocated_bytes': Path(destination).stat().st_blocks * 512}
@@ -157,15 +107,13 @@ class Vm:
         # Serial sockets live in a short private /tmp directory: run paths
         # exceed the 108-byte AF_UNIX limit.
         self.sockets = Path(tempfile.mkdtemp(prefix='zt-', dir='/tmp'))
-        # KVM is the default; TCG is an explicit experimental diagnostic backend.
+        # KVM with the host CPU; there is no software-emulation fallback.
         # Back guest RAM with preallocated memfd pages; anonymous demand faults
         # stalled guest execution on a development host. No host policy is changed.
         ram = (f'memory-backend-memfd,id=zt-ram,size={memory_mib}M,'
                'hugetlb=off,share=on,prealloc=on,prealloc-threads=2')
-        config = accelerator_config()
-        acceleration = accelerator_args(config)
-        acceleration[1] += ',memory-backend=zt-ram'
-        argv = [QEMU, '-object', ram, *acceleration, '-m', str(memory_mib),
+        argv = [QEMU, '-object', ram, '-machine', 'q35,accel=kvm,memory-backend=zt-ram', '-cpu', 'host',
+                '-m', str(memory_mib),
                 '-smp', '2', '-display', 'none', '-monitor', 'none', '-nic', 'none',
                 '-no-reboot', '-object', 'rng-builtin,id=rng',
                 '-device', 'virtio-rng-pci,rng=rng',
@@ -183,7 +131,7 @@ class Vm:
                 self.ssh_port = reservation.getsockname()[1]
             offset = argv.index('-nic')
             del argv[offset:offset + 2]
-        evidence = {'schema': 1, 'inputs': {}, 'accelerator': config, 'memory_mib': memory_mib}
+        evidence = {'schema': 1, 'inputs': {}, 'memory_mib': memory_mib}
         if 'kernel' in boot:
             for name in ('kernel', 'initrd'):
                 shutil.copyfile(regular(boot[name]), self.run / name)
@@ -212,7 +160,7 @@ class Vm:
             return path
         primary_bus = boot.get('a_bus', 'virtio')
         if (primary_bus not in ('virtio', 'usb', 'nvme')
-                or primary_bus != 'virtio' and (not boot.get('boot_a') or 'efi' not in boot or 'kernel' in boot)):
+                or primary_bus != 'virtio' and (boot.get('boot_disk') != 'A' or 'efi' not in boot or 'kernel' in boot)):
             raise RuntimeError('alternate fixture bus requires an EFI boot of owned disk A')
         if primary_bus == 'usb':
             argv += ['-device', 'qemu-xhci,id=zt-usb']
@@ -220,7 +168,7 @@ class Vm:
             evidence['disk_bus'] = {'A': primary_bus, 'B': 'virtio', 'D': 'virtio'}
         for label in DISKS:
             path = image(label)
-            boot_disk = boot.get('boot_disk', 'A' if boot.get('boot_a') else None)
+            boot_disk = boot.get('boot_disk')
             if boot_disk is not None and boot_disk not in DISKS:
                 raise ValueError('boot disk must be a declared stock disk')
             boot_index = ',bootindex=1' if label == boot_disk else ''
@@ -228,7 +176,7 @@ class Vm:
                      '-device', disk_device(label, boot_index, primary_bus=primary_bus)]
         if 'pxe' in boot:
             if (not network or 'efi' not in boot or 'disk' in boot or images
-                    or boot.get('boot_a') or boot.get('boot_disk')
+                    or boot.get('boot_disk')
                     # QEMU option and slirp command syntax
                     or any(c in f'{self.run}{Path(__file__)}' for c in ', ')):
                 raise ValueError('a network boot is a firmware launch with a NIC and no boot disk')
@@ -244,7 +192,7 @@ class Vm:
                      '-device', 'virtio-blk-pci,drive=boot,serial=ZFS-E2E-C,bootindex=1']
         self.image_paths = {}
         if images:
-            if case_root is None or 'kernel' in boot or 'disk' in boot or boot.get('boot_a') or boot.get('boot_disk'):
+            if case_root is None or 'kernel' in boot or 'disk' in boot or boot.get('boot_disk'):
                 raise ValueError('case images need an explicit private root and firmware-only launch')
             if len(images) > 2 or sum(image.boot for image in images) != 1:
                 raise ValueError('attach one boot image and at most one independent copy')

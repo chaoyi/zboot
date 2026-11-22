@@ -18,6 +18,8 @@ import uuid
 
 from host.case import Boot
 from host.console import ConsoleError, MENU_PROMPT, READY
+from host.ssh import (PASSWORD, command, fingerprint, keygen, password_env, record, ssh_argv,
+                      write_askpass)
 
 ID = 'EFI-CONNECT'
 GROUP = 'efi'
@@ -25,7 +27,7 @@ SECONDS = 4200
 DISKS = {'A': 8, 'B': 2, 'D': 2}
 # Only local transports permit unattended countdown. The first key-consumption
 # leg deliberately stays USB; the held console/custody legs retain virtio.
-BOOTS = [Boot(1, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1),
          Boot(2, efi=True, target=3, extra={'from': 'A', 'bus': 'usb'}, network=True),
          Boot(4, efi=True, target=5, extra={'from': 'A', 'bus': 'nvme'}, network=True),
          Boot(6, efi=True, target=7, extra={'from': 'A', 'bus': 'nvme'}, network=True),
@@ -40,27 +42,16 @@ WAIT_ENDED = 'Remote-access wait ended. Automatic boot follows the ordinary menu
 RECOVERED = 'Menu SSH: previous owned cgroups closed before startup.'
 SESSION_ENDED = 'Automatic SSH session ended. Automatic boot follows the ordinary menu conditions.'
 LAST_ENDED = 'Menu SSH: last authenticated session ended; owned cgroup closed.'
-SSH_ENABLED = r'Host key fingerprint: (SHA256:[A-Za-z0-9+/]{43})'
 
 
 def prepare(run_dir):
     """Disposable credentials stay in this private case; only public bytes share."""
     for name in ('login', 'wrong'):
-        try:
-            result = subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
-                                     '-f', str(run_dir / name)], capture_output=True, timeout=30)
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f'{name} key generation timed out') from error
-        (run_dir / f'{name}-keygen.out').write_bytes(result.stdout)
-        (run_dir / f'{name}-keygen.err').write_bytes(result.stderr)
-        if result.returncode:
-            raise RuntimeError(f'{name} key generation failed: {result.returncode}')
+        keygen(run_dir, name)
     public = run_dir / 'public'
     public.mkdir(mode=0o700)
     public.joinpath('authorized_keys').write_bytes(run_dir.joinpath('login.pub').read_bytes())
-    askpass = run_dir / 'askpass'
-    askpass.write_text('#!/bin/sh\nprintf "%s\\n" "$ZT_CONNECT_PASSWORD"\n')
-    askpass.chmod(0o700)
+    write_askpass(run_dir)
     run_dir.joinpath('connect-inputs.json').write_text(json.dumps({
         'public_key_sha256': hashlib.sha256(public.joinpath('authorized_keys').read_bytes()).hexdigest(),
         'qemu_boots': len(BOOTS), 'wait_seconds': 600,
@@ -69,31 +60,6 @@ def prepare(run_dir):
 
 def shares(run_dir, _boot):
     return [('zt-connect-key', run_dir / 'public')]
-
-
-def record(console, name, argv, result):
-    console._record(name, shlex.join([str(arg) for arg in argv]), result.stdout, result.returncode)
-    (console.out / f'{console.n:02d}-{name}.err').write_text(result.stderr)
-    return result
-
-
-def command(console, name, argv, *, env=None, timeout=45):
-    left = min(timeout, console.deadline - time.monotonic())
-    if left <= 0:
-        raise TimeoutError(name)
-    try:
-        result = subprocess.run([str(arg) for arg in argv], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=left,
-                                env=env, start_new_session=True)
-    except subprocess.TimeoutExpired as error:
-        output = error.stdout or b''
-        errors = error.stderr or b''
-        result = subprocess.CompletedProcess(argv, 124,
-                    output.decode(errors='replace') if isinstance(output, bytes) else output,
-                    errors.decode(errors='replace') if isinstance(errors, bytes) else errors)
-        record(console, name, argv, result)
-        raise ConsoleError(f'{name}: host SSH command timed out') from error
-    return record(console, name, argv, result)
 
 
 def consumed(console):
@@ -109,48 +75,6 @@ def pause_remote(console):
     console.expect('Menu held by the console.', 60)
     console.expect(MENU_PROMPT, 60)
     console._record('console-hold', '<one bare space>', console._text(start, console.pos), 0)
-
-
-def fingerprint(console, ready):
-    hits = re.findall(SSH_ENABLED, ready)
-    if len(hits) != 1:
-        raise ConsoleError(f'expected one native host fingerprint, got {hits}')
-    known = console.case_dir / f'known-{console.out.name}'
-    scan = ['/usr/bin/ssh-keyscan', '-T', '10', '-t', 'ed25519', '-p', str(console.ssh_port), '127.0.0.1']
-    # The menu prints the fingerprint as it starts sshd, which may not listen
-    # yet; wait (unrecorded) for the first answer, then record one scan.
-    for _ in range(10):
-        if subprocess.run(scan, capture_output=True, timeout=30).stdout.strip():
-            break
-        time.sleep(1)
-    result = command(console, 'host-keyscan', scan)
-    if result.returncode or not result.stdout.strip():
-        raise ConsoleError('SSH listener produced no host key')
-    known.write_text(result.stdout)
-    actual = command(console, 'host-fingerprint', ['/usr/bin/ssh-keygen', '-l', '-E', 'sha256', '-f', known])
-    if actual.returncode or actual.stdout.split()[1:2] != hits:
-        raise ConsoleError('SSH host key does not match the console fingerprint')
-    return known
-
-
-def ssh_argv(console, known, *, key='login', password=False):
-    args = ['/usr/bin/ssh', '-F', '/dev/null', '-p', str(console.ssh_port),
-            '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1',
-            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={known}',
-            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR',
-            '-o', 'NumberOfPasswordPrompts=1']
-    if password:
-        args += ['-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password',
-                 '-o', 'KbdInteractiveAuthentication=no', '-o', 'BatchMode=no']
-    else:
-        args += ['-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
-                 '-o', 'PreferredAuthentications=publickey', '-i', str(console.case_dir / key)]
-    return args + ['root@127.0.0.1']
-
-
-def password_env(console, password):
-    return dict(os.environ, SSH_ASKPASS=str(console.case_dir / 'askpass'),
-                SSH_ASKPASS_REQUIRE='force', DISPLAY='zt-connect:0', ZT_CONNECT_PASSWORD=password)
 
 
 def no_banner(console, name):
@@ -277,7 +201,7 @@ def stage_8(console):
     pause_remote(console)
     enabled = console.menu('connect', 'connect')
     known = fingerprint(console, enabled)
-    passwords = re.findall(r'One-time root password: ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12})', enabled)
+    passwords = re.findall(PASSWORD, enabled)
     if len(passwords) != 1:
         raise ConsoleError('connect did not print exactly one bounded password')
     environment = password_env(console, passwords[0])

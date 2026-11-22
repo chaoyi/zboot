@@ -434,12 +434,12 @@ pub(super) fn boot_shortcut(
         .map_err(|error| at("run rescan to update the displayed boot selection", error))?;
     let cli = crate::cli::grammar::Cli {
         verbose: false,
+        json: false,
         command: crate::cli::grammar::Verb::Boot {
             dataset: Some(request.dataset.clone()),
             kernel: None,
             tar: None,
             overlay: Vec::new(),
-            json: false,
         },
     };
     let bindings = vec![(

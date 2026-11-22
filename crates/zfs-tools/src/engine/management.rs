@@ -29,7 +29,6 @@ pub enum MountMode {
     NoAuto,
 }
 impl MountMode {
-    #[cfg(feature = "internal")]
     pub fn native(self) -> &'static str {
         match self {
             Self::On => "on",
@@ -54,7 +53,6 @@ pub struct Placement {
 }
 impl Placement {
     /// The dataset's `readonly` and `canmount`, without its `volmode`.
-    #[cfg(feature = "internal")]
     pub fn from_dataset(dataset: &crate::engine::Dataset) -> Self {
         Self {
             schema_version: 1,
@@ -71,7 +69,6 @@ impl Placement {
     /// What a fence saves of the dataset now: [`Self::from_dataset`] and,
     /// for a volume, a `volmode` set by hand. A local `none` is not saved:
     /// at rest it cannot be told from the fence's own.
-    #[cfg(feature = "internal")]
     pub fn observed(
         dataset: &crate::engine::Dataset,
         properties: &BTreeMap<String, NativeProperty>,
@@ -105,7 +102,6 @@ impl Placement {
         }
         Ok(record)
     }
-    #[cfg(feature = "internal")]
     pub fn encode(&self) -> Result<String, Error> {
         let encoded = serde_json::to_string(self).map_err(|e| refuse(e.to_string()))?;
         Self::parse(&encoded)?;
@@ -174,7 +170,6 @@ impl PairRecord {
             role: self.role.opposite(),
         }
     }
-    #[cfg(feature = "internal")]
     pub fn encode(&self) -> Result<String, Error> {
         self.validate()?;
         serde_json::to_string(self).map_err(|e| refuse(e.to_string()))
@@ -365,7 +360,7 @@ pub(crate) fn peer_references(state: &NativeState, name: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(test, feature = "internal"))]
+#[cfg(test)]
 fn admit_working(state: &NativeState, name: &str) -> Result<(), Error> {
     admit_working_parts(&state.inspection.datasets, &state.dataset_properties, name)
 }
@@ -583,7 +578,6 @@ mod tests {
         properties.insert(PLACEMENT_PROPERTY.into(), pending("local"));
         assert!(!error(&properties, "stick/ROOT/default").contains("interrupted deploy"),);
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn an_operation_record_is_inert_only_on_and_below_its_pool_root() {
         let property = |source: &str| {
@@ -609,7 +603,6 @@ mod tests {
             );
         }
     }
-    #[cfg(feature = "internal")]
     fn fixture() -> NativeState {
         use crate::engine::{InspectRequest, native};
         let rows = [
@@ -665,7 +658,6 @@ mod tests {
             source: source.into(),
         }
     }
-    #[cfg(feature = "internal")]
     fn paired() -> (NativeState, PairRecord) {
         let mut state = fixture();
         let endpoint = |name: &str| Endpoint {
@@ -712,7 +704,6 @@ mod tests {
             );
         (state, record)
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn native_incarnations_and_mutual_fencing_admit_only_primary() {
         let (state, record) = paired();
@@ -738,7 +729,6 @@ mod tests {
         )
         .unwrap();
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn absent_peer_refuses_ownership_instead_of_assuming_a_role() {
         let (mut state, _) = paired();
@@ -778,7 +768,6 @@ mod tests {
         let properties = BTreeMap::from([("zctl:role".into(), prop("1", "local"))]);
         validate_supported_properties(&properties, "tank/data").unwrap();
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn partial_publication_unknown_schema_stale_identity_and_source_refuse() {
         for case in 0..7 {
@@ -847,7 +836,6 @@ mod tests {
             assert!(ownership(&state, "tank/data/child").is_err(), "case {case}");
         }
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn foreign_fields_and_invalid_ids_cannot_become_management_authority() {
         let (_, record) = paired();

@@ -9,7 +9,6 @@ use crate::engine::{
 use crate::{CaptureOutcome, CaptureStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "internal")]
 pub struct CaptureRequest {
     pub roots: Vec<String>,
     pub name: String,
@@ -71,7 +70,6 @@ impl CaptureBackend for NativeCapture {
     }
 }
 
-#[cfg(feature = "internal")]
 pub fn capture_with(
     request: &CaptureRequest,
     backend: &mut impl CaptureBackend,
@@ -100,7 +98,6 @@ pub fn capture_with(
     capture_prepared_with(&plan, &request.name, &operation_id, backend)
 }
 
-#[cfg(feature = "internal")]
 pub fn capture_prepared(
     plan: &SnapshotScope,
     name: &str,
@@ -244,7 +241,6 @@ fn refuse_collisions(state: &NativeState, names: &[String]) -> Result<(), Error>
 }
 
 #[cfg(test)]
-#[cfg(feature = "internal")]
 mod tests {
     use super::*;
     use crate::engine::{

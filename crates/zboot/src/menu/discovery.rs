@@ -396,8 +396,7 @@ fn batch(progress: &Mutex<Progress>) -> Result<()> {
     use hostid_adopt::{Failure, Import};
     let writer = Arc::new(
         zfs_tools::engine::lock::for_command("zboot", "read-only pool discovery")
-            .map_err(|error| refuse(error.to_string()))?
-            .ok_or_else(|| refuse("pool discovery requires the writer lock"))?,
+            .map_err(|error| refuse(error.to_string()))?,
     );
     publish_inventory_writer(&INVENTORY_WRITER, &writer, progress)?;
     prove_ram()?;

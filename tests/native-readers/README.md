@@ -1,11 +1,11 @@
 # Supervised reader native proof
 
 This driver checks [`zsnap protect` and `zsnap recover`](../../crates/zsnap/README.md#protected-snapshot-readers)
-against real ZFS in a disposable QEMU guest (KVM by default). It builds the current `zsnap`
+against real ZFS in a disposable QEMU/KVM guest. It builds the current `zsnap`
 package (`cargo build -p zsnap --bin zsnap`). It does not write host pools,
 pass through physical devices or use the network. The UKI's own `zboot` is
 replaced by a stub that exits with status 125 in the guest. A fixture `zfs`
-wrapper can pause or lose a hold reply; these hooks exist only in the guest
+wrapper can pause a hold after it succeeds; that hook exists only in the guest
 fixture.
 
 Run from the repository root with a zboot UKI, as for the
@@ -20,17 +20,14 @@ Prerequisites are x86-64 Linux with KVM, Cargo and cached dependencies, QEMU,
 `zstd`, `readelf`, and host Python with its standard library and matching loader.
 The host Python fixture and its loader and libraries are supplied on a
 read-only 9P share. They do not replace the UKI's libc or native ZFS tools.
-`ZBOOT_VM_ACCEL=tcg` explicitly selects experimental software emulation with
-QEMU's `max` CPU. There is no automatic fallback from KVM. Accelerator selection
-is recorded in provenance. On slower emulated guests,
-`--operation-timeout 120 --timeout 900` gives operations more time to complete. The operation timeout
-defaults to 20 seconds and scales setup, readiness and completion guards in the
-same proportions. It does not change the eight-second writer-lock assertion or
-the product's one-second stop timeout. The outer timeout bounds the whole guest.
+The guest always runs under KVM with the host CPU model; there is no software
+emulation fallback. Each guest command has a fixed 20-second liveness guard,
+separate from the eight-second writer-lock assertion and the product's
+one-second stop timeout. The outer `--timeout` bounds the whole guest.
 
 The runner honors caller-owned `CARGO_TARGET_DIR` and `TMPDIR`, while keeping
 Cargo intermediate output in its private staging directory. With no caller
-paths it owns a private system temporary directory. An external execution
+paths it owns a private directory under `TMPDIR` (default `/var/tmp`). An external execution
 scope must cover the entire build and guest lifetime:
 
 ```sh
@@ -61,14 +58,13 @@ policies.
 
 Source hashes cover every file of the zfs-tools and zsnap crates (including
 `include_str!` inputs such as `crates/zsnap/src/policies.toml`), Cargo manifests/lockfile,
-this harness and `tests/acceptance/host/uki.py`, which takes the kernel and
+this harness, the shared runner `tests/native_proof.py` and `tests/acceptance/host/uki.py`, which takes the kernel and
 initramfs out of the UKI. The source manifest is checked after compilation and
 native execution.
 Evidence contains commands, reader identity/view facts, JSON results, retained
 job records, final inventory, hold state, serial output and exact runtime/build
 provenance. On case failure, `failure-processes.json` captures live guest process
 commands, wait channels, syscalls, kernel stacks, cgroups and mount tables before
-cleanup, with job records saved as `*-failure-record.json`. Use `--trace-basic`
-to add a syscall trace for the first supervisor (requires host `strace`).
+cleanup, with job records saved as `*-failure-record.json`.
 This does not qualify a rebuilt UKI, a writer cohort or any actual
 backup service migration.

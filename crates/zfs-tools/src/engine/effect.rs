@@ -1,11 +1,9 @@
 //! Effects and recovery guidance accumulated by this command invocation.
 //! Call `reset` at the invocation boundary before admitting any work.
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "internal")]
 use std::{collections::BTreeSet, sync::Mutex};
 
 static EFFECT: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "internal")]
 static HINTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// Record an actual write or a dispatched native mutation with an uncertain outcome.
@@ -14,13 +12,11 @@ pub fn mark() {
 }
 
 /// Whether this invocation has performed or dispatched a mutation.
-#[cfg(feature = "internal")]
 pub fn any() -> bool {
     EFFECT.load(Ordering::SeqCst)
 }
 
 /// Start a new invocation, clearing its effect flag and guidance-only IDs.
-#[cfg(feature = "internal")]
 pub fn reset() {
     EFFECT.store(false, Ordering::SeqCst);
     HINTS
@@ -31,7 +27,6 @@ pub fn reset() {
 
 /// Remember an operation ID for later verified recovery guidance.
 /// A hint carries no authority and does not itself record an effect.
-#[cfg(feature = "internal")]
 pub fn operation_hint(id: &str) {
     if !id.is_empty() {
         HINTS
@@ -42,7 +37,6 @@ pub fn operation_hint(id: &str) {
 }
 
 /// Deterministically ordered guidance candidates, requiring native revalidation.
-#[cfg(feature = "internal")]
 pub fn operation_hints() -> Vec<String> {
     HINTS
         .lock()
@@ -53,7 +47,6 @@ pub fn operation_hints() -> Vec<String> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "internal")]
 mod tests {
     use super::*;
     use crate::engine::{intent, native};

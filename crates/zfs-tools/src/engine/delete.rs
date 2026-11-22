@@ -207,7 +207,9 @@ pub fn execute_snapshot_delete_with(
         ));
     }
 
-    revalidate(plan, &backend.observe()?, &plan.targets)?;
+    // Each point, the first included, is revalidated with the rest of the
+    // plan on a fresh observation and then on its own just before its
+    // destroy. A refusal before the first destroy is an error, not an outcome.
     let mut outcome = DeleteOutcome {
         status: DeleteStatus::Complete,
         points: Vec::new(),
@@ -288,14 +290,12 @@ pub fn execute_snapshot_delete_with(
 /// policy selection. This shared crate validates namespace/scope and binds the
 /// exact candidates; it does not implement or trust serialized policy programs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg(feature = "internal")]
 pub struct RetentionSelection {
     dataset: String,
     policy_evidence: String,
     evaluated_at_epoch_seconds: i64,
     points: Vec<SnapshotRef>,
 }
-#[cfg(feature = "internal")]
 impl RetentionSelection {
     pub fn new(
         dataset: String,
@@ -337,20 +337,17 @@ impl RetentionSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg(feature = "internal")]
 pub struct DeleteSkip {
     pub point: SnapshotRef,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg(feature = "internal")]
 pub struct RetentionDeletePlan {
     selection: RetentionSelection,
     plan: Option<SnapshotDeletePlan>,
     skipped: Vec<DeleteSkip>,
 }
-#[cfg(feature = "internal")]
 impl RetentionDeletePlan {
     pub fn plan(&self) -> Option<&SnapshotDeletePlan> {
         self.plan.as_ref()
@@ -360,16 +357,6 @@ impl RetentionDeletePlan {
     }
 }
 
-#[cfg(feature = "internal")]
-pub fn plan_retention_with(
-    selection: &RetentionSelection,
-    backend: &mut impl DeleteBackend,
-) -> Result<RetentionDeletePlan, Error> {
-    let state = backend.observe()?;
-    plan_retention_from_state(selection, &state)
-}
-
-#[cfg(feature = "internal")]
 pub fn plan_retention_from_state(
     selection: &RetentionSelection,
     state: &NativeState,
@@ -405,7 +392,6 @@ pub fn plan_retention_from_state(
     })
 }
 
-#[cfg(feature = "internal")]
 pub fn execute_retention_with(
     plan: &RetentionDeletePlan,
     backend: &mut impl DeleteBackend,
@@ -692,7 +678,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "internal")]
     #[test]
     fn retention_binds_policy_and_namespace_and_reports_protected_skips() {
         let mut fake = Fake::new();
@@ -708,7 +693,7 @@ mod tests {
             fake.points(),
         )
         .unwrap();
-        let plan = plan_retention_with(&selection, &mut fake).unwrap();
+        let plan = plan_retention_from_state(&selection, &fake.observe().unwrap()).unwrap();
         assert_eq!(plan.skipped().len(), 1);
         assert_eq!(plan.plan().unwrap().points().len(), 1);
         let report = execute_retention_with(&plan, &mut fake).unwrap();
@@ -726,7 +711,6 @@ mod tests {
             RetentionSelection::new("tank/data".into(), String::new(), 1, fake.points()).is_err()
         );
     }
-    #[cfg(feature = "internal")]
     #[test]
     fn a_paired_working_copy_prunes_and_a_fenced_copy_refuses() {
         use crate::engine::management::{Endpoint, PAIR_PROPERTY, PairRecord, Role};

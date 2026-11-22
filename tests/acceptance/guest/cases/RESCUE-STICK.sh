@@ -1,6 +1,5 @@
 # The factory input must be the fresh docs/RECOVERY.md rescue-package recipe. All disks,
 # loop backing files and fixtures are this disposable case's own devices.
-. /acceptance/share.sh
 ACCESS=/run/zt-rescue-access
 VIEW=/mnt/zt-rescue-view
 
@@ -97,7 +96,6 @@ build_image() { # KIND: current identity route is deliberately outside zboot
 }
 
 stage_1() {
-    fixtures_mount
     must source-version zboot --version
     must source-binary-sha256 sha256sum /usr/bin/zboot
     must factory-sha256 sha256sum /fixtures/e2e-factory.tar.zst

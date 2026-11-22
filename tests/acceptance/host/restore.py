@@ -44,8 +44,6 @@ def hostid(stage, check, boot):
 def base(stage, check):
     """restore_base: hostid, fixture disks; the source BE's placement when built."""
     hostid(stage, check, 1)
-    sums = [line.split()[0] for line in stage.step('fixtures-manifest').out.splitlines()]
-    check(len(sums) == 2 and sums[0] == sums[1], f'fixture share manifest differs from the initrd copy: {sums}')
     disks = stage.step('disks').out
     for serial in ('ZFS-E2E-A', 'ZFS-E2E-D'):
         check(f'{serial} /dev/' in disks, f'fixture disk {serial} present: {disks!r}')

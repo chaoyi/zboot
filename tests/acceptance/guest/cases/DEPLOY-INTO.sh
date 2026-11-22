@@ -1,7 +1,6 @@
 # deploy into: add a BE while every pool default remains fixed, then cut a second addition
 # after its real @factory snapshot. Boot 2 inspects and explicitly Drops that
 # fenced name before a fresh retry. Boot 3 starts D's own ESP and the new BE.
-. /acceptance/share.sh
 . /acceptance/deploy_boot.sh
 POOL=e2ed BE=e2ed/ROOT/new HALF=e2ed/ROOT/interrupted
 TAR=/fixtures/e2e-factory.tar.zst OVERLAY=/run/deploy-into-overlay
@@ -11,7 +10,6 @@ into() { name=$1 be=$2; shift 2; step "$name" zboot deploy into "$POOL" --tar "$
 stage_1() {
     fixture_hostid
     fixture_pools
-    fixtures_mount
     d=$(disk D)
     must old-preview zboot deploy "$d" --pool "$POOL" --be old --tar "$TAR" \
         --efi /fixtures/e2e-esp-artifacts/zboot-recovery.efi --esp 512M --dry-run --json
@@ -39,7 +37,6 @@ stage_1() {
 
 stage_2() {
     fixture_hostid
-    fixtures_mount
     must import-a zpool import -N -o readonly=on -d /dev e2ea
     must import-b zpool import -N -o readonly=on -d /dev e2eb
     must import-d zpool import -N -d /dev "$POOL"

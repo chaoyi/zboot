@@ -1,6 +1,5 @@
 # EFI-CONNECT uses a real installed factory root for all four kexec targets.
 # The acceptance probe is a disposable systemd unit, not a replacement initrd.
-. /acceptance/share.sh
 ROOT=e2ea/ROOT/proof
 M=/mnt/zt-connect-root
 ESP=/mnt/zt-connect-esp
@@ -58,7 +57,6 @@ next_stage() {
 }
 
 stage_1() {
-    fixtures_mount
     must setup-version zboot --version
     must setup-sha256 sha256sum /usr/bin/zboot
     must setup-efi-sha256 sha256sum /fixtures/e2e-esp-artifacts/zboot-recovery.efi

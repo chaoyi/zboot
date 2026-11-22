@@ -1,12 +1,10 @@
 //! Command-line restore and interrupted-operation recovery.
-use super::run::{applied, applied_operation, consent_to, dialogue, json_response, writer_for};
-
-pub(super) struct RestoreArgs {
-    pub(super) request: crate::restore::Request,
-    pub(super) dry_run: bool,
-    pub(super) confirm: Option<String>,
-    pub(super) json: bool,
-}
+use super::{
+    grammar::Consent,
+    run::{
+        Invocation, applied, applied_operation, consent_to, dialogue, json_response, writer_for,
+    },
+};
 
 pub(super) fn restore_backend() -> crate::restore::Native {
     crate::restore::Native::new()
@@ -42,15 +40,15 @@ fn cleanup_restore<T>(
 }
 
 fn print_completed(
-    json: bool,
+    inv: &mut Invocation,
     token: Option<String>,
     done: &crate::restore::Completed,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
+    if inv.json {
         let mut envelope =
             crate::consent::Envelope::new(crate::consent::Outcome::Applied, token, done);
         envelope.operation = Some(done.id.clone());
-        return json_response(envelope);
+        return json_response(inv, envelope);
     }
     println!(
         "Restored {} on pool {}; it is the boot default.",
@@ -63,14 +61,17 @@ fn print_completed(
     Ok(())
 }
 
-pub(super) fn restore(args: RestoreArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn restore(
+    request: crate::restore::Request,
+    consent: Consent,
+    inv: &mut Invocation,
+) -> Result<(), Box<dyn std::error::Error>> {
     use crate::restore;
     let id = restore::new_id();
     let Some((plan, token)) = consent_to(
-        args.dry_run,
-        args.confirm,
-        args.json,
-        || restore_plan(&args.request, &id),
+        inv,
+        consent,
+        || restore_plan(&request, &id),
         |plan| Ok(plan.token.clone()),
         |plan, _| restore::render(plan),
         |plan| plan.typed(),
@@ -78,12 +79,12 @@ pub(super) fn restore(args: RestoreArgs) -> Result<(), Box<dyn std::error::Error
     else {
         return Ok(());
     };
-    let mut dialogue = dialogue(args.json);
+    let mut dialogue = dialogue(inv.json);
     zfs_tools::engine::effect::operation_hint(&id);
     let mut backend = restore_backend();
     let result = restore::Run::start(&mut backend, &plan, &mut dialogue);
     match cleanup_restore(&mut backend, result) {
-        Ok(done) => print_completed(args.json, Some(token), &done),
+        Ok(done) => print_completed(inv, Some(token), &done),
         Err(error) => Err(format!("{error}. Restore {id} stopped").into()),
     }
 }
@@ -155,9 +156,8 @@ fn one_record_token(
 fn resume_one(
     record: zfs_tools::engine::intent::Intent<serde_json::Value>,
     abandon: bool,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    consent: Consent,
+    inv: &mut Invocation,
     engine: ResumeEngine,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = record.id.clone();
@@ -176,9 +176,8 @@ fn resume_one(
     let verb = if abandon { "Abandon" } else { "Continue" };
     let Some((record, token)) = (if abandon {
         consent_to(
-            dry_run,
-            confirm,
-            json,
+            inv,
+            consent,
             reread,
             shown,
             |record, token| {
@@ -194,15 +193,18 @@ fn resume_one(
                 text: record.id.clone(),
             },
         )?
-    } else if dry_run {
+    } else if consent.dry_run {
         let record = reread()?;
         let token = shown(&record)?;
-        if json {
-            json_response(crate::consent::Envelope::new(
-                crate::consent::Outcome::Preview,
-                Some(token),
-                &record,
-            ))?;
+        if inv.json {
+            json_response(
+                inv,
+                crate::consent::Envelope::new(
+                    crate::consent::Outcome::Preview,
+                    Some(token),
+                    &record,
+                ),
+            )?;
         } else {
             println!(
                 "{verb} {} {} after step {}; dry run, nothing changed.",
@@ -217,8 +219,8 @@ fn resume_one(
         // and the record again under it.
         let record = reread()?;
         let token = shown(&record)?;
-        continue_token(&id, confirm.as_deref(), Some(&token))?;
-        writer_for(&record)?;
+        continue_token(&id, consent.confirm.as_deref(), Some(&token))?;
+        writer_for(inv, &record)?;
         let fresh = reread()?;
         crate::consent::unchanged(&token, &shown(&fresh)?)?;
         Some((fresh, token))
@@ -228,17 +230,17 @@ fn resume_one(
     if record.kind != kind {
         return Err(format!("operation {id} changed kind; nothing was done").into());
     }
-    let mut dialogue = dialogue(json);
+    let mut dialogue = dialogue(inv.json);
     zfs_tools::engine::effect::operation_hint(&id);
     let outcome = engine(record, abandon, &mut dialogue)?;
     applied_operation(
-        json,
+        inv,
         Some(token),
         Some(&id),
         outcome.complete,
         &outcome.result,
     )?;
-    if !json {
+    if !inv.json {
         println!(
             "{} operation {}.",
             if abandon { "Abandoned" } else { "Continued" },
@@ -269,9 +271,8 @@ fn continue_token(
 pub(super) fn resume(
     id: Option<String>,
     abandon: bool,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    consent: Consent,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::restore;
     use std::io::Write;
@@ -288,13 +289,12 @@ pub(super) fn resume(
     if let Some((_, record)) = restore::record(&mut restore_backend(), &id)?
         && let Some(engine) = resume_engine(&record.kind)
     {
-        return resume_one(record, abandon, dry_run, confirm, json, engine);
+        return resume_one(record, abandon, consent, inv, engine);
     }
     if abandon {
         let Some((preview, token)) = consent_to(
-            dry_run,
-            confirm,
-            json,
+            inv,
+            consent,
             || Ok(restore::abandon_plan(&mut restore_backend(), &id)?),
             |preview| Ok(preview.token.clone()),
             |preview, token| {
@@ -318,8 +318,8 @@ pub(super) fn resume(
         };
         debug_assert_eq!(preview.id, id);
         let abandoned = restore::abandon(&mut restore_backend(), &id)?;
-        if json {
-            return applied(json, Some(token), &abandoned);
+        if inv.json {
+            return applied(inv, Some(token), &abandoned);
         }
         println!("Abandoned restore {id}. Left in place:");
         for left in &abandoned.left {
@@ -331,9 +331,8 @@ pub(super) fn resume(
     let plan = if plan.typed().is_some() {
         // An erase of A is ahead or was interrupted: a fresh typed answer.
         let Some((plan, _)) = consent_to(
-            dry_run,
-            confirm,
-            json,
+            inv,
+            consent,
             || resume_plan(&id),
             |plan| {
                 plan.token.clone().ok_or_else(|| {
@@ -367,21 +366,20 @@ pub(super) fn resume(
         };
         plan
     } else {
-        continue_token(&id, confirm.as_deref(), None)?;
-        let mut dialogue = dialogue(json);
+        continue_token(&id, consent.confirm.as_deref(), None)?;
+        let mut dialogue = dialogue(inv.json);
         writeln!(dialogue, "Restore {id}: last completed step {}", plan.step)?;
-        if dry_run {
+        if consent.dry_run {
             writeln!(dialogue, "Dry run; nothing changed.")?;
-            if json {
-                json_response(crate::consent::Envelope::new(
-                    crate::consent::Outcome::Preview,
-                    None,
-                    &plan,
-                ))?;
+            if inv.json {
+                json_response(
+                    inv,
+                    crate::consent::Envelope::new(crate::consent::Outcome::Preview, None, &plan),
+                )?;
             }
             return Ok(());
         }
-        writer_for(&plan)?;
+        writer_for(inv, &plan)?;
         let fresh = resume_plan(&id)?;
         if fresh.token.is_some() {
             return Err(
@@ -390,11 +388,11 @@ pub(super) fn resume(
         }
         fresh
     };
-    let mut dialogue = dialogue(json);
+    let mut dialogue = dialogue(inv.json);
     let mut backend = restore_backend();
     let result = restore::Run::resume(&mut backend, &id, plan.erase_layout()?, &mut dialogue);
     let done = cleanup_restore(&mut backend, result)?;
-    print_completed(json, plan.token, &done)
+    print_completed(inv, plan.token, &done)
 }
 
 #[cfg(test)]

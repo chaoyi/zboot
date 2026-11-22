@@ -491,7 +491,7 @@ fn prune(
                  no snapshots were deleted, run it again"
             );
         }
-        writer
+        Some(writer)
     };
     for plan in plans.iter().filter_map(|p| p.plan()) {
         // Confirmation binds these immutable exact candidates. Replanning after

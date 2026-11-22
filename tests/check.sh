@@ -17,8 +17,6 @@ if grep -rnE 'disallowed_methods|allow\(clippy::(all|style)' crates/*/src |
     echo 'check: only engine/native.rs may allow clippy::disallowed_methods' >&2
     exit 1
 fi
-# The supported library alone, without the workspace-internal engine feature.
-cargo clippy -p zfs-tools --all-targets --locked --offline -j "$jobs" -- -D warnings
 # Select exact Cargo artifacts for the native-library ABI fault fixtures.
 native_manifest=$(mktemp "${TMPDIR:-/var/tmp}/zboot-helpers-artifacts.XXXXXX")
 trap 'rm -f "$native_manifest"' EXIT

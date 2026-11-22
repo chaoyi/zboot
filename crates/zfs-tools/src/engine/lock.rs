@@ -33,7 +33,7 @@ pub const COMMAND_WAIT: Duration = Duration::from_secs(300);
 /// allow` delegation, so it must join the same lock. Boot initialization
 /// creates the readable inode; an unavailable lock refuses the command. Root
 /// writers also create it when needed and repair its mode independently of umask.
-pub fn for_command(program: &str, purpose: &str) -> Result<Option<WriterLock>, LockError> {
+pub fn for_command(program: &str, purpose: &str) -> Result<WriterLock, LockError> {
     let waiting = |holder: &str| {
         eprintln!(
             "{program}: waiting for the ZFS writer lock, held by {}",
@@ -43,7 +43,7 @@ pub fn for_command(program: &str, purpose: &str) -> Result<Option<WriterLock>, L
     if !rustix::process::geteuid().is_root() {
         return WriterLock::join_at(Path::new(PATH), COMMAND_WAIT, waiting);
     }
-    WriterLock::acquire(&format!("{program} {purpose}"), COMMAND_WAIT, waiting).map(Some)
+    WriterLock::acquire(&format!("{program} {purpose}"), COMMAND_WAIT, waiting)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +136,7 @@ impl WriterLock {
         path: &Path,
         wait: Duration,
         waiting: impl FnOnce(&str),
-    ) -> Result<Option<Self>, LockError> {
+    ) -> Result<Self, LockError> {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
@@ -147,7 +147,7 @@ impl WriterLock {
             )))?;
         regular(&file)?;
         lock(&mut file, wait, waiting)?;
-        Ok(Some(Self { _file: file }))
+        Ok(Self { _file: file })
     }
 
     /// Duplicate custody of the same flock open-file description without
@@ -295,9 +295,7 @@ mod tests {
         let holder = format!("pid {} zboot sync", std::process::id());
         assert_eq!(error, LockError::Busy { holder });
         drop(held);
-        let joined = WriterLock::join_at(&path, RELEASED, |_| {})
-            .unwrap()
-            .unwrap();
+        let joined = WriterLock::join_at(&path, RELEASED, |_| {}).unwrap();
         // While joined, a root writer waits for it.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = WriterLock::acquire_at(&path, "zsnap run", Duration::ZERO, |_| {}).unwrap_err();
@@ -456,9 +454,7 @@ mod tests {
         let dir = dir();
         let path = dir.join("writer.lock");
         drop(WriterLock::acquire_at(&path, "initialize", Duration::ZERO, |_| {}).unwrap());
-        let joined = WriterLock::join_at(&path, Duration::ZERO, |_| {})
-            .unwrap()
-            .unwrap();
+        let joined = WriterLock::join_at(&path, Duration::ZERO, |_| {}).unwrap();
         let mut child = lock_child(Some(&joined), &dir.join("ready"));
         drop(joined);
         assert!(matches!(
@@ -470,9 +466,7 @@ mod tests {
             Err(LockError::Busy { .. })
         ));
         child.stop();
-        let next = WriterLock::join_at(&path, RELEASED, |_| {})
-            .unwrap()
-            .unwrap();
+        let next = WriterLock::join_at(&path, RELEASED, |_| {}).unwrap();
         drop(next);
         std::fs::remove_dir_all(dir).unwrap();
     }

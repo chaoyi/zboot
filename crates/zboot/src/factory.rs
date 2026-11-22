@@ -686,7 +686,7 @@ pub(crate) mod tests {
                 let scratch = Scratch::new();
                 action(&scratch.0).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
             };
-            std::process::exit(crate::cli::finish(result, false, retry));
+            std::process::exit(crate::cli::finish(result, None, false, retry));
         }
         let test = std::thread::current().name().unwrap().to_owned();
         let output = Command::new(std::env::current_exe().unwrap())

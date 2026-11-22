@@ -1,7 +1,6 @@
 # PXE-MENU: a factory root on A whose ESP then holds no EFI executable, so
 # firmware can start zboot only from the network. A disposable probe unit in
 # the installed root runs stage 3 after the menu's handoff.
-. /acceptance/share.sh
 ROOT=e2ea/ROOT/proof
 M=/mnt/zt-pxe-root
 ESP=/mnt/zt-pxe-esp
@@ -17,7 +16,6 @@ esp_partition() {
 }
 
 stage_1() {
-    fixtures_mount
     must setup-efi-sha256 sha256sum /fixtures/e2e-esp-artifacts/zboot-recovery.efi
     must setup-factory-sha256 sha256sum /fixtures/e2e-factory.tar.zst
     a=$(disk A)

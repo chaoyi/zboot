@@ -23,7 +23,7 @@ ID = 'GUIDED-DIRTY-PORTABLE-MENU'
 GROUP = 'efi'
 SECONDS = 7200
 DISKS = guided.DISKS
-BOOTS = [Boot(1, extra={'setup': 'neutral'}), Boot(2, efi=True), Boot(3, efi=True, extra={'from': 'A'}),
+BOOTS = [Boot(1), Boot(2, efi=True), Boot(3, efi=True, extra={'from': 'A'}),
          Boot(4, efi=True, extra={'from': 'A'}), Boot(5, efi=True)]
 
 STICK = '/mnt/zfs-e2e/g-stick'

@@ -14,16 +14,15 @@ it and refuses a copy that differs from its publisher's record: `OUT/SHA256SUMS`
 or the installed `zboot` package's dpkg md5sums (which catch a stale or damaged
 file, not a forged one); any other path is refused.
 
-KVM with the host CPU model is the default, including local runs. Set
-`ZBOOT_VM_ACCEL=tcg` only for explicit software-emulation diagnostics; that
-selects QEMU's `max` CPU and records the experimental backend in provenance.
-There is no silent fallback. `--jobs N` bounds Cargo workers (default
+The guest always runs under KVM with the host CPU model; there is no software
+emulation fallback. `--jobs N` bounds Cargo workers (default
 `CARGO_BUILD_JOBS`, otherwise 4); `--timeout N` bounds the guest runtime.
+This runner and [the native reader proof](../native-readers/README.md) share
+their host side, [`tests/native_proof.py`](../native_proof.py).
 
 The guest uses that UKI's kernel, initramfs, modules and ZFS tools.
 `provenance.json` records the UKI, kernel and initramfs digests, the checksum
-record checked, the UKI's `.osrel` (which must say `ID=zboot`) and its
-`zboot --version` output.
+record checked and the UKI's `.osrel` (which must say `ID=zboot`).
 The guest's `zboot` and `zsnap` commands are replaced with stubs that exit 125,
 so the example cannot accidentally use an application instead of the API.
 

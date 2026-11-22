@@ -15,17 +15,6 @@ READ_MOUNT=/mnt/zfs-e2e/restore-read
 # slug NAME: a dataset name usable in a step name.
 slug() { echo "$1" | tr '/@' '__'; }
 
-# restore_fixtures: the read-only bulk fixture share at /fixtures, which
-# lib.sh normally mounts already.
-restore_fixtures() {
-    if [ ! -d /fixtures/e2e-esp-artifacts ]; then
-        mkdir -p /fixtures
-        must fixtures-mount mount -t 9p -o ro,trans=virtio,version=9p2000.L,cache=none zt-fixtures /fixtures
-    fi
-    # The share is the one this initrd was built against (its embedded manifest).
-    must fixtures-manifest sha256sum /fixtures/manifest.json /e2e-fixtures.manifest.json
-}
-
 # put FILE CONTENT: write CONTENT (no newline) into FILE.
 put() { mkdir -p "${1%/*}" && printf '%s' "$2" > "$1" || fail "cannot write $1"; }
 
@@ -38,7 +27,6 @@ restore_hostid() {
 # restore_base: hostid, the common pools, and D's partition 2 for pool C.
 restore_base() {
     restore_hostid
-    restore_fixtures
     fixture_pools
     must disks sh -c 'for d in /sys/block/vd*; do echo "$(cat "$d/serial") /dev/${d##*/}"; done'
     zr_d=$(disk D)

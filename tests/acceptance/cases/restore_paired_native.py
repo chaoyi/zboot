@@ -12,7 +12,7 @@ GROUP = 'restore'
 SECONDS = 3600
 DISKS = {'A': 4, 'B': 4, 'D': 8}
 # The setup boot runs this build's own kernel, initramfs and tools.
-BOOTS = [Boot(1, append='zboot.recovery=1', extra={'setup': 'neutral'})]
+BOOTS = [Boot(1, append='zboot.recovery=1')]
 
 
 def rows(step):

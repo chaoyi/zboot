@@ -4,8 +4,12 @@
 //! unpair or released anchors. Those print the plan and take the typed target
 //! or `--confirm TOKEN`. `sync` runs either way; only its pending deletions
 //! wait for the typed summary or the token.
-use super::run::{
-    applied_operation, consent_to, dialogue, json_response, lossless, writer_for, writer_for_replan,
+use super::{
+    grammar::Consent,
+    run::{
+        Invocation, applied_operation, consent_to, dialogue, json_response, lossless, writer_for,
+        writer_for_replan,
+    },
 };
 use crate::{
     consent::{self, Envelope, Outcome, Typed},
@@ -15,55 +19,42 @@ use std::{error::Error, io::Write};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
-/// Shared confirmation flags for pair verbs.
-pub(super) struct ConsentFlags {
-    pub dry_run: bool,
-    pub confirm: Option<String>,
-    pub json: bool,
-}
-
 /// The envelope (or human summary) of a verb that ran. A verb whose effects
 /// stand but whose follow-up (the boot default) failed is `partial`
 /// and exits 4.
 fn report(
-    json: bool,
+    inv: &mut Invocation,
     token: Option<String>,
     operation: Option<String>,
     complete: bool,
     result: impl serde::Serialize,
     human: String,
 ) -> Result {
-    if !json {
+    if !inv.json {
         print!("{human}");
     }
-    applied_operation(json, token, operation.as_deref(), complete, result)
+    applied_operation(inv, token, operation.as_deref(), complete, result)
 }
 /// Go on with `planned` directly, or through typed consent when it is † or
 /// the operator asked for a preview or passed a token. Either way the writer
 /// lock is taken only now, after the plan (and any answer); the engine plans
 /// again under it and refuses a changed plan.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn consent<P: serde::Serialize>(
     planned: P,
     dagger: bool,
-    flags: ConsentFlags,
+    consent: Consent,
+    inv: &mut Invocation,
     plan: impl Fn() -> Result<P>,
     token: impl Fn(&P) -> std::io::Result<String>,
     describe: impl Fn(&P, &str) -> String,
     target: impl Fn(&P) -> Typed,
 ) -> Result<Option<(P, String)>> {
-    if dagger || flags.dry_run || flags.confirm.is_some() {
-        return consent_to(
-            flags.dry_run,
-            flags.confirm,
-            flags.json,
-            plan,
-            token,
-            describe,
-            target,
-        );
+    if dagger || consent.dry_run || consent.confirm.is_some() {
+        return consent_to(inv, consent, plan, token, describe, target);
     }
     let token = token(&planned)?;
-    writer_for(&planned)?;
+    writer_for(inv, &planned)?;
     Ok(Some((planned, token)))
 }
 fn dataset_target(name: &str) -> Typed {
@@ -73,15 +64,15 @@ fn dataset_target(name: &str) -> Typed {
     }
 }
 
-pub(super) fn pair(left: String, right: String, dry_run: bool, json: bool) -> Result {
+pub(super) fn pair(left: String, right: String, dry_run: bool, inv: &mut Invocation) -> Result {
     let request = crate::pairs::plan::PairRequest {
         left,
         right,
         primary: Some(crate::history::Side::Left),
     };
     let Some(plan) = lossless(
+        inv,
         dry_run,
-        json,
         // The plan's own refusal says when to swap PRIMARY and SECONDARY.
         || crate::pairs::plan::plan(&request).map_err(Into::into),
         pairs::describe::pair,
@@ -93,14 +84,13 @@ pub(super) fn pair(left: String, right: String, dry_run: bool, json: bool) -> Re
     let o = &result.outcome;
     let human = pairs::describe::paired(&result);
     let operation = (!o.already_paired).then(|| o.operation_id.clone());
-    report(json, None, operation, true, &result, human)
+    report(inv, None, operation, true, &result, human)
 }
 pub(super) fn unpair(
     dataset: String,
     release_anchors: bool,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    flags: Consent,
+    inv: &mut Invocation,
 ) -> Result {
     let plan_now = || -> Result<UnpairPlan> { Ok(pairs::unpair_plan(&dataset, release_anchors)?) };
     let first = plan_now()?;
@@ -108,11 +98,8 @@ pub(super) fn unpair(
     let Some((plan, token)) = consent(
         first,
         dagger,
-        ConsentFlags {
-            dry_run,
-            confirm,
-            json,
-        },
+        flags,
+        inv,
         plan_now,
         consent::token,
         |p, token| format!("{}Token {token}\n", pairs::describe::unpair(p)),
@@ -124,7 +111,7 @@ pub(super) fn unpair(
     let result = pairs::unpair(&plan)?;
     let human = pairs::describe::unpaired(&result);
     report(
-        json,
+        inv,
         Some(token),
         result.operation_id.clone(),
         true,
@@ -136,9 +123,8 @@ pub(super) fn sync(
     source: Option<String>,
     destination: Option<String>,
     all: bool,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    consent: Consent,
+    inv: &mut Invocation,
 ) -> Result {
     let target = match (source, destination, all) {
         (_, _, true) => SyncTarget::All,
@@ -152,12 +138,12 @@ pub(super) fn sync(
     let plan_now = || -> Result<pairs::SyncPlan> { Ok(pairs::sync_plan(&target)?) };
     let planned = plan_now()?;
     let shown = planned.token()?;
-    if let Some(given) = confirm.as_deref() {
+    if let Some(given) = consent.confirm.as_deref() {
         consent::unchanged(given, &shown)?;
     }
-    if dry_run {
-        if json {
-            json_response(Envelope::new(Outcome::Preview, Some(shown), &planned))?;
+    if consent.dry_run {
+        if inv.json {
+            json_response(inv, Envelope::new(Outcome::Preview, Some(shown), &planned))?;
         } else {
             print!("{}", pairs::describe::sync_plan(&planned, &shown));
             println!("Dry run; nothing changed.");
@@ -167,12 +153,12 @@ pub(super) fn sync(
     // The transfer runs in every case. The pending deletions go only with
     // the token, or with the summary typed on a terminal; with neither (a
     // timer) they are kept and reported.
-    let delete = match (&confirm, planned.summary()) {
+    let delete = match (&consent.confirm, planned.summary()) {
         (Some(_), _) => true,
         (None, Some(summary))
             if consent::Mode::select(false, None) == consent::Mode::Interactive =>
         {
-            let mut out = dialogue(json);
+            let mut out = dialogue(inv.json);
             write!(out, "{}", pairs::describe::sync_plan(&planned, &shown))?;
             out.flush()?;
             let mut input =
@@ -190,20 +176,20 @@ pub(super) fn sync(
         }
         _ => false,
     };
-    writer_for_replan(&planned, &plan_now, delete)?;
+    writer_for_replan(inv, &planned, &plan_now, delete)?;
     let fresh = plan_now()?;
     let token = fresh.token()?;
     if delete {
         consent::unchanged(&shown, &token)?;
     }
-    report_synced(&target, pairs::sync_prepared(&fresh, delete)?, token, json)
+    report_synced(&target, pairs::sync_prepared(&fresh, delete)?, token, inv)
 }
 
 pub(super) fn report_synced(
     target: &SyncTarget,
     entries: Vec<pairs::SyncEntry>,
     token: String,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result {
     let human = pairs::describe::synced(&entries);
     if *target == SyncTarget::All {
@@ -215,7 +201,7 @@ pub(super) fn report_synced(
                 .is_some_and(|r| r.transfer.unmirrored.is_empty())
         });
         return report(
-            json,
+            inv,
             Some(token),
             None,
             complete,
@@ -232,26 +218,18 @@ pub(super) fn report_synced(
         .and_then(|e| e.result)
         .ok_or("sync returned no result")?;
     let id = result.transfer.operation_id.clone();
-    report(json, Some(token), Some(id), true, &result, human)
+    report(inv, Some(token), Some(id), true, &result, human)
 }
 
-pub(super) fn primary(
-    dataset: String,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
-) -> Result {
+pub(super) fn primary(dataset: String, flags: Consent, inv: &mut Invocation) -> Result {
     let plan_now = || -> Result<PrimaryPlan> { Ok(pairs::primary_plan(&dataset)?) };
     let first = plan_now()?;
     let dagger = first.confirms();
     let Some((plan, token)) = consent(
         first,
         dagger,
-        ConsentFlags {
-            dry_run,
-            confirm,
-            json,
-        },
+        flags,
+        inv,
         plan_now,
         PrimaryPlan::token,
         |p, token| format!("{}Token {token}\n", pairs::describe::primary(p)),
@@ -264,7 +242,7 @@ pub(super) fn primary(
     let complete = result.complete();
     let human = pairs::describe::switched(&result);
     report(
-        json,
+        inv,
         Some(token),
         result.operation_id.clone(),
         complete,

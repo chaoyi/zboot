@@ -1,6 +1,6 @@
 # Shared setup stage of the GUIDED-* cases (sourced by their case scripts
-# after lib.sh). Runs in a direct-kernel boot with extra={'setup': 'neutral'}:
-# the build's kernel and zboot/zsnap, its UKI at
+# after lib.sh). Runs in a direct-kernel boot:
+# the session's kernel and zboot/zsnap, its UKI at
 # /fixtures/e2e-esp-artifacts/zboot-recovery.efi and a factory root tar at
 # /fixtures/e2e-factory.tar.zst.
 #

@@ -758,7 +758,7 @@ where
     };
     let _writer = if command.locks_at_entry() {
         match zfs_tools::engine::lock::for_command("zsnap", command.name()) {
-            Ok(lock) => lock,
+            Ok(lock) => Some(lock),
             Err(error) => {
                 eprintln!("zsnap: {error}");
                 return std::process::ExitCode::FAILURE;

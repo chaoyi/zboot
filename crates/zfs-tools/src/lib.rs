@@ -8,19 +8,16 @@
 //! Implementation state, native command backends and operation records are
 //! private.
 //!
-//! The non-default `internal` feature makes the private engine public for this
-//! workspace's `zboot` and `zsnap` applications. It is unsupported and
-//! unstable: it has no compatibility promise, may change in any release, and
-//! no other package should enable it. The supported API needs no feature.
+//! The hidden `engine` module is public only for this workspace's `zboot` and
+//! `zsnap` applications. It is unsupported and unstable: it has no
+//! compatibility promise and may change in any release. Other packages use
+//! the supported API at the crate root.
 #![cfg_attr(test, allow(clippy::disallowed_methods, reason = "test fixtures"))]
 mod api;
 mod effects;
 /// Unsupported, unstable engine internals for `zboot` and `zsnap` only.
-#[cfg(feature = "internal")]
 #[doc(hidden)]
 pub mod engine;
-#[cfg(not(feature = "internal"))]
-mod engine;
 mod inventory;
 mod reader;
 

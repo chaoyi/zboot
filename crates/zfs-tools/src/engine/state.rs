@@ -1,6 +1,5 @@
 //! Complete native evidence bundle for cooperating operation admission.
 //! Sequential queries may drift; plans revalidate immediately before effects.
-#[cfg(feature = "internal")]
 use crate::engine::{
     DatasetIdentity, Guid,
     management::{self, Ownership},
@@ -11,7 +10,6 @@ use crate::engine::{
     Error, InspectRequest, Inspection,
     native::{self, PropertyInventory},
 };
-#[cfg(feature = "internal")]
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -25,7 +23,6 @@ pub struct NativeState {
 /// admitted native observation. This is ephemeral read evidence, not a plan
 /// for a writer and not a cache of unobserved native properties.
 #[derive(Debug, Clone)]
-#[cfg(feature = "internal")]
 pub struct ReadonlyInventoryBinding {
     scope: SnapshotScope,
     recursive_roots: Vec<String>,
@@ -35,19 +32,14 @@ pub struct ReadonlyInventoryBinding {
     ownership: BTreeMap<String, Ownership>,
     cmdlines: BTreeMap<String, Option<native::NativeProperty>>,
 }
-#[cfg(feature = "internal")]
 const MAX_READONLY_MEMBERS: usize = 16_384;
-#[cfg(feature = "internal")]
 const MAX_READONLY_ROOTS: usize = 128;
 
-#[cfg(feature = "internal")]
 use crate::engine::contains_dataset as contains;
-#[cfg(feature = "internal")]
 fn scoped_refusal(message: impl Into<String>) -> Error {
     Error::Inconsistent(message.into())
 }
 
-#[cfg(feature = "internal")]
 impl ReadonlyInventoryBinding {
     pub fn capture(state: &NativeState, scope: &SnapshotScope) -> Result<Self, Error> {
         if !scope.is_recursive_readonly() {
@@ -263,12 +255,10 @@ impl ReadonlyInventoryBinding {
     }
 }
 
-#[cfg(feature = "internal")]
 pub fn observe_scope(binding: &ReadonlyInventoryBinding) -> Result<NativeState, Error> {
     observe_scope_with(binding, &mut native::run)
 }
 
-#[cfg(feature = "internal")]
 pub fn observe_scope_with(
     binding: &ReadonlyInventoryBinding,
     run: &mut impl FnMut(&'static str, &[String]) -> Result<String, Error>,
@@ -324,7 +314,7 @@ pub fn observe_with(
     })
 }
 
-#[cfg(all(test, feature = "internal"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     fn scoped_fixture() -> NativeState {

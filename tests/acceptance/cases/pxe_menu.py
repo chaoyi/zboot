@@ -12,42 +12,22 @@ import json
 from pathlib import Path
 import re
 
-from cases import efi_connect as _connect
 from host.case import Boot
 from host.console import ConsoleError
+from host.ssh import command, connect, ssh_argv, write_askpass
 
 ID = 'PXE-MENU'
 GROUP = 'efi'
 SECONDS = 1800
 DISKS = {'A': 8, 'B': 2, 'D': 2}
-BOOTS = [Boot(1, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1),
          Boot(2, efi=True, target=3, network=True, extra={'pxe': True})]
 ROOT = 'e2ea/ROOT/proof'
 VARIABLE = '/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
-PASSWORD = r'One-time root password: ([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12})'
-
-
-def write_askpass(run_dir):
-    """ssh reads the one-time password from this (efi_connect.password_env)."""
-    askpass = run_dir / 'askpass'
-    askpass.write_text('#!/bin/sh\nprintf "%s\\n" "$ZT_CONNECT_PASSWORD"\n')
-    askpass.chmod(0o700)
 
 
 def prepare(run_dir):
     write_askpass(run_dir)
-
-
-def connect(console):
-    """`connect` in a network-booted UKI: (known_hosts, ssh environment).
-    console.ready() first pauses the countdown of a machine with a BE to boot."""
-    console.ready()
-    enabled = console.menu('connect', 'connect')
-    known = _connect.fingerprint(console, enabled)
-    passwords = re.findall(PASSWORD, enabled)
-    if len(passwords) != 1:
-        raise ConsoleError('connect did not print exactly one one-time password')
-    return known, _connect.password_env(console, passwords[0])
 
 
 def stage_2(console):
@@ -55,8 +35,8 @@ def stage_2(console):
     body = ('set -e; printf "CMDLINE="; cat /proc/cmdline; '
             '/bin/busybox grep " /sys/firmware/efi/efivars efivarfs " /proc/mounts; '
             f'test ! -e {VARIABLE}; printf "NO_LOADER_PARTITION\\n"')
-    login = _connect.command(console, 'password-login',
-                             _connect.ssh_argv(console, known, password=True) + [body], env=environment)
+    login = command(console, 'password-login', ssh_argv(console, known, password=True) + [body],
+                    env=environment)
     if login.returncode:
         raise ConsoleError('the one-time password did not open an SSH session')
     console.menu('handoff', f'boot {ROOT} -v', until=('ZBOOT_HANDOFF_LOAD',))
@@ -72,7 +52,7 @@ def network_boot(ev, check, index, label):
                 ['virtio-net-pci,netdev=zt-net,bootindex=1'], f'{label}: the NIC is the only boot device')
     check(not any('boot.raw' in arg for arg in argv), f'{label}: no stick is attached')
     session = Path(ev.root).parents[2]
-    built = json.loads((session / 'efi.json').read_text())['builds']['neutral']['uki_sha256']
+    built = json.loads((session / 'efi.json').read_text())['uki_sha256']
     check.equal(launch['inputs'].get('zboot.efi'), built, f'{label}: the server holds the recorded UKI')
     requests = (directory / 'http.log').read_text().splitlines()
     check(bool(requests) and all(line.split()[1:2] == ['/zboot.efi'] for line in requests),

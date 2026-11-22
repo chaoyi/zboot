@@ -1,92 +1,91 @@
 #!/usr/bin/env bash
-# Populate a new initramfs root from explicitly named, trusted runtime files:
+# Populate a new initramfs root from the trusted runtime files of a build root:
 #
-#   stage-runtime.sh --NAME FILE... --udev-rules DIR --firmware-root DIR
-#       --firmware RELATIVE... --module-dir DIR --output NEW_DIRECTORY
+#   stage-runtime.sh --root DIR --helpers-dir DIR --module-dir DIR
+#       --firmware RELATIVE... --output NEW_DIRECTORY
 #
-# Every NAME in `programs` is required. Each program goes to its fixed
-# destination with its loader closure; ldd runs only on these caller-supplied
+# Every program in `programs` is required. Each comes from its fixed Debian
+# (usrmerge) path under the root, or from the helpers directory, and goes to
+# its fixed destination with its loader closure; ldd runs only on these
 # installed executables. usr/share/zfs-tools/runtime-sources.sha256 records
 # every source file for the licence collector. NEW_DIRECTORY appears only when
 # the whole root is staged.
 set -euo pipefail
 umask 022
 
-# NAME DESTINATION [ram]. `ram` also lists the program and its libraries in
-# usr/lib/zboot/ram-boot.files: `zboot boot --tar` copies those into the
-# initramfs it builds around a root tar.
+# SOURCE DESTINATION [ram]. SOURCE is under --root, or under --helpers-dir
+# when it starts with `helpers/`. `ram` also lists the program and its
+# libraries in usr/lib/zboot/ram-boot.files: `zboot boot --tar` copies those
+# into the initramfs it builds around a root tar.
 programs=(
-    'udevd /usr/lib/systemd/systemd-udevd'
-    'udevadm /usr/bin/udevadm'
-    'ata-id /usr/lib/udev/ata_id'
-    'scsi-id /usr/lib/udev/scsi_id'
-    'busybox /bin/busybox ram'
-    'zfs /sbin/zfs'
-    'zpool /sbin/zpool'
-    'zdb /sbin/zdb'
-    'signature-probe /sbin/zboot-probe-signatures'
+    '/usr/lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd'
+    '/usr/bin/udevadm /usr/bin/udevadm'
+    '/usr/lib/udev/ata_id /usr/lib/udev/ata_id'
+    '/usr/lib/udev/scsi_id /usr/lib/udev/scsi_id'
+    '/bin/busybox /bin/busybox ram'
+    '/usr/sbin/zfs /sbin/zfs'
+    '/usr/sbin/zpool /sbin/zpool'
+    '/usr/sbin/zdb /sbin/zdb'
+    'helpers/zboot-probe-signatures /sbin/zboot-probe-signatures'
     # restore relinks encryption keys through the host's libzfs_core.
-    'change-key /sbin/zboot-change-key'
-    'mount-zfs /sbin/mount.zfs'
-    'kexec /sbin/kexec'
-    'kmod /sbin/kmod'
-    'lsblk /bin/lsblk'
-    'findmnt /bin/findmnt'
-    'losetup /usr/sbin/losetup'
-    'sfdisk /sbin/sfdisk'
-    'sgdisk /sbin/sgdisk'
-    'wipefs /sbin/wipefs'
+    'helpers/zboot-change-key /sbin/zboot-change-key'
+    '/usr/sbin/mount.zfs /sbin/mount.zfs'
+    '/usr/sbin/kexec /sbin/kexec'
+    '/usr/bin/kmod /sbin/kmod'
+    '/usr/bin/lsblk /bin/lsblk'
+    '/usr/bin/findmnt /bin/findmnt'
+    '/usr/sbin/losetup /usr/sbin/losetup'
+    '/usr/sbin/sfdisk /sbin/sfdisk'
+    '/usr/sbin/sgdisk /sbin/sgdisk'
+    '/usr/sbin/wipefs /sbin/wipefs'
     # wipe sanitizes NVMe through nvme-cli.
-    'nvme /sbin/nvme'
-    'partprobe /sbin/partprobe'
-    'mkfs-vfat /sbin/mkfs.vfat'
-    'blkid /sbin/blkid'
-    'tar /bin/tar ram'
-    'zstd /bin/zstd ram'
-    'sshd /usr/sbin/sshd'
-    'sshd-auth /usr/lib/openssh/sshd-auth'
-    'sshd-session /usr/lib/openssh/sshd-session'
-    'ssh-keygen /usr/bin/ssh-keygen'
-    'ip /bin/ip'
+    '/usr/sbin/nvme /sbin/nvme'
+    '/usr/sbin/partprobe /sbin/partprobe'
+    '/usr/sbin/mkfs.vfat /sbin/mkfs.vfat'
+    '/usr/sbin/blkid /sbin/blkid'
+    '/usr/bin/tar /bin/tar ram'
+    '/usr/bin/zstd /bin/zstd ram'
+    '/usr/sbin/sshd /usr/sbin/sshd'
+    '/usr/lib/openssh/sshd-auth /usr/lib/openssh/sshd-auth'
+    '/usr/lib/openssh/sshd-session /usr/lib/openssh/sshd-session'
+    '/usr/bin/ssh-keygen /usr/bin/ssh-keygen'
+    '/usr/bin/ip /bin/ip'
 )
-names=()
-declare -A destination=() ram=() given=()
-for row in "${programs[@]}"; do
-    read -r name path flag <<< "$row"
-    names+=("$name")
-    destination[$name]=$path
-    ram[$name]=$flag
-done
 
-udev_rules='' firmware_root='' modules='' output=''
+root='' helpers='' modules='' output=''
 firmware_files=()
 firmware_sources=()
 while (( $# )); do
     case "$1" in
         --help)
-            printf 'usage: stage-runtime.sh'
-            printf ' --%s FILE' "${names[@]}"
-            printf ' --udev-rules DIR --firmware-root DIR --firmware RELATIVE... --module-dir DIR --output NEW_DIRECTORY\n'
+            echo 'usage: stage-runtime.sh --root DIR --helpers-dir DIR --module-dir DIR --firmware RELATIVE... --output NEW_DIRECTORY'
             exit 0 ;;
-        --udev-rules) udev_rules=$2 ;;
-        --firmware-root) firmware_root=$2 ;;
+        --root) root=$2 ;;
+        --helpers-dir) helpers=$2 ;;
         --firmware) firmware_files+=("$2") ;;
         --module-dir) modules=$2 ;;
         --output) output=$2 ;;
-        --?*)
-            name=${1#--}
-            [[ -n "${destination[$name]+known}" ]] || { echo "unknown argument: $1" >&2; exit 2; }
-            given[$name]=$2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift 2
 done
 [[ -n "$output" && "$output" == /* && ! -e "$output" && ! -L "$output" ]] || { echo 'output must be a new absolute directory' >&2; exit 2; }
-for name in "${names[@]}"; do
-    file=${given[$name]-}
-    [[ -f "$file" && -x "$file" ]] || { echo "required trusted executable missing: --$name $file" >&2; exit 2; }
+[[ "$root" == /* && -d "$root" ]] || { echo 'root must be an absolute directory' >&2; exit 2; }
+[[ "$helpers" == /* && -d "$helpers" ]] || { echo 'helpers directory must be an absolute directory' >&2; exit 2; }
+# "/" stays "" so a root of / names each file by its own absolute path.
+root=${root%/} helpers=${helpers%/}
+sources=() destinations=() lists=()
+for row in "${programs[@]}"; do
+    read -r path destination flag <<< "$row"
+    if [[ "$path" == helpers/* ]]; then file=$helpers/${path#helpers/}; else file=$root$path; fi
+    [[ -f "$file" && -x "$file" ]] || { echo "required trusted executable missing: $file" >&2; exit 2; }
+    sources+=("$file")
+    destinations+=("$destination")
+    lists+=("$flag")
+    [[ "$destination" != /bin/busybox ]] || busybox=$file
 done
-[[ -n "$firmware_root" && -d "$firmware_root" ]] || { echo 'firmware root directory is required' >&2; exit 2; }
+firmware_root=$root/usr/lib/firmware
+[[ -d "$firmware_root" ]] || { echo "firmware root directory is required: $firmware_root" >&2; exit 2; }
 firmware_root=$(realpath -e -- "$firmware_root")
 (( ${#firmware_files[@]} )) || { echo 'at least one --firmware selection is required' >&2; exit 2; }
 for firmware in "${firmware_files[@]}"; do
@@ -97,8 +96,9 @@ for firmware in "${firmware_files[@]}"; do
     [[ "$source" == "${firmware_root%/}/"* && -f "$source" && -s "$source" ]] || { echo "firmware must be a nonempty file within firmware root: $firmware" >&2; exit 2; }
     firmware_sources+=("$source")
 done
+udev_rules=$root/usr/lib/udev/rules.d
 for rule in 60-block.rules 60-persistent-storage.rules; do
-    [[ -n "$udev_rules" && -f "$udev_rules/$rule" && -s "$udev_rules/$rule" ]] || { echo "required packaged udev rule missing: $udev_rules/$rule" >&2; exit 2; }
+    [[ -f "$udev_rules/$rule" && -s "$udev_rules/$rule" ]] || { echo "required packaged udev rule missing: $udev_rules/$rule" >&2; exit 2; }
 done
 [[ -d "$modules" && -s "$modules/modules.dep" ]] || { echo 'module tree with modules.dep is required' >&2; exit 2; }
 release=$(basename -- "$modules")
@@ -133,8 +133,8 @@ copy_program() { # SOURCE DESTINATION [LIST]: LIST also gets both paths
         done < <(printf '%s\n' "$deps" | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }')
     fi
 }
-for name in "${names[@]}"; do
-    copy_program "${given[$name]}" "${destination[$name]}" ${ram[$name]:+"$ram_boot_files"}
+for index in "${!sources[@]}"; do
+    copy_program "${sources[$index]}" "${destinations[$index]}" ${lists[$index]:+"$ram_boot_files"}
 done
 LC_ALL=C sort -u -o "$ram_boot_files" "$ram_boot_files"
 # Use the substrate's packaged storage rules unchanged. The generic drivers
@@ -148,7 +148,7 @@ done
 for applet in dd sh mount umount mkdir sleep cat ls mdev reboot poweroff chroot mknod chmod cp sync sha256sum awk rm touch switch_root mkpasswd udhcpc; do
     # Consume the entire list: grep -q can close the pipe early and turn a
     # successful match into a producer SIGPIPE under pipefail.
-    "${given[busybox]}" --list | grep -x "$applet" >/dev/null || { echo "busybox lacks $applet" >&2; exit 1; }
+    "$busybox" --list | grep -x "$applet" >/dev/null || { echo "busybox lacks $applet" >&2; exit 1; }
     # DHCP is invoked explicitly as `busybox udhcpc`.
     [[ "$applet" == udhcpc ]] || ln -s busybox "$stage/bin/$applet"
 done

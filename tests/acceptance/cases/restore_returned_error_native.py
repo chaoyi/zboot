@@ -13,8 +13,8 @@ GROUP = 'restore'
 SECONDS = 7200
 DISKS = {'A': 4, 'B': 4, 'D': 8}
 # Each fixture boot runs this build's own kernel, initramfs and tools.
-BOOTS = [Boot(1, udev=True, append='zboot.recovery=1', extra={'setup': 'neutral'}),
-         Boot(2, udev=True, append='zboot.recovery=1', extra={'setup': 'neutral'})]
+BOOTS = [Boot(1, udev=True, append='zboot.recovery=1'),
+         Boot(2, udev=True, append='zboot.recovery=1')]
 
 
 def active_receipt(check, observation, op, state, what):

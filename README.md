@@ -68,8 +68,8 @@ something and did not finish, and the message names the next step
 The four Cargo packages are the `zfs-tools` library (`crates/zfs-tools`), the
 `zboot` and `zsnap` applications (`crates/zboot`, `crates/zsnap`) and the
 internal helpers (`crates/zboot-helpers`). The applications use the library's
-private engine through its unsupported `internal` feature; the supported API
-needs no feature. The helper package uses the host's dynamic libblkid and
+private engine through its hidden, unsupported `engine` module; other
+consumers use the supported API at the crate root. The helper package uses the host's dynamic libblkid and
 libzfs_core libraries.
 
 | Job | Command | Output or scope |
@@ -80,26 +80,23 @@ libzfs_core libraries.
 | Build the pinned distribution | `just dist OUT` or `dist/dist.sh OUT` | UKI, Debian package, matching source archive and unpacked installation; see [BUILD](docs/BUILD.md) |
 | Run VM tests | follow [TESTING](docs/TESTING.md#vm-tests) | application acceptance, native library API and protected readers; requires KVM and build artifacts |
 
-`just` is optional. Select disk-backed temporary/build staging appropriate to the
-host. Native acceptance accepts an explicit build runner; it otherwise owns local
-staging under `TMPDIR`.
+`just` is optional. Builds and VM tests stage under `TMPDIR`; choose
+disk-backed storage ([TESTING](docs/TESTING.md)).
 
 ## Documents
 
 | Document | Owns |
 |---|---|
 | [CLI.md](docs/CLI.md) | zboot verbs, options, refusals, exit statuses and menu commands |
-| [zsnap guide](crates/zsnap/README.md) | snapshots, retention and the zsnap command line |
+| [zsnap guide](crates/zsnap/README.md) | snapshots, retention, [protected readers](crates/zsnap/README.md#protected-snapshot-readers) and the zsnap command line |
 | [Library guide](crates/zfs-tools/README.md) | the supported `zfs_tools` API, its composition rules, reader protection and compatibility |
 | [DESIGN.md](docs/DESIGN.md) | the design rules, safety checks and known limitations |
 | [RECOVERY.md](docs/RECOVERY.md) | getting to the menu, rescue sticks, restoring and reinstalling a disk |
 | [BUILD.md](docs/BUILD.md) | building the zboot UKI and the `zboot` package; making root tars |
 | [TESTING.md](docs/TESTING.md) | the offline gate and the QEMU acceptance cases |
-| [Protected readers](crates/zsnap/README.md#protected-snapshot-readers) | running reader jobs against protected snapshots and recovering interrupted jobs |
 
-The guides above are the maintained product documentation. Private development
-records are kept separately. To publish a source snapshot, see
-[BUILD](docs/BUILD.md#publishing-a-source-snapshot).
+These guides are the maintained product documentation; development records
+are kept separately ([publishing](docs/BUILD.md#publishing-a-source-snapshot)).
 
 ## OpenZFS dependency
 
@@ -124,13 +121,12 @@ host's `libzfs_core.so.3`.
   data leaf separately; snapshots across leaves promise no common capture
   moment.
 - The UKI is not signed. Firmware must allow an unsigned loader.
-- The writer lock (`/run/zfs-tools/writer.lock`) orders zboot and zsnap
+- The [writer lock](docs/DESIGN.md#writer-lock) orders zboot and zsnap
   writers on one host. It is not a fence between hosts, and plain `zfs` and
   `zpool` commands do not take it.
-
-Current limits, including space limits across a `primary`, a diverged copy
-and what only engine tests cover, are listed in
-[DESIGN](docs/DESIGN.md#known-limitations-and-follow-up).
+- [DESIGN](docs/DESIGN.md#known-limitations-and-follow-up) lists the other
+  current limits, including space limits across a `primary`, a diverged copy
+  and what only engine tests cover.
 
 ## License
 

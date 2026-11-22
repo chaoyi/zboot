@@ -34,7 +34,8 @@ stage=$(arg zt.stage) || stage=1
 mkdir -p /out && mount -t 9p -o trans=virtio,version=9p2000.L,cache=none zt-out /out ||
     die 'output share missing'
 # lib.sh, fault.sh and the case scripts arrive on a read-only share, so a
-# session's frozen copy (or a --dev working tree) runs without a new initrd.
+# checkout's cases (a qualification's or a --dev working tree's) run without
+# a new initrd.
 mount -t 9p -o ro,trans=virtio,version=9p2000.L,cache=none zt-acceptance /acceptance ||
     die 'acceptance share missing'
 . /acceptance/lib.sh

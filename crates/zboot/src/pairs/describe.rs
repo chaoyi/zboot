@@ -115,11 +115,10 @@ pub fn pair(plan: &PairPlan) -> String {
         crate::history::Side::Right => (&plan.right, &plan.left),
     };
     let mut out = format!(
-        "Pair {} (primary) with {}.\n{} and its {} descendant(s) become read-only and unmounted.\n",
+        "Pair {} (primary) with {}.\n{} becomes read-only and unmounted.\n",
         zfs_tools::engine::escape_display(&primary.endpoint.name),
         zfs_tools::engine::escape_display(&receiver.endpoint.name),
         zfs_tools::engine::escape_display(&receiver.endpoint.name),
-        receiver.members.len().saturating_sub(1)
     );
     for (a, b) in &plan.anchors {
         out += &format!(

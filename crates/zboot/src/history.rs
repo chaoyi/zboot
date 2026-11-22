@@ -70,9 +70,8 @@ pub enum Side {
 pub struct Admission {
     /// None means either side may be chosen primary.
     pub ahead: Option<Side>,
-    /// The newest common snapshot of the two leaves, keyed by the empty
-    /// relative path of the leaf itself.
-    pub anchors: BTreeMap<String, Guid>,
+    /// The newest common snapshot of the two leaves.
+    pub anchor: Guid,
     /// Snapshots older than the anchor that only one side retains, oldest
     /// first. On a pair's fenced copy these are pending deletions.
     pub only_left: Vec<Guid>,
@@ -260,7 +259,7 @@ pub fn admit_pair(left: &Tree, right: &Tree) -> Result<Admission, Rejection> {
     }
     Ok(Admission {
         ahead,
-        anchors: BTreeMap::from([(String::new(), anchor)]),
+        anchor,
         only_left: before_a
             .into_iter()
             .filter(|s| !in_right.contains(s))
@@ -343,7 +342,7 @@ mod tests {
                         Some(Side::Right)
                     }
                 );
-                assert_eq!(ab.anchors, ba.anchors);
+                assert_eq!(ab.anchor, ba.anchor);
             }
         }
     }
@@ -351,7 +350,7 @@ mod tests {
     fn pruned_older_snapshots_are_reported_not_refused() {
         let ab = admit_pair(&tree("a/r", &[1, 2, 3, 4]), &tree("b/r", &[1, 3])).unwrap();
         assert_eq!(ab.ahead, Some(Side::Left));
-        assert_eq!(ab.anchors, BTreeMap::from([(String::new(), Guid::new(3))]));
+        assert_eq!(ab.anchor, Guid::new(3));
         assert_eq!(ab.only_left, vec![Guid::new(2)]);
         assert!(ab.only_right.is_empty());
         // The working copy pruned 1 and 2; the copy still has them.

@@ -1,8 +1,8 @@
 """Shared host side of the GUIDED-* cases: Menu dialogues and verdict parts.
 
-Stage 1 (guest/guided.sh) builds the fixture with the `neutral` build's own
-kernel, zboot and UKI and a `zboot factory` root tar. Firmware stages then
-drive the Menu console of that build's stick or of A's own ESP (the same
+Stage 1 (guest/guided.sh) builds the fixture with the session's kernel,
+zboot and UKI and a `zboot factory` root tar. Firmware stages then
+drive the Menu console of the session's stick or of A's own ESP (the same
 UKI, installed by the deploy and again by the restore, from the BE).
 Each Menu shell body prints native facts; the verdict judges them here,
 never inside the guest.
@@ -204,28 +204,30 @@ def postboot(console):
 
 # --- verdict parts ---
 
-def build(ev, name):
-    """The recorded dist/dist.sh output NAME of this run's session (efi.json)."""
-    session = Path(ev.root).resolve().parents[2]
-    return json.loads((session / 'efi.json').read_text())['builds'][name]
+def session(ev):
+    return Path(ev.root).resolve().parents[2]
 
 
-def uki(ev, check, name='neutral'):
-    """The file identity of build NAME's UKI as the session staged it for the
-    fixtures share, checked against the recorded build output."""
-    recorded = build(ev, name)
-    path = Path(recorded['directory']) / 'loader/zboot-recovery.efi'
+def firmware(ev):
+    """The session's firmware-boot record (efi.json)."""
+    return json.loads((session(ev) / 'efi.json').read_text())
+
+
+def uki(ev, check):
+    """The file identity of the UKI as the session staged it, checked against
+    the recorded build output."""
+    path = session(ev) / 'uki/loader/zboot-recovery.efi'
     with path.open('rb') as file:
         digest = hashlib.file_digest(file, 'sha256').hexdigest()
-    check.equal(digest, recorded['uki_sha256'], f'the staged {name} UKI is the recorded build output')
+    check.equal(digest, firmware(ev)['uki_sha256'], 'the staged UKI is the recorded build output')
     return {'sha256': digest, 'bytes': path.stat().st_size}
 
 
-def check_stick(ev, n, check, name='neutral'):
-    """Boot n attached exactly build NAME's stick image (launch evidence)."""
+def check_stick(ev, n, check):
+    """Boot n attached exactly the session's stick image (launch evidence)."""
     launch = json.loads((Path(ev.root).parent / f'boot-{n}/launch.json').read_text())
-    check.equal(launch['inputs'].get('boot.raw'), build(ev, name)['stick_sha256'],
-                f'boot {n} attached the {name} stick')
+    check.equal(launch['inputs'].get('boot.raw'), firmware(ev)['stick_sha256'],
+                f'boot {n} attached the session stick')
 
 
 def mirror_snapshot(stage):
@@ -333,8 +335,8 @@ def check_restore(ev, n, check, cut=None):
     check_dialogue(s, ('source', 'restore', 'consent'), check)
 
 
-def check_resume(ev, n, check, consent, stick='neutral'):
-    check_stick(ev, n, check, stick)
+def check_resume(ev, n, check, consent):
+    check_stick(ev, n, check)
     s = ev.stage(n)
     found = operations(s.step('status').out)
     check.equal(len(found), 1, f'status lists one interrupted restore: {found}')
@@ -625,8 +627,8 @@ def check_labels(text, pool, state, check, what):
     check(f['guid'] is not None and f['guids'] == [f['guid']] * 4, f"{what}: {pool} label pool_guid {f['guids']} = {f['guid']}")
 
 
-def check_postboot(ev, n, check, stick='neutral'):
-    check_stick(ev, n, check, stick)
+def check_postboot(ev, n, check):
+    check_stick(ev, n, check)
     s = ev.stage(n)
     check.equal(s.step('serials').out.split(), ['ZFS-E2E-A', 'ZFS-E2E-B', 'ZFS-E2E-C'], 'vda, vdb, vdd serials')
     ro = [line.split('\t') for line in lines(s.step('menu-readonly').out)]

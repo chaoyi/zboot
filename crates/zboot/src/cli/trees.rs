@@ -1,16 +1,19 @@
-use super::run::{Incomplete, applied_operation, consent_to, dialogue, json_response, lossless};
+use super::{
+    grammar::Consent,
+    run::{
+        Incomplete, Invocation, applied_operation, consent_to, dialogue, json_response, lossless,
+    },
+};
 
 pub(super) fn rollback_command(
     target: String,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    consent: Consent,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::rollback;
     let Some((plan, token)) = consent_to(
-        dry_run,
-        confirm,
-        json,
+        inv,
+        consent,
         || Ok(rollback::plan(&target)?),
         rollback::consent,
         rollback::describe,
@@ -19,8 +22,8 @@ pub(super) fn rollback_command(
     else {
         return Ok(());
     };
-    let outcome = rollback::execute(&plan, &token, &mut dialogue(json))?;
-    if !json {
+    let outcome = rollback::execute(&plan, &token, &mut dialogue(inv.json))?;
+    if !inv.json {
         println!(
             "Rolled back {} to @{}; destroyed {} newer snapshot(s).",
             zfs_tools::engine::escape_display(&outcome.root.name),
@@ -29,19 +32,17 @@ pub(super) fn rollback_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, Some(token), Some(&id), outcome.complete, outcome)
+    applied_operation(inv, Some(token), Some(&id), outcome.complete, outcome)
 }
 pub(super) fn drop_command(
     targets: Vec<String>,
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    consent: Consent,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::discard;
     let Some((plan, token)) = consent_to(
-        dry_run,
-        confirm,
-        json,
+        inv,
+        consent,
         || Ok(discard::plan(&targets)?),
         discard::consent,
         discard::describe,
@@ -50,8 +51,8 @@ pub(super) fn drop_command(
     else {
         return Ok(());
     };
-    let outcome = discard::execute(&plan, &token, &mut dialogue(json))?;
-    if !json {
+    let outcome = discard::execute(&plan, &token, &mut dialogue(inv.json))?;
+    if !inv.json {
         println!(
             "Dropped {}; destroyed {} dataset(s) and snapshot(s).",
             plan.summary,
@@ -59,26 +60,26 @@ pub(super) fn drop_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, Some(token), Some(&id), outcome.complete, outcome)
+    applied_operation(inv, Some(token), Some(&id), outcome.complete, outcome)
 }
 pub(super) fn rename_command(
     source: String,
     destination: String,
     dry_run: bool,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::rename;
     let Some(plan) = lossless(
+        inv,
         dry_run,
-        json,
         || Ok(rename::plan(&source, &destination)?),
         rename::describe,
     )?
     else {
         return Ok(());
     };
-    let outcome = rename::execute(&plan, &mut dialogue(json))?;
-    if !json {
+    let outcome = rename::execute(&plan, &mut dialogue(inv.json))?;
+    if !inv.json {
         println!(
             "Renamed {} to {}.",
             zfs_tools::engine::escape_display(&source),
@@ -86,18 +87,18 @@ pub(super) fn rename_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, None, Some(&id), outcome.complete, outcome)
+    applied_operation(inv, None, Some(&id), outcome.complete, outcome)
 }
 pub(super) fn fork_command(
     source: String,
     destination: String,
     dry_run: bool,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::tree::fork;
     let Some(plan) = lossless(
+        inv,
         dry_run,
-        json,
         || {
             Ok(if source.contains('@') {
                 fork::plan(&source, &destination)?
@@ -110,8 +111,8 @@ pub(super) fn fork_command(
     else {
         return Ok(());
     };
-    let outcome = fork::execute(&plan, &mut dialogue(json))?;
-    if !json {
+    let outcome = fork::execute(&plan, &mut dialogue(inv.json))?;
+    if !inv.json {
         println!(
             "Forked {} as {}.",
             zfs_tools::engine::escape_display(&outcome.source_snapshot),
@@ -119,7 +120,7 @@ pub(super) fn fork_command(
         );
     }
     let id = outcome.operation_id.clone();
-    applied_operation(json, None, Some(&id), outcome.complete, outcome)
+    applied_operation(inv, None, Some(&id), outcome.complete, outcome)
 }
 fn default_snapshot_name(now: std::time::SystemTime) -> String {
     crate::tree::snapshot_name("zboot", now)
@@ -128,7 +129,7 @@ fn default_snapshot_name(now: std::time::SystemTime) -> String {
 pub(super) fn default(
     dataset: Option<String>,
     dry_run: bool,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(dataset) = dataset else {
         let state = zfs_tools::engine::state::observe()?;
@@ -139,12 +140,11 @@ pub(super) fn default(
             .filter(|property| !property.value.is_empty() && property.value != "-")
             .map(|property| property.value.clone())
             .collect();
-        if json {
-            return json_response(crate::consent::Envelope::new(
-                crate::consent::Outcome::Applied,
-                None,
-                defaults,
-            ));
+        if inv.json {
+            return json_response(
+                inv,
+                crate::consent::Envelope::new(crate::consent::Outcome::Applied, None, defaults),
+            );
         }
         match defaults.as_slice() {
             [] => println!("No boot default."),
@@ -159,8 +159,8 @@ pub(super) fn default(
         return Ok(());
     };
     let Some(plan) = lossless(
+        inv,
         dry_run,
-        json,
         || Ok(crate::boot_support::default::plan(&dataset)?),
         |_| {
             format!(
@@ -173,7 +173,7 @@ pub(super) fn default(
         return Ok(());
     };
     let result = crate::boot_support::default::execute(&plan)?;
-    if !json {
+    if !inv.json {
         println!(
             "Default selection {} {}.",
             zfs_tools::engine::escape_display(&dataset),
@@ -187,7 +187,7 @@ pub(super) fn default(
             println!("{}", zfs_tools::engine::escape_display(detail));
         }
     }
-    applied_operation(json, None, None, result.complete, result)
+    applied_operation(inv, None, None, result.complete, result)
 }
 
 pub(super) fn cmdline(
@@ -195,12 +195,12 @@ pub(super) fn cmdline(
     set: Option<String>,
     clear: bool,
     dry_run: bool,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(value) = set.or(clear.then(String::new)) {
         let Some(plan) = lossless(
+            inv,
             dry_run,
-            json,
             || Ok(crate::boot_support::cmdline_plan(&dataset, &value)?),
             |_| {
                 format!(
@@ -214,7 +214,7 @@ pub(super) fn cmdline(
             return Ok(());
         };
         let result = crate::boot_support::apply_cmdline(&plan)?;
-        if !json {
+        if !inv.json {
             println!(
                 "Kernel argument update for {} {}.",
                 zfs_tools::engine::escape_display(&dataset),
@@ -228,15 +228,14 @@ pub(super) fn cmdline(
                 println!("{}", zfs_tools::engine::escape_display(detail));
             }
         }
-        applied_operation(json, None, None, result.complete, result)
+        applied_operation(inv, None, None, result.complete, result)
     } else {
         let result = crate::boot_support::saved_cmdline(&dataset)?;
-        if json {
-            json_response(crate::consent::Envelope::new(
-                crate::consent::Outcome::Applied,
-                None,
-                result,
-            ))
+        if inv.json {
+            json_response(
+                inv,
+                crate::consent::Envelope::new(crate::consent::Outcome::Applied, None, result),
+            )
         } else {
             println!(
                 "{}",
@@ -315,11 +314,11 @@ pub(super) fn snapshot_plan(
 pub(super) fn snapshot(
     datasets: Vec<String>,
     dry_run: bool,
-    json: bool,
+    inv: &mut Invocation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(groups) = lossless(
+        inv,
         dry_run,
-        json,
         || {
             Ok(snapshot_plan(
                 &zfs_tools::engine::state::observe()?,
@@ -349,18 +348,21 @@ pub(super) fn snapshot(
         let outcome = match zfs_tools::engine::capture::capture_prepared(&group.scope, name, &id) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if json && !outcomes.is_empty() {
-                    json_response(crate::consent::Envelope::new(
-                        crate::consent::Outcome::Partial,
-                        None,
-                        &outcomes,
-                    ))?;
+                if inv.json && !outcomes.is_empty() {
+                    json_response(
+                        inv,
+                        crate::consent::Envelope::new(
+                            crate::consent::Outcome::Partial,
+                            None,
+                            &outcomes,
+                        ),
+                    )?;
                 }
                 return Err(error.into());
             }
         };
         let complete = outcome.status() == zfs_tools::CaptureStatus::Complete;
-        if !json {
+        if !inv.json {
             for point in outcome.points() {
                 println!(
                     "Captured {}  guid={}",
@@ -375,12 +377,15 @@ pub(super) fn snapshot(
         let detail = outcome.detail().map(str::to_owned);
         outcomes.push(outcome);
         if !complete {
-            if json {
-                json_response(crate::consent::Envelope::new(
-                    crate::consent::Outcome::Partial,
-                    None,
-                    &outcomes,
-                ))?;
+            if inv.json {
+                json_response(
+                    inv,
+                    crate::consent::Envelope::new(
+                        crate::consent::Outcome::Partial,
+                        None,
+                        &outcomes,
+                    ),
+                )?;
             }
             return Err(Incomplete(format!(
                 "capture {id} needs inspection. {}",
@@ -391,12 +396,11 @@ pub(super) fn snapshot(
             .into());
         }
     }
-    if json {
-        json_response(crate::consent::Envelope::new(
-            crate::consent::Outcome::Applied,
-            None,
-            outcomes,
-        ))?;
+    if inv.json {
+        json_response(
+            inv,
+            crate::consent::Envelope::new(crate::consent::Outcome::Applied, None, outcomes),
+        )?;
     }
     Ok(())
 }

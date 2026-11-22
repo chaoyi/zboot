@@ -169,20 +169,10 @@ inner() {
     log 'staging the runtime'
     # The staged runtime is the initramfs root the later steps complete.
     root=/work/initramfs
-    bash /src/dist/initramfs/stage-runtime.sh \
-        --udevd /usr/lib/systemd/systemd-udevd --udevadm /usr/bin/udevadm \
-        --ata-id /usr/lib/udev/ata_id --scsi-id /usr/lib/udev/scsi_id \
-        --udev-rules /usr/lib/udev/rules.d \
-        --busybox /bin/busybox --zfs /usr/sbin/zfs --zpool /usr/sbin/zpool \
-        --zdb /usr/sbin/zdb --signature-probe /work/zboot-probe-signatures \
-        --change-key /work/zboot-change-key --mount-zfs /usr/sbin/mount.zfs \
-        --kexec /usr/sbin/kexec --kmod /usr/bin/kmod --lsblk /usr/bin/lsblk --findmnt /usr/bin/findmnt --losetup /usr/sbin/losetup \
-        --sfdisk /usr/sbin/sfdisk --sgdisk /usr/sbin/sgdisk --wipefs /usr/sbin/wipefs --nvme /usr/sbin/nvme --partprobe /usr/sbin/partprobe \
-        --mkfs-vfat /usr/sbin/mkfs.vfat --blkid /usr/sbin/blkid --tar /usr/bin/tar --zstd /usr/bin/zstd \
-        --sshd /usr/sbin/sshd --sshd-auth /usr/lib/openssh/sshd-auth \
-        --sshd-session /usr/lib/openssh/sshd-session --ssh-keygen /usr/bin/ssh-keygen \
-        --ip /usr/bin/ip --firmware-root /usr/lib/firmware "${firmware_args[@]}" \
-        --module-dir "/lib/modules/$release" --output "$root"
+    # Programs come from their fixed Debian paths in this root; the two
+    # helpers were installed into /work above.
+    bash /src/dist/initramfs/stage-runtime.sh --root / --helpers-dir /work \
+        "${firmware_args[@]}" --module-dir "/lib/modules/$release" --output "$root"
 
     log 'collecting release notices and matching Debian source packages'
     # Only this private build root is changed. Binary and source indices use

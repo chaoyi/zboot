@@ -1,57 +1,16 @@
 """The zboot UKI and its initramfs, for the acceptance runner and the two native
 proofs (tests/native-api, tests/native-readers): PE sections, the payloads a
-guest boots and their identity, and the newc archives the proofs append."""
+guest boots, and the newc archives the proofs append."""
 import hashlib
-import io
 from pathlib import Path
-import re
 import shutil
 import subprocess
-import tempfile
 
-# What `zboot --version` prints (build_identity::VERSION after the name).
-ZBOOT_VERSION = re.compile(r'zboot ([0-9][0-9A-Za-z.~+-]*) \(source ([0-9a-f]{12})\)\n')
 # Where a UKI's publisher recorded its digest: a dist/dist.sh OUT, or dpkg.
 UKI_PATH = 'usr/lib/zboot/zboot.efi'
 DPKG_MD5SUMS = Path('/var/lib/dpkg/info/zboot.md5sums')
 # What a native proof puts in place of each writer the UKI carries.
 DISABLED_WRITER = b'#!/bin/sh\necho cached-writer-disabled >&2\nexit 125\n'
-
-
-# Exactly the project inputs copied by dist/dist.sh outer(). The archive omits
-# transient target/__pycache__ files; require no ignored files in these paths.
-PRODUCT_INPUTS = ('Cargo.toml', 'Cargo.lock', 'crates', 'dist', 'LICENSE', 'docs/BUILD.md')
-
-
-def verify_product_source(source, producer_oid, candidate_oid):
-    """Require a clean candidate and identical committed distribution inputs.
-
-    Preserve both identities: equivalence permits test-only iteration against an
-    existing build; it does not relabel the producer as the candidate revision.
-    """
-    for oid in (producer_oid, candidate_oid):
-        if not isinstance(oid, str) or re.fullmatch('[0-9a-f]{40}', oid) is None:
-            raise RuntimeError('distribution source OID must be a full lowercase hexadecimal commit')
-    def git(*args):
-        return subprocess.run(['git', *args], cwd=source, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-    for oid in (producer_oid, candidate_oid):
-        if git('cat-file', '-e', f'{oid}^{{commit}}').returncode:
-            raise RuntimeError(f'distribution source OID commit is unavailable: {oid}')
-    current = git('rev-parse', 'HEAD')
-    status = git('status', '--porcelain', '--untracked-files=all')
-    ignored = git('ls-files', '--others', '--ignored', '--exclude-standard', '--', *PRODUCT_INPUTS)
-    indexed = git('ls-files', '-v', '-z', '--', *PRODUCT_INPUTS)
-    hidden_index = indexed.returncode or any(not entry.startswith('H ')
-                                             for entry in indexed.stdout.split('\0') if entry)
-    if (current.returncode or current.stdout.strip() != candidate_oid or status.returncode or
-            status.stdout or ignored.returncode or ignored.stdout or hidden_index):
-        raise RuntimeError('distribution source proof requires an exact clean candidate checkout')
-    difference = git('diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none',
-                     '--quiet', producer_oid, candidate_oid, '--', *PRODUCT_INPUTS)
-    if difference.returncode:
-        raise RuntimeError('distribution source OID differs in product inputs or cannot be compared')
-    return {'producer_source_oid': producer_oid, 'candidate_source_oid': candidate_oid}
 
 
 def sha256(path):
@@ -126,29 +85,7 @@ def boot_payloads(uki, copy, kernel, initramfs):
     kernel.write_bytes(uki_section(copy, '.linux'))
     initramfs.write_bytes(uki_section(copy, '.initrd'))
     return {'uki': str(uki), 'uki_sha256': sha256(copy), 'uki_record': record, 'os_release': os_release,
-            'zboot': zboot_identity(initramfs),
             'kernel_sha256': sha256(kernel), 'initrd_sha256': sha256(initramfs)}
-
-
-def zboot_identity(initramfs):
-    """`VERSION (source DIGEST)` of the initramfs's usr/bin/zboot, as its own
-    `--version` prints it (the same check dist/dist.sh makes). The bytes alone
-    cannot say where the embedded string starts. Run it only from a UKI that
-    matched its publisher's record."""
-    data = subprocess.run(['zstd', '-dc', '--', str(initramfs)], stdout=subprocess.PIPE, check=True).stdout
-    bodies = [body for name, _, body in newc_members(io.BytesIO(data)) if name == 'usr/bin/zboot']
-    if len(bodies) != 1:
-        raise RuntimeError(f'{initramfs}: needs exactly one usr/bin/zboot')
-    with tempfile.TemporaryDirectory(dir=Path(initramfs).parent) as directory:
-        program = Path(directory) / 'zboot'
-        program.write_bytes(bodies[0])
-        program.chmod(0o700)
-        output = subprocess.run([str(program), '--version'], env={}, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=30, check=True).stdout
-    found = ZBOOT_VERSION.fullmatch(output)
-    if not found:
-        raise RuntimeError(f'{initramfs}: unexpected zboot --version: {output!r}')
-    return f'{found[1]} (source {found[2]})'
 
 
 def guest_initrd(initramfs, destination, init, stubs):
@@ -174,29 +111,3 @@ def newc(name, data, mode=0o100755, inode=1):
     result += data
     return result + b'\0' * (-len(data) % 4)
 
-
-def newc_members(stream):
-    """Each (name, mode, data) of the first newc archive in binary STREAM, up to
-    its trailer. A leading `./` is dropped from names."""
-    position = 0
-
-    def read(size):
-        nonlocal position
-        data = stream.read(size)
-        if len(data) != size:
-            raise RuntimeError('truncated newc archive')
-        position += size
-        return data
-
-    while True:
-        header = read(110)
-        if header[:6] != b'070701':
-            raise RuntimeError('not a newc archive member')
-        fields = [int(header[6 + 8 * i:14 + 8 * i], 16) for i in range(13)]
-        name = read(fields[11]).rstrip(b'\0').decode(errors='replace').removeprefix('./')
-        read(-position % 4)
-        if name == 'TRAILER!!!':
-            return
-        data = read(fields[6])
-        read(-position % 4)
-        yield name, fields[1], data

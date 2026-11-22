@@ -34,7 +34,7 @@ case $kind in
         sudo install -m 0644 /usr/share/keyrings/debian-archive-keyring.gpg /etc/apt/trusted.gpg.d/zfs-tools-debian.gpg
         ;;
     vm)
-        sudo apt-get install -y --no-install-recommends "${common[@]}" qemu-system-x86 ovmf mtools fdisk dosfstools attr jq nvme-cli acl
+        sudo apt-get install -y --no-install-recommends "${common[@]}" qemu-system-x86 ovmf mtools fdisk attr jq acl
         [[ -c /dev/kvm ]] || { echo 'BLOCKED: /dev/kvm is absent' >&2; exit 1; }
         # QEMU/udev can recreate this node across a power-cut case. Preserve
         # access for the ordinary runner user throughout all guest boots.

@@ -31,13 +31,11 @@ HOOK
     deploy_boot_overlay "$OVERLAY" "$BE" B
 }
 
-. /acceptance/share.sh
 . /acceptance/deploy_boot.sh
 
 stage_1() {
     fixture_hostid
     fixture_pools
-    fixtures_mount
     d=$(disk D)
     must mkdir mkdir -p /mnt/zfs-e2e
     host_overlay

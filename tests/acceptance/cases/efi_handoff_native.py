@@ -16,8 +16,8 @@ ID = 'EFI-HANDOFF-NATIVE'
 GROUP = 'efi'
 SECONDS = 3600
 DISKS = {'A': 2, 'B': 2, 'D': 2}
-BOOTS = [Boot(1), Boot(2, efi=True, target=3, extra={'build': 'neutral'}),
-         Boot(4, efi=True, target=5, extra={'build': 'neutral'})]
+BOOTS = [Boot(1), Boot(2, efi=True, target=3),
+         Boot(4, efi=True, target=5)]
 
 ON_CHILD = 'e2ea/BE/proof/var'
 UNKNOWN = 'e2ea/BE/unknown'

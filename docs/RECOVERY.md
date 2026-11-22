@@ -11,50 +11,37 @@ front of you. Never type a copied device path or a sample token as consent.
 
 ## The menu
 
-The boot menu runs from zboot's unified kernel image (UKI), stored on an
-EFI system partition (ESP) or served over the network. It starts the same
-way from the host's ESP
-(`EFI/zboot/zboot.efi`, or the firmware's fallback `EFI/BOOT/BOOTX64.EFI`),
-from a rescue stick or from a boot server. It imports every pool it can
-read-only, without force and without mounting anything, then shows:
-
-- the boot environments it found, numbered, with their kernels;
-- interrupted operations;
-- pools it could not import, with the reason (another host's, a name already
-  taken, damaged).
+The boot menu runs from zboot's unified kernel image (UKI). It starts the
+same way from the host's ESP (`EFI/zboot/zboot.efi`, or the firmware's
+fallback `EFI/BOOT/BOOTX64.EFI`), from a rescue stick or from a boot server.
+It imports every pool it can read-only, without force and without mounting
+anything, then lists the boot environments it found, numbered, with their
+kernels; interrupted operations; and pools it could not import, with the
+reason (another host's, a name already taken, damaged).
 
 It prints `ZBOOT_MENU_READY`, and the prompt is `zboot> `. With exactly one
-boot default on the host it counts down five seconds and boots it. A key
-cancels the countdown for good. With no default or more than one it waits
-without a countdown. When something makes automatic boot unsafe it prints
+boot default on the host it counts down five seconds and boots it; a key
+cancels the countdown for good. With no default or more than one it waits.
+When something makes automatic boot unsafe it prints
 `Automatic boot is off: REASON` and waits: a `canmount=on` dataset inside a
 boot environment, a hibernation image or a device that could hide one,
 devices it cannot read, or an adopted host's active pool that is not
-entirely on local NVMe or SATA disks. A host whose pool is on USB, SAS or
-virtio therefore never counts down.
+entirely on local NVMe or SATA disks (so a host whose pool is on USB, SAS or
+virtio never counts down). A `canmount=on` dataset inside one boot
+environment also makes the menu refuse every other boot environment: boot
+the one that owns it and run the `zfs set canmount=noauto` command the
+refusal prints.
 
-A `canmount=on` dataset inside one boot environment would mount over the
-others, so the menu also refuses to boot every other boot environment until
-it is fixed: boot the one that owns it and run the `zfs set canmount=noauto`
-command the refusal prints.
-
-- `N` boots boot environment N, `N.M` its M-th kernel. `boot N -v` prints
-  each stage of the handoff.
-- The menu takes the same verbs and operands as the command line. A boot
-  environment may be named by the number `N` that `status` (or `ls`) shows;
-  other datasets take their full names.
-- `connect`, `rescan`, `shell`, `reboot`, `poweroff` and `help` are the
-  menu's own commands ([CLI.md](CLI.md#in-the-menu)).
-- Any zboot command in the UKI (a menu line, the shell, SSH) plans on the
-  read-only pools. Only after your answer does it reopen the pools it needs
-  writable, and it returns them to read-only when done; a pool it exported
-  stays exported until `rescan`. `wipe` and `deploy DISK` export the pools on
-  that disk after the answer.
-- The UKI has no hostid of its own. It adopts the one host whose active pool
-  labels agree, and imports that host's pools and pools that record no host.
-  Another host's pools stay closed and are listed. With no active pool it
-  takes the default boot environment's `/etc/hostid`.
-- The menu runs on the screen. Firmware must allow an unsigned loader.
+`N` boots boot environment N, `N.M` its M-th kernel; `boot N -v` prints each
+stage of the handoff. The menu takes the same verbs as the command line, plus
+its own commands ([CLI.md](CLI.md#in-the-menu)). Every zboot command in the
+UKI plans on the read-only pools and reopens the pools it needs writable only
+after your answer; a pool it exported stays exported until `rescan`, and
+`wipe` and `deploy DISK` export the pools on their disk after the answer.
+The UKI has no hostid of its own: it adopts the one host
+whose active pool labels agree and imports that host's pools and pools that
+record no host; another host's pools stay closed and are listed. The menu runs
+on the screen. Firmware must allow an unsigned loader.
 
 `shell` opens a root shell; `exit` returns to the menu. The shell and zboot
 run from RAM: do not mount disk-backed filesystems over `/usr`, `/bin`,
@@ -80,22 +67,20 @@ several cabled interfaces, leave one connected.
 
 | Situation | What to do |
 |---|---|
-| The host still runs | `zboot reboot --menu --key FILE` writes the keys in FILE to `zboot/authorized_keys` on the ESP the host booted from and reboots. The menu then waits ten minutes instead of counting down, and starts wired DHCP and SSH for those keys only, never a password. It deletes the file before anything starts, so this happens once; if the file cannot be deleted, SSH does not start. Without `--key` the file is empty and the menu waits with no SSH. If that ESP is not directly on a fixed NVMe or SATA disk (a stick, a USB or hot-plug disk), the next ordinary boot is unlikely to load it, so the command refuses and lists the host's zboot ESPs on fixed disks; add `--esp PART` for the one the firmware boots, or name the stick's ESP to boot the stick again. A network-booted system has no such ESP; name one with `--esp`. |
+| The host still runs | `zboot reboot --menu --key FILE` writes the keys in FILE to `zboot/authorized_keys` on the ESP the next boot loads and reboots ([CLI](CLI.md#menu-and-remote-access) says which ESP, and when to add `--esp PART`). The menu then waits ten minutes instead of counting down, and starts wired DHCP and SSH for those keys only, never a password. It deletes the file before anything starts, so this happens once; if the file cannot be deleted, SSH does not start. |
 | A stick | Write plain OpenSSH public keys (no key options) to `zboot/authorized_keys` on the stick's ESP. The next boot from it behaves as above. |
 | Network boot | Have the loader (iPXE, say) pass `zboot.ssh_key=TYPE:BASE64` (repeatable). Its arguments replace the UKI's embedded command line, so repeat that line too: `zboot.recovery=1` and the consoles ([BUILD](BUILD.md)). Firmware HTTP boot passes no arguments, and under Secure Boot the stub ignores them; use `connect` then. |
 | Someone at the console | They type `connect`, which prints the address, the host key fingerprint and a one-time password. Check the fingerprint before you accept the key. The password is valid until its first login or the end of that session. |
 
-Pressing a key at the console cancels automatic boot for the rest of that
-menu run. A successful SSH login pauses automatic boot until its session
-ends. Otherwise, after ten minutes, or when that
-session ends with nobody at the console, the menu stops SSH and counts down
-under its usual conditions. A session ends before half the DHCP lease has
-passed, at most six hours.
-Over SSH, run zboot verbs directly (`zboot status`, `zboot restore ...`);
-they follow the same rules as menu lines. A login is one session: the menu
-allows one session per connection, and once the last one closes it stops SSH
-for good. `ssh HOST COMMAND` therefore runs exactly one command; keep an
-interactive shell open for the whole visit.
+A key pressed at the console cancels automatic boot for the rest of that menu
+run, and a successful SSH login pauses it until its session ends. Otherwise,
+after ten minutes, or when that session ends with nobody at the console, the
+menu stops SSH and counts down under its usual conditions. A session ends
+before half the DHCP lease has passed, at most six hours. Over SSH, run zboot
+verbs directly (`zboot status`, `zboot restore ...`); they follow the same
+rules as menu lines. The menu allows one session per connection and stops
+SSH for good once the last one closes, so `ssh HOST COMMAND` runs exactly one
+command: keep an interactive shell open for the whole visit.
 
 The menu takes plain public keys only. A FIDO key created with
 `no-touch-required` needs that option in `authorized_keys`, so it cannot get

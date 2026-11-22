@@ -1,13 +1,9 @@
 use super::{
     access::{Access, Bindings, Env},
-    grammar::{Cli, DeployInto, Verb},
+    grammar::{Cli, Consent, DeployInto, Verb},
     names, pairs, provision, recovery, status, trees,
 };
 use crate::consent::{Envelope, Outcome};
-
-thread_local! {
-    static RESPONSE: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
-}
 
 #[derive(Debug)]
 pub(super) struct Incomplete(pub(super) String);
@@ -18,6 +14,63 @@ impl std::fmt::Display for Incomplete {
     }
 }
 impl std::error::Error for Incomplete {}
+
+/// One command's state: whether it prints JSON, the envelope it reports, its
+/// writer lock, its pool access and its reviewed disk scope. A menu line is
+/// an invocation of its own beside the menu's.
+pub(super) struct Invocation {
+    pub(super) json: bool,
+    response: Option<serde_json::Value>,
+    writer: Writer,
+    access: Access,
+    disk_scope: Option<crate::device::DiskScope>,
+}
+
+impl Invocation {
+    pub(super) fn new(json: bool) -> Self {
+        Self {
+            json,
+            response: None,
+            writer: Writer::NotDeferred,
+            access: Access::new(),
+            disk_scope: None,
+        }
+    }
+
+    pub(super) fn defer_writer(&mut self, purpose: String, take: TakeLock) {
+        self.writer = Writer::Deferred { purpose, take };
+    }
+
+    #[cfg(test)]
+    pub(super) fn writer_held(&self) -> bool {
+        matches!(self.writer, Writer::Held(_))
+    }
+
+    /// Exit status and output of this invocation's `result`.
+    pub(super) fn finish(
+        mut self,
+        result: Result<(), Box<dyn std::error::Error>>,
+        retry: &str,
+    ) -> i32 {
+        finish(result, self.response.take(), self.json, retry)
+    }
+}
+
+/// A panic unwinds past the ordinary close. Return the pools to read-only
+/// here: the drop body runs before any field drops, so the writer lock is
+/// still held.
+impl Drop for Invocation {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Err(error) = self.access.close()
+        {
+            eprintln!(
+                "zboot: pool cleanup failed: {}. Inspect zboot status before booting",
+                zfs_tools::engine::escape_display(&error.to_string())
+            );
+        }
+    }
+}
 
 /// A † verb's consent: print the plan, then take `--confirm TOKEN` or, on a
 /// terminal, the typed target, after which the verb plans again and goes on
@@ -30,9 +83,8 @@ impl std::error::Error for Incomplete {}
 /// before the plan is made again, so a `--confirm` plan is also made again
 /// under the lock; a dry run or an unconfirmed exit never takes it.
 pub(super) fn consent_to<P: serde::Serialize>(
-    dry_run: bool,
-    confirm: Option<String>,
-    json: bool,
+    inv: &mut Invocation,
+    consent: Consent,
     plan: impl Fn() -> Result<P, Box<dyn std::error::Error>>,
     token: impl Fn(&P) -> std::io::Result<String>,
     describe: impl Fn(&P, &str) -> String,
@@ -42,11 +94,11 @@ pub(super) fn consent_to<P: serde::Serialize>(
     use std::io::Write;
     let planned = plan()?;
     let shown = token(&planned)?;
-    let mode = Mode::select(dry_run, confirm);
+    let mode = Mode::select(consent.dry_run, consent.confirm);
     if let Mode::Token(given) = &mode {
         consent::unchanged(given, &shown)?;
     }
-    let mut dialogue = self::dialogue(json);
+    let mut dialogue = self::dialogue(inv.json);
     write!(dialogue, "{}", describe(&planned, &shown))?;
     dialogue.flush()?;
     let mut input: Box<dyn std::io::BufRead> = match &mode {
@@ -65,8 +117,8 @@ pub(super) fn consent_to<P: serde::Serialize>(
     )?;
     match decision {
         Decision::DryRun | Decision::Unconfirmed => {
-            if json {
-                json_response(Envelope::new(Outcome::Preview, Some(shown), &planned))?;
+            if inv.json {
+                json_response(inv, Envelope::new(Outcome::Preview, Some(shown), &planned))?;
             }
             if decision == Decision::Unconfirmed {
                 return Err(consent::Unconfirmed.into());
@@ -74,7 +126,7 @@ pub(super) fn consent_to<P: serde::Serialize>(
             Ok(None)
         }
         Decision::Proceed { replan } => {
-            let locked = writer_for_replan(&planned, &plan, true)?;
+            let locked = writer_for_replan(inv, &planned, &plan, true)?;
             if !replan && !locked {
                 return Ok(Some((planned, shown)));
             }
@@ -91,28 +143,28 @@ pub(super) fn consent_to<P: serde::Serialize>(
 /// that plan names are then reopened writable and it is made again on them;
 /// one that now names another pool is refused, to be run again.
 pub(super) fn lossless<P: serde::Serialize>(
+    inv: &mut Invocation,
     dry_run: bool,
-    json: bool,
     plan: impl Fn() -> Result<P, Box<dyn std::error::Error>>,
     describe: impl Fn(&P) -> String,
 ) -> Result<Option<P>, Box<dyn std::error::Error>> {
     use std::io::Write;
     if dry_run {
         let planned = plan()?;
-        if json {
-            json_response(Envelope::new(Outcome::Preview, None, &planned))?;
+        if inv.json {
+            json_response(inv, Envelope::new(Outcome::Preview, None, &planned))?;
         } else {
             write!(dialogue(false), "{}", describe(&planned))?;
             println!("Dry run; nothing changed.");
         }
         return Ok(None);
     }
-    let locked = lock()?;
+    let locked = lock(inv)?;
     let planned = plan()?;
-    if !locked || !ACCESS.with_borrow(Access::reopens_plan) {
+    if !locked || !inv.access.reopens_plan() {
         return Ok(Some(planned));
     }
-    ACCESS.with_borrow_mut(|access| access.open(&planned))?;
+    inv.access.open(&planned)?;
     let fresh = plan()?;
     let added = super::access::unreviewed_pools(&planned, &fresh)?;
     if let Some(refusal) = replan_refusal(&added, false) {
@@ -134,15 +186,16 @@ enum LockAt {
     AfterConsent,
 }
 
+/// Takes the writer lock; `Ok(None)` stands for one in tests, which take none.
 type TakeLock =
     fn(
         &str,
     )
         -> Result<Option<zfs_tools::engine::lock::WriterLock>, zfs_tools::engine::lock::LockError>;
 
-/// The deferred writer lock of this process.
+/// An invocation's deferred writer lock.
 enum Writer {
-    /// Not deferred: taken at entry, or never.
+    /// Not deferred: the command takes none.
     NotDeferred,
     Deferred {
         purpose: String,
@@ -150,25 +203,19 @@ enum Writer {
     },
     Held(#[allow(dead_code)] Option<zfs_tools::engine::lock::WriterLock>),
 }
-thread_local! {
-    static WRITER: std::cell::RefCell<Writer> = const { std::cell::RefCell::new(Writer::NotDeferred) };
-    static ACCESS: std::cell::RefCell<Access> = const { std::cell::RefCell::new(Access::new()) };
-    static DISK_SCOPE: std::cell::RefCell<Option<crate::device::DiskScope>> = const { std::cell::RefCell::new(None) };
-}
-
-pub(super) fn defer_writer(purpose: String, take: TakeLock) {
-    WRITER.set(Writer::Deferred { purpose, take });
-}
 
 /// Take the deferred writer lock now, once; it is then held until the
-/// process ends. Under it, before any effect, the menu's displayed identities
-/// are checked again, a reviewed disk scope is exported and, in the UKI, the
-/// pools `plan` names are reopened writable. Returns whether this call took
-/// the lock. A no-op for a command that took the lock at entry or takes none.
-pub(super) fn writer_for(plan: &impl serde::Serialize) -> Result<bool, Box<dyn std::error::Error>> {
-    let locked = lock()?;
+/// invocation ends. Under it, before any effect, the menu's displayed
+/// identities are checked again, a reviewed disk scope is exported and, in
+/// the UKI, the pools `plan` names are reopened writable. Returns whether this
+/// call took the lock. A no-op for a command that takes none.
+pub(super) fn writer_for(
+    inv: &mut Invocation,
+    plan: &impl serde::Serialize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let locked = lock(inv)?;
     if locked {
-        ACCESS.with_borrow_mut(|access| access.open(plan))?;
+        inv.access.open(plan)?;
     }
     Ok(locked)
 }
@@ -179,19 +226,20 @@ pub(super) fn writer_for(plan: &impl serde::Serialize) -> Result<bool, Box<dyn s
 /// stays read-only, so it is refused before any pool reopens. That is a stale
 /// plan when it was `confirmed`, otherwise a refusal to run the verb again.
 pub(super) fn writer_for_replan<P: serde::Serialize>(
+    inv: &mut Invocation,
     planned: &P,
     plan: &dyn Fn() -> Result<P, Box<dyn std::error::Error>>,
     confirmed: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let locked = lock()?;
+    let locked = lock(inv)?;
     if locked {
-        if ACCESS.with_borrow(Access::reopens_plan) {
+        if inv.access.reopens_plan() {
             let added = super::access::unreviewed_pools(planned, &plan()?)?;
             if let Some(refusal) = replan_refusal(&added, confirmed) {
                 return Err(refusal);
             }
         }
-        ACCESS.with_borrow_mut(|access| access.open(planned))?;
+        inv.access.open(planned)?;
     }
     Ok(locked)
 }
@@ -214,71 +262,45 @@ fn replan_refusal(added: &[String], confirmed: bool) -> Option<Box<dyn std::erro
 
 /// Take the deferred writer lock; under it, check the menu's displayed
 /// identities again and export a reviewed disk scope.
-fn lock() -> Result<bool, Box<dyn std::error::Error>> {
-    let locked = WRITER.with_borrow_mut(|writer| -> Result<bool, Box<dyn std::error::Error>> {
-        let Writer::Deferred { purpose, take } = writer else {
-            return Ok(false);
-        };
-        *writer = Writer::Held(crate::menu::after_imports(|| {
-            take(purpose).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
-        })?);
-        Ok(true)
-    })?;
-    if locked {
-        ACCESS.with_borrow(Access::check)?;
-        DISK_SCOPE.with_borrow(|scope| -> Result<(), Box<dyn std::error::Error>> {
-            if let Some(scope) = scope {
-                scope.export()?;
-            }
-            Ok(())
-        })?;
+fn lock(inv: &mut Invocation) -> Result<bool, Box<dyn std::error::Error>> {
+    let Writer::Deferred { purpose, take } = &inv.writer else {
+        return Ok(false);
+    };
+    inv.writer = Writer::Held(crate::menu::after_imports(|| {
+        take(purpose).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    })?);
+    inv.access.check()?;
+    if let Some(scope) = &inv.disk_scope {
+        scope.export()?;
     }
-    Ok(locked)
+    Ok(true)
 }
 
 pub(super) fn include_disk_scope(
+    inv: &mut Invocation,
     scope: &crate::device::DiskScope,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    DISK_SCOPE.with_borrow_mut(|selected| {
-        if selected.as_ref().is_some_and(|selected| selected != scope) {
-            return Err("the reviewed disk export scope changed".into());
-        }
-        *selected = Some(scope.clone());
-        Ok(())
-    })
-}
-
-/// A panic unwinds past the ordinary close. Return the pools to read-only
-/// here, while the writer lock is still held.
-struct CloseOnPanic;
-impl Drop for CloseOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking()
-            && let Err(error) = close_access()
-        {
-            eprintln!(
-                "zboot: pool cleanup failed: {}. Inspect zboot status before booting",
-                zfs_tools::engine::escape_display(&error.to_string())
-            );
-        }
+    if inv
+        .disk_scope
+        .as_ref()
+        .is_some_and(|selected| selected != scope)
+    {
+        return Err("the reviewed disk export scope changed".into());
     }
-}
-
-fn close_access() -> Result<(), Box<dyn std::error::Error>> {
-    Ok(ACCESS.with_borrow_mut(Access::close)?)
+    inv.disk_scope = Some(scope.clone());
+    Ok(())
 }
 
 pub(super) fn applied(
-    json: bool,
+    inv: &mut Invocation,
     token: Option<String>,
     outcome: impl serde::Serialize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        json_response(crate::consent::Envelope::new(
-            crate::consent::Outcome::Applied,
-            token,
-            outcome,
-        ))?;
+    if inv.json {
+        json_response(
+            inv,
+            crate::consent::Envelope::new(crate::consent::Outcome::Applied, token, outcome),
+        )?;
     }
     Ok(())
 }
@@ -293,22 +315,23 @@ pub(super) fn dialogue(json: bool) -> Box<dyn std::io::Write> {
 }
 
 pub(super) fn json_response<T: serde::Serialize>(
+    inv: &mut Invocation,
     value: Envelope<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    RESPONSE.set(Some(serde_json::to_value(value)?));
+    inv.response = Some(serde_json::to_value(value)?);
     Ok(())
 }
 
 /// The envelope of a recorded operation: `partial`, and a failure naming
 /// `zboot resume`, when its follow-up is incomplete and its record remains.
 pub(super) fn applied_operation(
-    json: bool,
+    inv: &mut Invocation,
     token: Option<String>,
     operation: Option<&str>,
     complete: bool,
     outcome: impl serde::Serialize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
+    if inv.json {
         let mut envelope = crate::consent::Envelope::new(
             if complete {
                 crate::consent::Outcome::Applied
@@ -319,7 +342,7 @@ pub(super) fn applied_operation(
             outcome,
         );
         envelope.operation = operation.map(str::to_owned);
-        json_response(envelope)?;
+        json_response(inv, envelope)?;
     }
     if !complete {
         if let Some(operation) = operation {
@@ -330,6 +353,7 @@ pub(super) fn applied_operation(
     Ok(())
 }
 fn execute(
+    inv: &mut Invocation,
     cli: Cli,
     numbers: Option<&crate::status::Numbering>,
     listed_boot: Option<crate::handoff::HandoffRequest>,
@@ -342,11 +366,9 @@ fn execute(
             pool,
             esp,
             swap,
-            dry_run,
-            confirm,
-            json,
-        } => recovery::restore(recovery::RestoreArgs {
-            request: crate::restore::Request {
+            consent,
+        } => recovery::restore(
+            crate::restore::Request {
                 source,
                 disk,
                 keep,
@@ -354,22 +376,11 @@ fn execute(
                 esp_bytes: esp,
                 swap_bytes: swap,
             },
-            dry_run,
-            confirm,
-            json,
-        })?,
-        Verb::Resume {
-            id,
-            dry_run,
-            confirm,
-            json,
-        } => recovery::resume(id, false, dry_run, confirm, json)?,
-        Verb::Abandon {
-            id,
-            dry_run,
-            confirm,
-            json,
-        } => recovery::resume(id, true, dry_run, confirm, json)?,
+            consent,
+            inv,
+        )?,
+        Verb::Resume { id, consent } => recovery::resume(id, false, consent, inv)?,
+        Verb::Abandon { id, consent } => recovery::resume(id, true, consent, inv)?,
         Verb::Deploy {
             into: Some(DeployInto::Into(into)),
             ..
@@ -386,7 +397,7 @@ fn execute(
                     hostname: into.hostname,
                 },
                 into.dry_run,
-                into.json,
+                inv,
             )?
         }
         Verb::Deploy {
@@ -405,9 +416,7 @@ fn execute(
             esp,
             esp_partition,
             swap,
-            dry_run,
-            confirm,
-            json,
+            consent,
         } => provision::deploy(
             crate::deploy::command::Args {
                 target: match (disk, image) {
@@ -427,9 +436,8 @@ fn execute(
                 esp_partition,
                 swap,
             },
-            dry_run,
-            confirm,
-            json,
+            consent,
+            inv,
         )?,
         Verb::FactoryFinish { root, stage } => crate::factory::finish_stage(&root, &stage)?,
         Verb::Factory {
@@ -438,8 +446,6 @@ fn execute(
             mirror,
             snapshot,
             packages,
-            json,
-            ..
         } => provision::factory(
             crate::factory::Request {
                 output,
@@ -448,89 +454,57 @@ fn execute(
                 snapshot,
                 packages,
             },
-            json,
+            inv,
         )?,
         Verb::Esp {
             partitions,
             efi,
-            dry_run,
-            confirm,
-            json,
+            consent,
         } => provision::esp(
             partitions,
             &efi.map(Ok).unwrap_or_else(crate::status::shipped_efi)?,
-            dry_run,
-            confirm,
-            json,
+            consent,
+            inv,
         )?,
         Verb::Rename {
             source,
             destination,
             dry_run,
-            json,
-        } => trees::rename_command(source, destination, dry_run, json)?,
-        Verb::Rollback {
-            target,
-            dry_run,
-            confirm,
-            json,
-        } => trees::rollback_command(target, dry_run, confirm, json)?,
-        Verb::Primary {
-            dataset,
-            dry_run,
-            confirm,
-            json,
-        } => pairs::primary(dataset, dry_run, confirm, json)?,
+        } => trees::rename_command(source, destination, dry_run, inv)?,
+        Verb::Rollback { target, consent } => trees::rollback_command(target, consent, inv)?,
+        Verb::Primary { dataset, consent } => pairs::primary(dataset, consent, inv)?,
         Verb::Chroot { dataset, command } => trees::chroot(dataset, command)?,
-        Verb::Wipe {
-            disk,
-            dry_run,
-            confirm,
-            json,
-        } => provision::wipe(disk, dry_run, confirm, json)?,
+        Verb::Wipe { disk, consent } => provision::wipe(disk, consent, inv)?,
         Verb::Sync {
             source,
             destination,
             all,
-            dry_run,
-            confirm,
-            json,
-        } => pairs::sync(source, destination, all, dry_run, confirm, json)?,
-        Verb::Default {
-            dataset,
-            dry_run,
-            json,
-        } => trees::default(dataset, dry_run, json)?,
+            consent,
+        } => pairs::sync(source, destination, all, consent, inv)?,
+        Verb::Default { dataset, dry_run } => trees::default(dataset, dry_run, inv)?,
         Verb::Cmdline {
             dataset,
             set,
             clear,
             dry_run,
-            json,
         } => trees::cmdline(
             dataset.ok_or("no running boot environment")?,
             set,
             clear,
             dry_run,
-            json,
+            inv,
         )?,
         Verb::Fork {
             snapshot,
             destination,
             dry_run,
-            json,
         } => trees::fork_command(
             snapshot.ok_or("no running boot environment")?,
             destination,
             dry_run,
-            json,
+            inv,
         )?,
-        Verb::Drop {
-            targets,
-            dry_run,
-            confirm,
-            json,
-        } => trees::drop_command(targets, dry_run, confirm, json)?,
+        Verb::Drop { targets, consent } => trees::drop_command(targets, consent, inv)?,
         Verb::Boot {
             tar: Some(tar),
             overlay,
@@ -540,54 +514,42 @@ fn execute(
             dataset, kernel, ..
         } => crate::menu::boot(dataset, kernel, listed_boot)?,
         Verb::Reboot {
-            key,
-            esp,
-            dry_run,
-            json,
-            ..
+            key, esp, dry_run, ..
         } => {
             if let Some(planned) = lossless(
+                inv,
                 dry_run,
-                json,
                 || Ok(crate::reboot::plan(key.as_deref(), esp.as_deref())?),
                 crate::reboot::describe,
             )? {
                 crate::reboot::apply(&planned)?;
-                if !json {
+                if !inv.json {
                     println!(
                         "Menu request written to {}; rebooting.",
                         zfs_tools::engine::escape_display(&planned.target.partition.path)
                     );
                 }
-                applied(json, None, &planned)?;
+                applied(inv, None, &planned)?;
             }
         }
         Verb::Menu { no_autoboot } => crate::menu::start(no_autoboot)?,
         Verb::Unpair {
             dataset,
             release_anchors,
-            dry_run,
-            confirm,
-            json,
-        } => pairs::unpair(dataset, release_anchors, dry_run, confirm, json)?,
+            consent,
+        } => pairs::unpair(dataset, release_anchors, consent, inv)?,
         Verb::Pair {
             left,
             right,
             dry_run,
-            json,
-        } => pairs::pair(left, right, dry_run, json)?,
-        Verb::Snapshot {
-            datasets,
-            dry_run,
-            json,
-        } => trees::snapshot(datasets, dry_run, json)?,
+        } => pairs::pair(left, right, dry_run, inv)?,
+        Verb::Snapshot { datasets, dry_run } => trees::snapshot(datasets, dry_run, inv)?,
         Verb::Status {
             datasets,
             snapshots,
             all,
             devices,
-            json,
-        } => status::status(datasets, snapshots, all, devices, json, numbers)?,
+        } => status::status(datasets, snapshots, all, devices, inv, numbers)?,
     }
     Ok(())
 }
@@ -608,37 +570,6 @@ fn lock_at(command: &Verb) -> LockAt {
             ..
         } => LockAt::Never,
         _ => LockAt::AfterConsent,
-    }
-}
-
-fn wants_json(command: &Verb) -> bool {
-    match command {
-        Verb::Deploy {
-            into: Some(DeployInto::Into(into)),
-            ..
-        } => into.json,
-        Verb::Reboot { json, .. }
-        | Verb::Boot { json, .. }
-        | Verb::Restore { json, .. }
-        | Verb::Resume { json, .. }
-        | Verb::Abandon { json, .. }
-        | Verb::Deploy { json, .. }
-        | Verb::Factory { json, .. }
-        | Verb::Rename { json, .. }
-        | Verb::Rollback { json, .. }
-        | Verb::Primary { json, .. }
-        | Verb::Wipe { json, .. }
-        | Verb::Sync { json, .. }
-        | Verb::Default { json, .. }
-        | Verb::Cmdline { json, .. }
-        | Verb::Fork { json, .. }
-        | Verb::Drop { json, .. }
-        | Verb::Unpair { json, .. }
-        | Verb::Pair { json, .. }
-        | Verb::Status { json, .. }
-        | Verb::Snapshot { json, .. }
-        | Verb::Esp { json, .. } => *json,
-        Verb::Chroot { .. } | Verb::Menu { .. } | Verb::FactoryFinish { .. } => false,
     }
 }
 
@@ -691,13 +622,15 @@ fn recorded_operations() -> Vec<String> {
         .collect()
 }
 
+/// The exit status and output of a command's `result` and the envelope it
+/// reported, if any.
 pub(crate) fn finish(
     result: Result<(), Box<dyn std::error::Error>>,
+    mut response: Option<serde_json::Value>,
     json: bool,
     retry: &str,
 ) -> i32 {
     use std::io::Write;
-    let mut response = RESPONSE.take();
     let reported_partial = response
         .as_ref()
         .is_some_and(|value| value["mode"] == "partial");
@@ -872,7 +805,7 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     run(args, |purpose| {
-        zfs_tools::engine::lock::for_command("zboot", purpose)
+        zfs_tools::engine::lock::for_command("zboot", purpose).map(Some)
     })
 }
 
@@ -904,7 +837,7 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     let verbosity = InvocationVerbosity::new();
-    reset_invocation();
+    zfs_tools::engine::effect::reset();
     let cli = match Cli::parse_from_args(args) {
         Ok(cli) => cli,
         Err(error) => return usage_exit(error),
@@ -926,46 +859,26 @@ fn usage_exit(error: clap::Error) -> i32 {
     }
 }
 
-fn reset_invocation() {
-    WRITER.set(Writer::NotDeferred);
-    RESPONSE.set(None);
-    ACCESS.set(Access::new());
-    DISK_SCOPE.set(None);
-    zfs_tools::engine::effect::reset();
-}
-
-/// Preserve the outer menu session while each parsed line owns its own
-/// response, effect accounting, access guard and writer lock.
-struct MenuInvocation {
-    writer: Option<Writer>,
-    response: Option<serde_json::Value>,
-    access: Access,
-    disk_scope: Option<crate::device::DiskScope>,
+/// The library's effect accounting is per process. Each menu line counts its
+/// own; the menu session's is restored after it.
+struct MenuEffects {
     effect: bool,
     hints: Vec<String>,
 }
 
-impl MenuInvocation {
+impl MenuEffects {
     fn new() -> Self {
-        Self {
-            writer: Some(
-                WRITER.with_borrow_mut(|writer| std::mem::replace(writer, Writer::NotDeferred)),
-            ),
-            response: RESPONSE.take(),
-            access: ACCESS.take(),
-            disk_scope: DISK_SCOPE.take(),
+        let session = Self {
             effect: zfs_tools::engine::effect::any(),
             hints: zfs_tools::engine::effect::operation_hints(),
-        }
+        };
+        zfs_tools::engine::effect::reset();
+        session
     }
 }
 
-impl Drop for MenuInvocation {
+impl Drop for MenuEffects {
     fn drop(&mut self) {
-        WRITER.set(self.writer.take().unwrap());
-        RESPONSE.set(self.response.take());
-        ACCESS.set(std::mem::take(&mut self.access));
-        DISK_SCOPE.set(self.disk_scope.take());
         zfs_tools::engine::effect::reset();
         if self.effect {
             zfs_tools::engine::effect::mark();
@@ -982,11 +895,11 @@ pub(crate) fn run_menu(
     numbers: Option<&crate::status::Numbering>,
     listed_boot: Option<crate::handoff::HandoffRequest>,
 ) -> i32 {
-    let _session = MenuInvocation::new();
+    let _session = MenuEffects::new();
     let verbosity = InvocationVerbosity::new();
     run_parsed(
         cli,
-        |purpose| zfs_tools::engine::lock::for_command("zboot", purpose),
+        |purpose| zfs_tools::engine::lock::for_command("zboot", purpose).map(Some),
         Some(bindings),
         numbers,
         listed_boot,
@@ -995,15 +908,14 @@ pub(crate) fn run_menu(
 }
 
 /// Target resolution failures happen before a menu command can
-/// enter `run_menu`. Give them the same response and invocation isolation.
+/// enter `run_menu`. Give them the same response and effect isolation.
 /// Parsing here is only for the command's output contract; no target resolves.
 pub(crate) fn finish_menu_pre_execution(
     words: &[String],
     error: Box<dyn std::error::Error>,
 ) -> i32 {
-    let _session = MenuInvocation::new();
+    let _session = MenuEffects::new();
     let verbosity = InvocationVerbosity::new();
-    reset_invocation();
     let shortcut = words.len() == 1 && words[0].as_bytes().first().is_some_and(u8::is_ascii_digit);
     let args = std::iter::once("zboot")
         .chain(shortcut.then_some("boot"))
@@ -1013,11 +925,7 @@ pub(crate) fn finish_menu_pre_execution(
         Err(error) => return usage_exit(error),
     };
     verbosity.apply(cli.verbose);
-    finish(
-        Err(error),
-        wants_json(&cli.command),
-        verb_name(&cli.command),
-    )
+    finish(Err(error), None, cli.json, verb_name(&cli.command))
 }
 
 /// `bindings` are a menu line's displayed identities; `None` for a command line.
@@ -1029,11 +937,10 @@ fn run_parsed(
     listed_boot: Option<crate::handoff::HandoffRequest>,
     verbosity: &InvocationVerbosity,
 ) -> i32 {
-    reset_invocation();
+    zfs_tools::engine::effect::reset();
     verbosity.apply(cli.verbose);
-    let json = wants_json(&cli.command);
     let verb = verb_name(&cli.command);
-    let _close = CloseOnPanic;
+    let mut inv = Invocation::new(cli.json);
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let environment = Env::detect();
         environment.admit(&cli.command)?;
@@ -1052,22 +959,18 @@ fn run_parsed(
             crate::menu::import_readonly_for_action()?;
         }
         resolve_targets(&mut cli.command, menu)?;
-        ACCESS.set(Access::of(
-            environment,
-            &cli.command,
-            bindings.unwrap_or_default(),
-        ));
-        ACCESS.with_borrow(Access::check)?;
+        inv.access = Access::of(environment, &cli.command, bindings.unwrap_or_default());
+        inv.access.check()?;
         match lock_at(&cli.command) {
             LockAt::Never => {}
-            LockAt::AfterConsent => defer_writer(verb.into(), take),
+            LockAt::AfterConsent => inv.defer_writer(verb.into(), take),
         }
         if let Verb::Chroot { dataset, .. } = &cli.command {
-            ACCESS.with_borrow_mut(|access| access.open_chroot(dataset))?;
+            inv.access.open_chroot(dataset)?;
         }
-        execute(cli, numbers, listed_boot)
+        execute(&mut inv, cli, numbers, listed_boot)
     })();
-    let result = match (result, close_access()) {
+    let result = match (result, inv.access.close()) {
         (result, Ok(())) => result,
         (result, Err(cleanup)) => Err(format!(
             "{}. Pool cleanup failed. {cleanup}. Inspect zboot status before booting",
@@ -1077,14 +980,8 @@ fn run_parsed(
         )
         .into()),
     };
-    let code = finish(result, json, verb);
-    WRITER.set(Writer::NotDeferred);
-    code
-}
-
-#[cfg(test)]
-pub(super) fn writer_is_held_for_test() -> bool {
-    WRITER.with_borrow(|writer| matches!(writer, Writer::Held(_)))
+    // The writer lock goes with the invocation, after its output.
+    inv.finish(result, verb)
 }
 
 #[cfg(test)]
@@ -1133,18 +1030,34 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A fake lock taker that records that it ran.
+    fn take(
+        _: &str,
+    ) -> Result<Option<zfs_tools::engine::lock::WriterLock>, zfs_tools::engine::lock::LockError>
+    {
+        TAKEN.set(true);
+        Ok(None)
+    }
+
     /// `consent_to` for a verb that defers its lock, with a fake lock taker:
     /// returns the plan calls, each with whether the lock was held then.
     fn consented(dry_run: bool, confirm: Option<&str>) -> (bool, Vec<bool>) {
-        defer_writer("drop".into(), |_| Ok(None));
+        TAKEN.set(false);
+        let mut inv = Invocation::new(true);
+        inv.defer_writer("drop".into(), take);
         let calls = std::cell::RefCell::new(Vec::new());
-        let held = || WRITER.with_borrow(|w| matches!(w, Writer::Held(_)));
         let result = consent_to(
-            dry_run,
-            confirm.map(String::from),
-            true,
+            &mut inv,
+            Consent {
+                dry_run,
+                confirm: confirm.map(String::from),
+            },
             || {
-                calls.borrow_mut().push(held());
+                calls.borrow_mut().push(TAKEN.get());
                 Ok("the plan")
             },
             |_| Ok("sha256:token".to_string()),
@@ -1157,11 +1070,10 @@ mod tests {
         let proceeded = matches!(result, Ok(Some(_)));
         let calls = calls.into_inner();
         assert_eq!(
-            held(),
+            matches!(inv.writer, Writer::Held(_)),
             proceeded,
             "the lock is held exactly when consent proceeds"
         );
-        WRITER.set(Writer::NotDeferred);
         (proceeded, calls)
     }
 
@@ -1175,33 +1087,31 @@ mod tests {
             consented(false, Some("sha256:token")),
             (true, vec![false, true])
         );
-        // A lock taken at entry (or none) is not taken again.
-        WRITER.set(Writer::NotDeferred);
-        assert!(!writer_for(&()).unwrap());
+        // A command that takes no lock does not take one here.
+        assert!(!writer_for(&mut Invocation::new(false), &()).unwrap());
     }
 
     #[test]
     fn a_lossless_preview_takes_no_lock_and_a_change_plans_once_under_it() {
         for (dry_run, expected) in [(true, vec![false]), (false, vec![true])] {
-            defer_writer("snapshot".into(), |_| Ok(None));
+            TAKEN.set(false);
+            let mut inv = Invocation::new(true);
+            inv.defer_writer("snapshot".into(), take);
             let calls = std::cell::RefCell::new(Vec::new());
             let result = lossless(
+                &mut inv,
                 dry_run,
-                true,
                 || {
-                    calls
-                        .borrow_mut()
-                        .push(WRITER.with_borrow(|writer| matches!(writer, Writer::Held(_))));
+                    calls.borrow_mut().push(TAKEN.get());
                     Ok(7u8)
                 },
                 |_| String::new(),
             );
             assert_eq!(*calls.borrow(), expected);
             assert_eq!(result.unwrap(), (!dry_run).then_some(7u8));
-            let preview = RESPONSE.take();
+            let preview = inv.response.take();
             assert_eq!(preview.is_some(), dry_run);
             assert!(preview.is_none_or(|value| value.get("token").is_none()));
-            WRITER.set(Writer::NotDeferred);
         }
     }
 
@@ -1210,10 +1120,9 @@ mod tests {
         assert!(replan_refusal(&[], true).is_none());
         for (confirmed, code) in [(true, 3), (false, 1)] {
             zfs_tools::engine::effect::reset();
-            RESPONSE.set(None);
             let refusal = replan_refusal(&["bpool".into()], confirmed).unwrap();
             assert_eq!(crate::consent::is_stale(refusal.as_ref()), confirmed);
-            assert_eq!(finish(Err(refusal), false, "sync"), code);
+            assert_eq!(finish(Err(refusal), None, false, "sync"), code);
         }
     }
 
@@ -1224,51 +1133,26 @@ mod tests {
     }
 
     #[test]
-    fn a_library_cli_invocation_clears_previous_deferred_writer_state() {
-        defer_writer("previous invocation".into(), |_| {
-            panic!("previous writer must be cleared")
-        });
-        assert_eq!(main(["zboot", "--version"]), 0);
-        assert!(WRITER.with_borrow(|writer| matches!(writer, Writer::NotDeferred)));
-    }
-
-    #[test]
     fn successive_menu_commands_restore_the_session_and_clear_their_effects() {
-        reset_invocation();
-        let outer_response = serde_json::json!({"session": "outer"});
-        RESPONSE.set(Some(outer_response.clone()));
-        defer_writer("outer session".into(), |_| Ok(None));
+        zfs_tools::engine::effect::reset();
         zfs_tools::engine::effect::operation_hint("outer operation");
         for previous_effect in [false, true] {
             if previous_effect {
                 zfs_tools::engine::effect::mark();
             }
             {
-                let _session = MenuInvocation::new();
-                reset_invocation();
+                let _session = MenuEffects::new();
                 assert!(!zfs_tools::engine::effect::any());
                 assert!(zfs_tools::engine::effect::operation_hints().is_empty());
-                assert!(RESPONSE.with_borrow(Option::is_none));
-                defer_writer("inner command".into(), |_| Ok(None));
-                assert!(writer_for(&()).unwrap());
                 zfs_tools::engine::effect::mark();
                 zfs_tools::engine::effect::operation_hint("inner operation");
-                RESPONSE.set(Some(serde_json::json!({"command": "inner"})));
             }
             assert_eq!(zfs_tools::engine::effect::any(), previous_effect);
             assert_eq!(
                 zfs_tools::engine::effect::operation_hints(),
                 vec!["outer operation"]
             );
-            assert_eq!(
-                RESPONSE.with_borrow(Clone::clone),
-                Some(outer_response.clone())
-            );
-            assert!(WRITER.with_borrow(|writer| matches!(
-                writer,
-                Writer::Deferred { purpose, .. } if purpose == "outer session"
-            )));
         }
-        reset_invocation();
+        zfs_tools::engine::effect::reset();
     }
 }

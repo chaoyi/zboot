@@ -12,8 +12,8 @@ ID = 'DEPLOY-INTO'
 GROUP = 'deploy'
 SECONDS = 7200
 DISKS = {'A': 2, 'B': 2, 'D': 8}
-BOOTS = [Boot(1, cut='INTO-FACTORY', udev=True, extra={'setup': 'neutral'}),
-         Boot(2, udev=True, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1, cut='INTO-FACTORY', udev=True),
+         Boot(2, udev=True),
          Boot(3, efi=True, poweroff=True, extra={'from': 'D'})]
 POOL, OLD, BE, HALF = 'e2ed', 'e2ed/ROOT/old', 'e2ed/ROOT/new', 'e2ed/ROOT/interrupted'
 

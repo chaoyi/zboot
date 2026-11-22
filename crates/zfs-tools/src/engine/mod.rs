@@ -3,28 +3,22 @@
 //! dataset and snapshot identities and recognizes boot/pair metadata so every
 //! writer respects the same guards. Callers coordinate multi-step writes through
 //! the host writer lock; sequential native observations are not atomic.
-#[cfg(feature = "internal")]
 pub mod attachment;
 pub(crate) mod bounded;
 pub mod capture;
 pub mod delete;
 pub(crate) mod dispatch;
 pub mod effect;
-#[cfg(feature = "internal")]
 pub mod hold;
-#[cfg(feature = "internal")]
 pub mod intent;
 pub mod lock;
 pub mod management;
-#[cfg(feature = "internal")]
 pub mod mountinfo;
-#[cfg(feature = "internal")]
 pub mod mutation;
 pub mod native;
 pub mod operation;
 pub(crate) mod protection;
 pub mod state;
-#[cfg(feature = "internal")]
 pub mod stream;
 
 use serde::{Deserialize, Serialize};
@@ -241,7 +235,6 @@ observation!(Inspection {
 impl Inspection {
     /// Select a presentation scope from an already complete native observation.
     /// This cannot turn a partial inventory into complete mutation evidence.
-    #[cfg(feature = "internal")]
     pub fn select(&self, request: &InspectRequest) -> Result<Self, Error> {
         if !self.requested_datasets.is_empty() {
             return Err(Error::Inconsistent(
@@ -326,7 +319,6 @@ impl std::error::Error for Error {}
 /// Inspect already-imported pools and datasets using native read-only commands.
 /// Empty imported inventory succeeds only for an unscoped request. Snapshot
 /// history is `None` when not requested and `Some([])` when observed empty.
-#[cfg(feature = "internal")]
 pub fn inspect(request: &InspectRequest) -> Result<Inspection, Error> {
     native::inspect_with(request, native::run)
 }
@@ -424,7 +416,6 @@ pub fn validate_snapshot_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 /// Observe one current snapshot. A failed native query is never reported as absence.
-#[cfg(feature = "internal")]
 pub fn observe_snapshot(name: &str) -> Result<Snapshot, Error> {
     native::observe_with(name, &mut native::run)
 }
@@ -432,7 +423,6 @@ pub fn observe_snapshot(name: &str) -> Result<Snapshot, Error> {
 /// An explicitly queried encrypted snapshot IV-set identity. This observation
 /// alone does not establish topology, cipher, or complete raw-receive admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg(feature = "internal")]
 pub struct SnapshotIvset {
     pub point: SnapshotRef,
     pub ivset_guid: Guid,
@@ -441,7 +431,6 @@ pub struct SnapshotIvset {
 /// Referenced space newly written since an exact snapshot. This is a native
 /// accounting metric, not proof of an unchanged head or writer quiescence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg(feature = "internal")]
 pub struct WrittenSince {
     pub dataset_name: String,
     pub dataset_identity: DatasetIdentity,
@@ -451,12 +440,10 @@ pub struct WrittenSince {
 
 /// Opt into the backend's hidden `ivsetguid` property. Unsupported, missing or
 /// zero observations refuse; ordinary inventory does not require this capability.
-#[cfg(feature = "internal")]
 pub fn observe_snapshot_ivset(point: &SnapshotRef) -> Result<SnapshotIvset, Error> {
     native::observe_ivset_with(point, native::run)
 }
 
-#[cfg(feature = "internal")]
 pub fn observe_written_since(dataset: &Dataset, base: &SnapshotRef) -> Result<WrittenSince, Error> {
     native::observe_written_since_with(dataset, base, native::run)
 }

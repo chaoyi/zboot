@@ -46,7 +46,6 @@ fn inherit_writer(command: &mut Command) -> Result<(), Error> {
 
 /// Set this invocation's explicit verbosity, returning the previous value so
 /// a caller that temporarily enables diagnostics can restore it afterwards.
-#[cfg(feature = "internal")]
 pub fn set_verbose(value: bool) -> bool {
     VERBOSE.swap(value, Ordering::SeqCst)
 }
@@ -91,7 +90,6 @@ pub struct Announced<'a>(&'a mut Command);
 impl<'a> Announced<'a> {
     /// Announce a child whose argv may carry credentials: one fixed line
     /// naming `what`, with no arguments and no change to its environment.
-    #[cfg(feature = "internal")]
     pub fn withheld(command: &'a mut Command, what: &str) -> Self {
         if verbose() {
             let _ = writeln!(std::io::stderr().lock(), "+ {what} (arguments withheld)");
@@ -106,7 +104,6 @@ impl<'a> Announced<'a> {
             .map_err(|error| launch_failure(self.0, "could not start", error))
     }
 
-    #[cfg(feature = "internal")]
     #[allow(clippy::disallowed_methods, reason = "the announced launch")]
     pub fn status(self) -> std::io::Result<std::process::ExitStatus> {
         // Spawn and wait separately so only a failed start is named one.
@@ -117,7 +114,6 @@ impl<'a> Announced<'a> {
         child.wait()
     }
 
-    #[cfg(any(test, feature = "internal"))]
     #[allow(clippy::disallowed_methods, reason = "the announced launch")]
     pub fn output(self) -> std::io::Result<std::process::Output> {
         // Std's `output` pipes unset streams, so it is not rebuilt from `spawn`;
@@ -128,7 +124,6 @@ impl<'a> Announced<'a> {
     }
 
     /// Replace this process with the child; returns only on failure.
-    #[cfg(feature = "internal")]
     #[allow(clippy::disallowed_methods, reason = "the announced launch")]
     pub fn exec(self) -> std::io::Error {
         let error = std::os::unix::process::CommandExt::exec(self.0);
@@ -1043,7 +1038,6 @@ fn subtree(
 /// Read explicit recursive roots and exact authority ancestors without a
 /// global pool/dataset/snapshot sweep. Dependencies are present in the result,
 /// while requested_datasets remains the selected read-only scope's roots.
-#[cfg(feature = "internal")]
 pub(crate) fn inspect_readonly_scope_with(
     selected_roots: &[String],
     recursive_roots: &[String],
@@ -1207,7 +1201,6 @@ pub fn resolve_with(
 /// All native queries are sequential; exclusive execution and fresh drift checks
 /// remain the caller's responsibility. The property is opt-in because backend
 /// support must be earned with native acceptance, not inferred from CLI parsing.
-#[cfg(feature = "internal")]
 pub fn observe_ivset_with(
     point: &SnapshotRef,
     mut run: impl FnMut(&'static str, &[String]) -> Result<String, Error>,
@@ -1248,7 +1241,6 @@ pub fn observe_ivset_with(
 /// Positive bytes are evidence of newly referenced writes; zero is only an
 /// accounting observation, never permission to overwrite or proof of no change.
 /// Identity checks detect replacement, but do not fence concurrent head writes.
-#[cfg(feature = "internal")]
 pub fn observe_written_since_with(
     dataset: &Dataset,
     base: &SnapshotRef,
@@ -1298,7 +1290,6 @@ pub fn observe_written_since_with(
     })
 }
 
-#[cfg(feature = "internal")]
 fn revalidate_head(
     dataset: &Dataset,
     run: &mut impl FnMut(&'static str, &[String]) -> Result<String, Error>,
@@ -1320,7 +1311,6 @@ fn revalidate_head(
     Ok(())
 }
 
-#[cfg(feature = "internal")]
 fn exact_properties_with(
     name: &str,
     properties: &[&str],
@@ -1356,7 +1346,6 @@ fn exact_properties_with(
     Ok(result)
 }
 
-#[cfg(feature = "internal")]
 fn check_property_identity(
     props: &BTreeMap<String, String>,
     guid: Guid,
@@ -1866,7 +1855,6 @@ mod tests {
         assert_eq!(&volume[0].canmount, &None);
         assert_eq!(&volume[0].volume_size_bytes, &Some(1024));
     }
-    #[cfg(feature = "internal")]
     fn exact_property_fixture<'a>(
         property_output: &'a str,
     ) -> impl FnMut(&'static str, &[String]) -> Result<String, Error> + 'a {
@@ -1887,13 +1875,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "internal")]
     const IVSET: &str = "tank@s\tguid\t789\ntank@s\tcreatetxg\t30\ntank@s\tobjsetid\t40\ntank@s\tivsetguid\t18446744073709551615\n";
-    #[cfg(feature = "internal")]
     const WRITTEN: &str =
         "tank\tguid\t456\ntank\tcreatetxg\t5\ntank\tobjsetid\t6\ntank\twritten@s\t0\n";
 
-    #[cfg(feature = "internal")]
     #[test]
     fn explicit_ivset_observation_preserves_exact_identity_and_full_u64() {
         let observed = observe_ivset_with(&point(), exact_property_fixture(IVSET)).unwrap();
@@ -1905,7 +1890,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "internal")]
     #[test]
     fn ivset_unknown_zero_incomplete_and_substituted_properties_refuse() {
         for output in [
@@ -1927,7 +1911,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "internal")]
     #[test]
     fn unsupported_ivset_query_and_postquery_identity_drift_never_succeed() {
         let mut fixture = exact_property_fixture(IVSET);
@@ -1956,7 +1939,6 @@ mod tests {
         assert!(matches!(changed, Err(Error::Inconsistent(_))));
     }
 
-    #[cfg(feature = "internal")]
     #[test]
     fn written_since_observation_binds_base_and_head_without_inventing_clean_state() {
         let dataset = parse_datasets(
@@ -1994,7 +1976,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "internal")]
     #[test]
     fn written_observation_rechecks_head_after_query() {
         let dataset = parse_datasets(
@@ -2072,7 +2053,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "internal")]
 #[path = "native_verbose_tests.rs"]
 mod verbose_tests;
 

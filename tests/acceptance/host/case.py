@@ -26,7 +26,7 @@ import time
 
 from host.channel import Channel
 from host.console import Console, ConsoleError
-from host.vm import Vm, accelerator_config, default_memory_mib
+from host.vm import Vm, default_memory_mib
 
 
 @dataclass
@@ -172,7 +172,6 @@ def run(module, run_dir, boot_for, out_share):
     """boot_for(boot) -> dict for Vm(boot=...). Returns the result record."""
     if not module.BOOTS:
         raise RuntimeError(f'{module.ID}: no boots declared')
-    config = accelerator_config()
     deadline = time.monotonic() + module.SECONDS
     run_dir.mkdir(mode=0o700)
     out = run_dir / 'out'
@@ -254,7 +253,6 @@ def run(module, run_dir, boot_for, out_share):
         except (KeyError, ValueError, OSError) as e:
             check(False, f'evidence incomplete: {e}')
     result = {'id': module.ID, 'pass': not check.failures, 'assertions': check.count,
-              'failures': check.failures, 'boots': boots, 'accelerator': config,
-              'qualification': not config['experimental']}
+              'failures': check.failures, 'boots': boots}
     (run_dir / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     return result

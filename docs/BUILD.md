@@ -42,7 +42,8 @@ in `dist/build.lock`, and:
    `zboot-probe-signatures` and `zboot-change-key` with Cargo, both dynamically
    linked for the GNU target (against the root's libblkid and the
    libzfs_core.so.3 that zfsutils-linux brings), and stages the runtime with
-   `dist/initramfs/stage-runtime.sh` as the initramfs root: the named tools, their
+   `dist/initramfs/stage-runtime.sh` as the initramfs root: the tools its table
+   names at their fixed Debian paths in the build root, the two helpers, their
    required shared libraries and loaders, the selected firmware and the kernel's module tree;
 4. collects the actual Debian package/source identities, notices and matching
    source archives, the crate and pinned Rust runtime notices, and local copies
@@ -76,22 +77,21 @@ in `dist/build.lock`, and:
 V is `CRATE+gitTIME.SOURCE`: the crate version, the source time as
 `YYYYMMDDHHMMSS` (UTC) and the first 12 hex digits of the source digest, for
 example `0.2.0+git20261119191621.943cb044d0ef`. dpkg compares TIME as a
-number, so a build from a later commit sorts later and installs as an
-upgrade; the `git` prefix also puts every V above the earlier `CRATE+SOURCE`
-versions. The same inputs give the same V: TIME is the committer time of
-`git log -1 -- INPUTS`, so a commit outside the inputs changes neither TIME
-nor the digest. Uncommitted changes to the inputs keep their last commit's
-TIME and only change the digest, which orders them arbitrarily against
-each other. A tree that has `dist/source-time` (one `YYYYMMDDHHMMSS` line)
-uses that file as is, so the project copy in `corresponding-source.tar.zst`
-rebuilds at its own version; without it, dist.sh refuses a tree outside Git
-and a shallow clone. The `zboot` executable embeds V, and `zboot factory`
-packages itself at it. `zboot --version` prints `zboot CRATE (source SOURCE)`. The
-package's other fields, including `Depends`, are `dist/deb/control`.
-`dist/deb/preinst` refuses to install or upgrade the package while any zboot
-operation is pending on an imported pool (a `zboot:operation` record), and
-lists them: finish or abandon them with the installed zboot first. When there is no `zfs` command, or `zfs get` fails (no
-module loaded), it lets the install proceed.
+number, so a build from a later commit installs as an upgrade (the `git`
+prefix also sorts every V above the earlier `CRATE+SOURCE` versions). TIME is
+the committer time of `git log -1 -- INPUTS`, so the same inputs give the same
+V and a commit outside the inputs changes neither TIME nor the digest;
+uncommitted changes keep their last commit's TIME and only change the digest.
+A tree with `dist/source-time` (one `YYYYMMDDHHMMSS` line) uses that file, so
+the project copy in `corresponding-source.tar.zst` rebuilds at its own
+version; without it, dist.sh refuses a tree outside Git and a shallow clone.
+The `zboot` executable embeds V, and `zboot factory` packages itself at it;
+`zboot --version` prints `zboot CRATE (source SOURCE)`. The package's other
+fields, including `Depends`, are `dist/deb/control`. `dist/deb/preinst`
+refuses to install or upgrade while any zboot operation is pending on an
+imported pool, and lists them: finish or abandon them with the installed
+zboot first. With no `zfs` command, or no module loaded, it lets the install
+proceed.
 
 `SOURCE_DATE_EPOCH` is the snapshot time, and the initramfs is a sorted cpio
 with zeroed times. Nothing is signed: not the UKI, not the DKMS modules.
@@ -145,21 +145,14 @@ loads an explicit wired-driver list in zboot's
 `crates/zboot/src/menu/menu_connect.rs`, while storage has its own list in
 `dist/initramfs/init.sh`.
 
-Publish the source asset alongside the UKI and Debian package. No dependency
-source tree belongs in Git. The source asset also contains the kernel config
-and local copies of Cargo dependencies; its project `.cargo/config.toml` selects that
-sibling vendor directory for offline Cargo rebuilds. Source collection uses
-`deb-src` from the same signed snapshot; missing exact versions fail the
-build. See [Licenses and source access](#licenses-and-source-access) for
-notice scope and distribution requirements.
-
-For a general source snapshot, `git archive` exports the tracked files.
-The distribution builder instead selects the inputs listed above; it includes
-only this guide from `docs/`. To share source without private development
-history, use a fresh publication repository as described below.
-
 Crates come from `cargo fetch --locked`, so Cargo checks each one against
-`Cargo.lock`; the compile itself is offline.
+`Cargo.lock`; the compile itself is offline. Debian sources come from
+`deb-src` in the same signed snapshot; a missing exact version fails the
+build. No dependency source tree belongs in Git: the source asset carries the
+Debian sources, the kernel config and local copies of the crates, and its
+project `.cargo/config.toml` selects that vendor directory for offline
+rebuilds. It includes only this guide from `docs/`; a source snapshot of the
+whole tree is [published separately](#publishing-a-source-snapshot).
 
 ## Licenses and source access
 
@@ -179,13 +172,12 @@ runtime inputs, binary versions and matching source-package identities.
 The project license does not replace these dependencies' licenses; a complete
 UKI is a collection of separately licensed components.
 
-When distributing binaries, share `corresponding-source.tar.zst` with the
-matching UKI or Debian package and keep it available alongside binary
-downloads. Preserve bundled license notices, including firmware notices.
-The supplied sources and build instructions must support rebuilding the
-static programs with modified LGPL libraries. The build stops if required
-notices or sources cannot be collected. These extra release steps are not
-needed for source-only publication.
+When distributing binaries, publish `corresponding-source.tar.zst` with the
+matching UKI or Debian package and keep it available alongside them. Preserve
+bundled license notices, including firmware notices. The supplied sources and
+build instructions must support rebuilding the static programs with modified
+LGPL libraries. The build stops if required notices or sources cannot be
+collected. Source-only publication needs none of this.
 
 ## Releases
 
@@ -252,11 +244,9 @@ git -C DIR push origin HEAD
 ```
 
 The push sends only the new tree, never this repository's history. Do not
-rewrite public history once a release tag names a commit.
-
-The source snapshot and the distribution's `corresponding-source.tar.zst`
-have different scopes. Publish matching distribution source and notices
-alongside any UKI or Debian package, as described above.
+rewrite public history once a release tag names a commit. The source snapshot
+does not replace the distribution's `corresponding-source.tar.zst`, which
+goes with any UKI or Debian package.
 
 ## Root tars
 
@@ -265,22 +255,18 @@ OUT/usr/bin/zboot factory ROOT.tar.zst [--packages PKG,...] [--snapshot TIME]
 ```
 
 `factory` writes a Debian root tar and `ROOT.tar.zst.packages` beside it, as
-an ordinary user on a running system (it refuses to run in the UKI). Neither
-file may exist. CLI.md lists its options, its package floor and what its
-finish step removes and regenerates. `ZBOOT_JOBS` bounds the factory root's DKMS
-compiler jobs, using the same 1–99 range and default of 8 as the distribution
-build. An empty value also uses the default; invalid values are refused before
-staging begins.
+an ordinary user on a running system (it refuses to run in the UKI);
+[CLI.md](CLI.md#factory) gives its options and what it installs and removes.
+`ZBOOT_JOBS` bounds the root's DKMS compiler jobs (1–99, default 8 when unset
+or empty); an invalid value is refused before staging. It needs:
 
-It needs:
-
-- the installation it runs from. Beside the executable: `zboot` and
-  `zsnap`. Under `../sbin`: `zboot-probe-signatures` and
-  `zboot-change-key`. Under `../lib`:
-  `zboot/zboot.efi` and `tmpfiles.d/zfs-tools.conf`. Under
-  `../share/doc`: `zboot/` with its notices and component inventory. A
-  missing piece is refused by its path before any work. Run `OUT/usr/bin/zboot` from a `dist/dist.sh` output, or
-  the installed `/usr/bin/zboot`;
+- the installation it runs from: `zboot` and `zsnap` beside the executable,
+  `zboot-probe-signatures` and `zboot-change-key` under `../sbin`,
+  `zboot/zboot.efi` and `tmpfiles.d/zfs-tools.conf` under `../lib`, and
+  `zboot/` with its notices and component inventory under `../share/doc`. A
+  missing piece is refused by its path before any work. Run
+  `OUT/usr/bin/zboot` from a `dist/dist.sh` output, or the installed
+  `/usr/bin/zboot`;
 - `mmdebstrap` (unshare mode, as above) and `dpkg-deb`;
 - a work directory under `$TMPDIR` (default `/var/tmp`) that other users can
   traverse;
@@ -298,9 +284,8 @@ initrd: the menu passes `spl.spl_hostid` at every handoff.
 
 ## Source layout and entry points
 
-Run commands from the repository root. `justfile` supplies optional shortcuts
-for builds, tests and formatting. `just test` runs the offline suite. The
-recipes call Cargo and the scripts below rather than duplicating their logic.
+Run commands from the repository root. The optional `justfile` recipes call
+Cargo and the scripts below rather than duplicating their logic.
 
 | Owner | Entry points and helpers |
 |---|---|

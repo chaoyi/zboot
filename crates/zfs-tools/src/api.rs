@@ -278,7 +278,6 @@ impl WriterSession {
 
     /// Unsupported: zsnap runs its reader view setup and teardown under this
     /// session's writer custody.
-    #[cfg(feature = "internal")]
     #[doc(hidden)]
     pub fn with_native_writer_mut<T>(
         &mut self,
@@ -295,9 +294,7 @@ impl WriterSession {
     /// Wait for the standard host writer lock. Delegated writers join the same
     /// existing inode; an unavailable lock is a refusal.
     pub fn acquire(purpose: &str) -> Result<Self, Error> {
-        let held = lock::for_command("zfs-tools", purpose)
-            .map_err(lock_error)?
-            .ok_or_else(|| Error::new("writer session requires actual lock custody"))?;
+        let held = lock::for_command("zfs-tools", purpose).map_err(lock_error)?;
         Ok(Self {
             held,
             poisoned: None,
@@ -488,7 +485,6 @@ impl CaptureOutcome {
     }
     /// Unsupported: a report for the workspace applications' own tests. It
     /// grants no authority; only native capture produces real outcomes.
-    #[cfg(feature = "internal")]
     #[doc(hidden)]
     pub fn from_parts(
         operation_id: String,

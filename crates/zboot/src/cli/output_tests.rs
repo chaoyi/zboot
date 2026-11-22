@@ -1,4 +1,5 @@
-use super::run::{Incomplete, consent_to, defer_writer, finish, json_response, lossless, run};
+use super::grammar::Consent;
+use super::run::{Incomplete, Invocation, consent_to, json_response, lossless, run};
 use crate::consent::{Envelope, Outcome, Typed};
 use std::{fs, io::Write, os::unix::fs::PermissionsExt, process::Command};
 
@@ -157,17 +158,20 @@ fn child(name: &str) -> ! {
         libc::STDOUT_FILENO
     );
     zfs_tools::engine::effect::reset();
+    let mut inv = Invocation::new(true);
     let args: Vec<String> = serde_json::from_str(&std::env::var(ARGS).unwrap()).unwrap();
     let code = match name {
         "run" => run(args, |_| Ok(None)),
         "closed_stdin" => {
             assert_eq!(unsafe { libc::close(libc::STDIN_FILENO) }, 0);
             for dry_run in [true, false] {
-                defer_writer("test confirmation".into(), |_| Ok(None));
+                inv.defer_writer("test confirmation".into(), |_| Ok(None));
                 let result = consent_to(
-                    dry_run,
-                    (!dry_run).then(|| TOKEN.into()),
-                    true,
+                    &mut inv,
+                    Consent {
+                        dry_run,
+                        confirm: (!dry_run).then(|| TOKEN.into()),
+                    },
                     || Ok(7u8),
                     |_| Ok(TOKEN.into()),
                     |_, _| String::new(),
@@ -179,8 +183,8 @@ fn child(name: &str) -> ! {
                 .unwrap();
                 assert_eq!(result.is_some(), !dry_run);
             }
-            json_response(Envelope::new(Outcome::Applied, None, ())).unwrap();
-            finish(Ok(()), true, "test")
+            json_response(&mut inv, Envelope::new(Outcome::Applied, None, ())).unwrap();
+            inv.finish(Ok(()), "test")
         }
         "typed_input" => {
             use std::io::{Read, Write};
@@ -208,17 +212,17 @@ fn child(name: &str) -> ! {
                 .write_all(b"target\nlock fence\nnext command\n")
                 .unwrap();
             ADMISSION_ORDER.set(Vec::new());
-            defer_writer("test typed answer".into(), typed_input_lock);
+            inv.defer_writer("test typed answer".into(), typed_input_lock);
             let selected = consent_to(
-                false,
-                None,
-                true,
+                &mut inv,
+                Consent {
+                    dry_run: false,
+                    confirm: None,
+                },
                 || {
                     if ADMISSION_ORDER.with_borrow(Vec::is_empty) {
-                        assert!(!super::run::writer_is_held_for_test());
                         admission_event("plan");
                     } else {
-                        assert!(super::run::writer_is_held_for_test());
                         admission_event("replan");
                     }
                     assert!(!zfs_tools::engine::effect::any());
@@ -233,7 +237,7 @@ fn child(name: &str) -> ! {
             )
             .unwrap();
             assert!(selected.is_some());
-            assert!(super::run::writer_is_held_for_test());
+            assert!(inv.writer_held());
             assert_eq!(
                 ADMISSION_ORDER.with_borrow(Clone::clone),
                 ["plan", "typed answer consumed", "lock", "replan"]
@@ -251,7 +255,7 @@ fn child(name: &str) -> ! {
                 .read_exact(&mut remaining)
                 .unwrap();
             assert_eq!(&remaining, b"next command\n");
-            finish(Ok(()), true, "test")
+            inv.finish(Ok(()), "test")
         }
         "writer_admission" => {
             // Exercise the shared consent and lossless -> writer gates. No pools
@@ -273,20 +277,22 @@ fn child(name: &str) -> ! {
                 for (dry_run, confirm, expected) in cases {
                     ADMISSION_ORDER.set(Vec::new());
                     zfs_tools::engine::effect::reset();
-                    defer_writer("test direct mutation".into(), refuse_admission_lock);
+                    let mut inv = Invocation::new(true);
+                    inv.defer_writer("test direct mutation".into(), refuse_admission_lock);
                     let plan = || {
                         admission_event("plan");
-                        assert!(!super::run::writer_is_held_for_test());
                         Ok(7u8)
                     };
                     let selected = if lossless_verb {
-                        lossless(dry_run, true, plan, |_| String::new())
+                        lossless(&mut inv, dry_run, plan, |_| String::new())
                             .map(|selected| selected.map(|plan| (plan, String::new())))
                     } else {
                         consent_to(
-                            dry_run,
-                            confirm.clone(),
-                            true,
+                            &mut inv,
+                            Consent {
+                                dry_run,
+                                confirm: confirm.clone(),
+                            },
                             plan,
                             |_| Ok(TOKEN.into()),
                             |_, _| String::new(),
@@ -324,13 +330,13 @@ fn child(name: &str) -> ! {
                         );
                     }
                     assert_eq!(ADMISSION_ORDER.with_borrow(Clone::clone), expected);
-                    assert!(!super::run::writer_is_held_for_test());
+                    assert!(!inv.writer_held());
                     assert!(!zfs_tools::engine::effect::any());
                     assert!(!root.join("changed").exists());
                 }
             }
-            json_response(Envelope::new(Outcome::Applied, None, ())).unwrap();
-            finish(Ok(()), true, "test")
+            json_response(&mut inv, Envelope::new(Outcome::Applied, None, ())).unwrap();
+            inv.finish(Ok(()), "test")
         }
         "verbose_successive" => {
             assert!(!zfs_tools::engine::native::set_verbose(false));
@@ -367,9 +373,11 @@ fn child(name: &str) -> ! {
         }),
         "stale" | "unconfirmed" => {
             let result = consent_to(
-                false,
-                (name == "stale").then(|| "old token".into()),
-                true,
+                &mut inv,
+                Consent {
+                    dry_run: false,
+                    confirm: (name == "stale").then(|| "old token".into()),
+                },
                 || Ok(7u8),
                 |_| Ok(TOKEN.into()),
                 |_, token| format!("Plan token {token}\n"),
@@ -378,10 +386,10 @@ fn child(name: &str) -> ! {
                     text: "target".into(),
                 },
             );
-            finish(result.map(|_| ()), true, "fork")
+            inv.finish(result.map(|_| ()), "fork")
         }
         "stale_replan" | "stale_after_effect" => {
-            defer_writer(
+            inv.defer_writer(
                 "fork".into(),
                 if name == "stale_after_effect" {
                     |_| {
@@ -395,9 +403,11 @@ fn child(name: &str) -> ! {
             );
             let calls = std::cell::Cell::new(0u8);
             let result = consent_to(
-                false,
-                Some("planned-1".into()),
-                true,
+                &mut inv,
+                Consent {
+                    dry_run: false,
+                    confirm: Some("planned-1".into()),
+                },
                 || {
                     let value = calls.get() + 1;
                     calls.set(value);
@@ -410,16 +420,18 @@ fn child(name: &str) -> ! {
                     text: "target".into(),
                 },
             );
-            finish(result.map(|_| ()), true, "fork")
+            inv.finish(result.map(|_| ()), "fork")
         }
         "matching_after_delay" => {
             let preview = crate::consent::token(&7u8).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
-            defer_writer("pair".into(), |_| Ok(None));
+            inv.defer_writer("pair".into(), |_| Ok(None));
             let result = consent_to(
-                false,
-                Some(preview),
-                true,
+                &mut inv,
+                Consent {
+                    dry_run: false,
+                    confirm: Some(preview),
+                },
                 || Ok(7u8),
                 crate::consent::token,
                 |_, token| format!("Plan token {token}\n"),
@@ -429,17 +441,17 @@ fn child(name: &str) -> ! {
                 },
             );
             assert!(matches!(result, Ok(Some(_))));
-            finish(result.map(|_| ()), true, "pair")
+            inv.finish(result.map(|_| ()), "pair")
         }
         "nonloss_stale" => {
             let result = super::pairs::consent(
                 7u8,
                 false,
-                super::pairs::ConsentFlags {
+                Consent {
                     dry_run: false,
                     confirm: Some("old token".into()),
-                    json: true,
                 },
+                &mut inv,
                 || Ok(7u8),
                 crate::consent::token,
                 |_, token| format!("Plan token {token}\n"),
@@ -448,10 +460,10 @@ fn child(name: &str) -> ! {
                     text: "target".into(),
                 },
             );
-            finish(result.map(|_| ()), true, "primary")
+            inv.finish(result.map(|_| ()), "primary")
         }
         "lossless_apply" | "lossless_dry_run" => {
-            defer_writer("snapshot".into(), |_| {
+            inv.defer_writer("snapshot".into(), |_| {
                 let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
                 fs::write(root.join("review-lock"), b"held").unwrap();
                 Ok(None)
@@ -459,8 +471,8 @@ fn child(name: &str) -> ! {
             let dry_run = name == "lossless_dry_run";
             let calls = std::cell::Cell::new(0);
             let result = lossless(
+                &mut inv,
                 dry_run,
-                true,
                 || {
                     calls.set(calls.get() + 1);
                     Ok(if root.join("review-lock").exists() {
@@ -479,11 +491,11 @@ fn child(name: &str) -> ! {
                     assert_eq!(name, "lossless_apply");
                     assert_eq!(plan, 2);
                     fs::write(root.join("changed"), b"applied the locked plan")?;
-                    json_response(Envelope::new(Outcome::Applied, None, plan))?;
+                    json_response(&mut inv, Envelope::new(Outcome::Applied, None, plan))?;
                 }
                 Ok(())
             });
-            finish(result, true, "snapshot")
+            inv.finish(result, "snapshot")
         }
         "sync_all_admissions_failed" => {
             let entries = vec![crate::pairs::SyncEntry {
@@ -496,23 +508,22 @@ fn child(name: &str) -> ! {
                 &crate::pairs::SyncTarget::All,
                 entries,
                 "frozen-token".into(),
-                true,
+                &mut inv,
             );
             assert!(!zfs_tools::engine::effect::any());
-            finish(result, true, "sync")
+            inv.finish(result, "sync")
         }
         "partial" => {
-            json_response(Envelope::new(
-                Outcome::Partial,
-                None,
-                serde_json::json!({"complete":false}),
-            ))
-            .unwrap();
-            finish(
-                Err(Incomplete("incomplete result".into()).into()),
-                true,
-                "sync",
+            json_response(
+                &mut inv,
+                Envelope::new(
+                    Outcome::Partial,
+                    None,
+                    serde_json::json!({"complete":false}),
+                ),
             )
+            .unwrap();
+            inv.finish(Err(Incomplete("incomplete result".into()).into()), "sync")
         }
         "effect" | "resume_effect" | "record_removed" => {
             if name != "effect" {
@@ -527,26 +538,21 @@ fn child(name: &str) -> ! {
                     root.join("changed").to_string_lossy().into_owned(),
                 ],
             );
-            finish(
+            inv.finish(
                 result
                     .map(drop)
                     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
-                true,
                 "sync",
             )
         }
         "resume_admission" => {
             zfs_tools::engine::effect::operation_hint(ID);
             assert!(!zfs_tools::engine::effect::any());
-            finish(Err("resume admission refused".into()), true, "resume")
+            inv.finish(Err("resume admission refused".into()), "resume")
         }
         "chroot" => {
             zfs_tools::engine::effect::mark();
-            finish(
-                Err(crate::maintenance::CommandExit(23).into()),
-                false,
-                "chroot",
-            )
+            Invocation::new(false).finish(Err(crate::maintenance::CommandExit(23).into()), "chroot")
         }
         _ => panic!("unknown child case {name}"),
     };

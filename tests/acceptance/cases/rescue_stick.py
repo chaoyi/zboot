@@ -3,45 +3,35 @@ The two constructor hostid routes and every image are private to this case.
 """
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import struct
-import subprocess
 
-from cases.efi_connect import command
 from host.case import Boot, Evidence
 from host.console import ConsoleError
+from host.deploy import RESCUE_PACKAGES as PACKAGES
+from host.ssh import command, keygen, keyscan, password_env, ssh_argv, write_askpass
 from host.vm import ImageInput
 
 ID = 'RESCUE-STICK'
 GROUP = 'deploy'
 SECONDS = 5400
 DISKS = {'A': 2, 'B': 2, 'D': 2}
-BOOTS = [Boot(1, udev=True, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1, udev=True),
          Boot(2, efi=True, network=True, extra={'case_images': 'parameter'}),
          Boot(3, efi=True, network=True, fresh_disks=True, extra={'case_images': 'parameter'}),
          Boot(4, efi=True, network=True, fresh_disks=True, extra={'case_images': 'file'}),
          Boot(5, efi=True, fresh_disks=True, extra={'case_images': 'copies'})]
 ROOT = 'stick/ROOT/rescue'
 PROMPT = 'rescue-root# '
-PACKAGES = {'openssh-server', 'systemd-resolved', 'ca-certificates', 'curl', 'rsync',
-            'less', 'vim-tiny', 'pciutils', 'usbutils', 'smartmontools', 'cryptsetup'}
 
 
 def prepare(run_dir):
-    result = subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
-                             '-f', str(run_dir / 'login')], capture_output=True, timeout=30)
-    run_dir.joinpath('keygen.out').write_bytes(result.stdout)
-    run_dir.joinpath('keygen.err').write_bytes(result.stderr)
-    if result.returncode:
-        raise RuntimeError('rescue fixture key generation failed')
+    keygen(run_dir, 'login')
     public = run_dir / 'public'
     public.mkdir(mode=0o700)
     public.joinpath('authorized_keys').write_bytes(run_dir.joinpath('login.pub').read_bytes())
-    askpass = run_dir / 'askpass'
-    askpass.write_text('#!/bin/sh\nprintf "%s\\n" "$ZT_RESCUE_PASSWORD"\n')
-    askpass.chmod(0o700)
+    write_askpass(run_dir)
     run_dir.joinpath('rescue-inputs.json').write_text(json.dumps({
         'public_key_sha256': hashlib.sha256(public.joinpath('authorized_keys').read_bytes()).hexdigest(),
         'qemu_boots': len(BOOTS), 'factory_recipe_packages': sorted(PACKAGES),
@@ -68,19 +58,6 @@ def images(run_dir, boot):
         # The runner materializes two independent copies, never hard links.
         attached.append(ImageInput(relative, facts[0], size, 'RESCUE-COPY'))
     return attached
-
-
-def ssh_args(console, known, password=False):
-    args = ['/usr/bin/ssh', '-F', '/dev/null', '-p', console.ssh_port,
-            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={known}',
-            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10',
-            '-o', 'ConnectionAttempts=1', '-o', 'LogLevel=ERROR', '-o', 'NumberOfPasswordPrompts=1']
-    if password:
-        args += ['-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password',
-                 '-o', 'KbdInteractiveAuthentication=no', '-o', 'BatchMode=no']
-    else:
-        args += ['-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-i', console.case_dir / 'login']
-    return args + ['root@127.0.0.1']
 
 
 def running_rescue(console):
@@ -123,16 +100,9 @@ done""")
     # Real SSH host identity is read from the installed root, then compared
     # independently to the host's loopback-forwarded key exchange.
     console.must('host-fingerprint', 'ssh-keygen -l -E sha256 -f /etc/ssh/ssh_host_ed25519_key.pub')
-    scan = command(console, 'host-keyscan', ['/usr/bin/ssh-keyscan', '-T', '10', '-t', 'ed25519',
-                                           '-p', console.ssh_port, '127.0.0.1'])
-    if scan.returncode or not scan.stdout.strip():
-        raise ConsoleError('the installed rescue SSH listener is absent')
-    known = console.case_dir / f'known-{console.out.name}'
-    known.write_text(scan.stdout)
-    checked = command(console, 'host-keyscan-fingerprint', ['/usr/bin/ssh-keygen', '-l', '-E', 'sha256', '-f', known])
     native = console.out / next(p.name for p in console.out.glob('*-host-fingerprint.out'))
-    if checked.returncode or checked.stdout.split()[1:2] != native.read_text().split()[1:2]:
-        raise ConsoleError('SSH host key differs from the native console fingerprint')
+    known = keyscan(console, console.case_dir / f'known-{console.out.name}', native.read_text().split()[1:2],
+                    check_step='host-keyscan-fingerprint')
     script = r'''set -e
 printf 'KEY_LOGIN_OK\n'
 test ! -e /etc/hostid
@@ -164,12 +134,11 @@ printf 'INTERNAL_IMPORT='; zpool import -N -o readonly=on internal 2>&1 | tr '\n
 printf 'INTERNAL_POOL='; zpool list -H -o name,readonly internal 2>/dev/null || :
 journalctl --sync
 journalctl -u ssh.service --no-pager -o cat'''
-    logged = command(console, 'key-login', ssh_args(console, known) + [script], timeout=90)
+    logged = command(console, 'key-login', ssh_argv(console, known) + [script], timeout=90)
     if logged.returncode:
         raise ConsoleError('the rescue root did not accept its overlay key or failed a native invariant')
-    environment = dict(os.environ, SSH_ASKPASS=str(console.case_dir / 'askpass'),
-                       SSH_ASKPASS_REQUIRE='force', DISPLAY='zt-rescue:0', ZT_RESCUE_PASSWORD='not-a-password')
-    failed = command(console, 'locked-password', ssh_args(console, known, True) + ['true'], env=environment)
+    failed = command(console, 'locked-password', ssh_argv(console, known, password=True) + ['true'],
+                     env=password_env(console, 'not-a-password'))
     if failed.returncode == 0:
         raise ConsoleError('the locked rescue root accepted a password')
 

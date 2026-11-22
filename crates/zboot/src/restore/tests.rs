@@ -2878,7 +2878,7 @@ fn abandon_archive_preflight_does_not_mark_an_effect() {
         assert_eq!(fake.dataset_ref(&staging()).local, properties);
         assert_eq!(super::record(&mut fake, ID).unwrap(), intent);
         let error = super::refuse("a later admission refused the operation");
-        let status = crate::cli::finish(Err(Box::new(error)), false, "abandon");
+        let status = crate::cli::finish(Err(Box::new(error)), None, false, "abandon");
         assert!(!zfs_tools::engine::effect::any());
         std::process::exit(status);
     }

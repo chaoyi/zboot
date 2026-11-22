@@ -27,7 +27,6 @@ pub struct SnapshotScope {
 }
 
 impl SnapshotScope {
-    #[cfg(feature = "internal")]
     pub fn roots(&self) -> &[String] {
         &self.roots
     }
@@ -40,7 +39,6 @@ impl SnapshotScope {
     /// containing pool. Property observations must be complete and trusted;
     /// this pure function cannot establish their provenance or freeze mutations.
     /// The maps are native observations, not user-supplied approval manifests.
-    #[cfg(feature = "internal")]
     pub fn plan(
         inspection: &Inspection,
         dataset_properties: &PropertyInventory,
@@ -99,7 +97,6 @@ impl SnapshotScope {
     /// Bind a working recursive tree for read-only boot asset inspection. This
     /// retains ownership and management admission but permits native readonly
     /// mounts; it is not a capture authorization.
-    #[cfg(feature = "internal")]
     pub fn plan_readonly_working(
         inspection: &Inspection,
         dataset_properties: &PropertyInventory,
@@ -260,7 +257,6 @@ impl SnapshotScope {
         })
     }
 
-    #[cfg(feature = "internal")]
     pub(crate) fn is_recursive_readonly(&self) -> bool {
         self.recursive && !self.require_writable
     }
@@ -270,7 +266,6 @@ impl SnapshotScope {
     /// scope or writer authority; full plans/revalidation still require global
     /// complete inventory. Unrelated host policy belongs to the listing and
     /// the full handoff checks, not this scoped read-only observation.
-    #[cfg(feature = "internal")]
     pub fn revalidate_scoped_readonly(
         &self,
         inspection: &Inspection,
@@ -394,7 +389,7 @@ fn refuse_management(
     Ok(())
 }
 
-#[cfg(all(test, feature = "internal"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::{

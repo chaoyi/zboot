@@ -13,7 +13,7 @@ ID = 'DEPLOY-NATIVE'
 GROUP = 'deploy'
 SECONDS = 3600
 DISKS = {'A': 2, 'B': 2, 'D': 8}
-BOOTS = [Boot(1, udev=True, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1, udev=True),
          Boot(2, efi=True, poweroff=True, extra={'from': 'D'})]
 
 def stage_2(console):

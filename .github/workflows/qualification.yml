@@ -86,10 +86,11 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 8
+      # Every shard at once (tests/ci/qualification.py SHARDS); GitHub Free
+      # runs at most 20 jobs at a time.
+      max-parallel: 20
       matrix: ${{ fromJSON(needs.build.outputs.matrix) }}
     env:
-      ZBOOT_VM_ACCEL: kvm
       ZBOOT_VM_MEMORY_MIB: ${{ contains(matrix.cases, 'RAM-BOOT') && '6144' || '4096' }}
       CARGO_BUILD_JOBS: '2'
       ZBOOT_ACCEPTANCE_STATE: /var/tmp/zfs-tools-acceptance

@@ -74,65 +74,47 @@ impl PairPlan {
         for tree in [&self.left, &self.right] {
             zfs_tools::engine::validate_dataset_name(&tree.endpoint.name)?;
             // A pair joins two leaves: each side binds exactly its root.
-            if tree.members.len() != 1 || tree.members[0].endpoint != tree.endpoint {
+            let [member] = tree.members.as_slice() else {
+                return Err(refuse("pair plan must bind exactly one leaf on each side"));
+            };
+            if member.endpoint != tree.endpoint {
                 return Err(refuse("pair plan must bind exactly one leaf on each side"));
             }
-            let mut names = BTreeSet::new();
-            let mut incarnations = BTreeSet::new();
-            let mut previous = None;
-            for member in &tree.members {
-                zfs_tools::engine::validate_dataset_name(&member.endpoint.name)?;
-                let identity = &member.endpoint.identity;
-                if !history::contains_dataset(&tree.endpoint.name, &member.endpoint.name)
-                    || previous.is_some_and(|name| name >= member.endpoint.name.as_str())
-                    || !names.insert(member.endpoint.name.as_str())
-                    || !incarnations.insert(identity.guid)
+            let identity = &member.endpoint.identity;
+            if [
+                identity.pool_guid.get(),
+                identity.guid.get(),
+                identity.createtxg.get(),
+                identity.objsetid.get(),
+            ]
+            .contains(&0)
+                || member.placement.identity != *identity
+            {
+                return Err(refuse("pair plan member scope or incarnation is invalid"));
+            }
+            Placement::parse(&member.placement.encode()?)?;
+            let mut snapshot_names = BTreeSet::new();
+            let mut snapshot_guids = BTreeSet::new();
+            let mut previous_txg = None;
+            for point in &member.snapshots {
+                zfs_tools::engine::validate_snapshot_name(&point.name)?;
+                if point.name.split_once('@').map(|(name, _)| name)
+                    != Some(member.endpoint.name.as_str())
+                    || point.dataset_guid != identity.guid
+                    || point.identity.pool_guid != identity.pool_guid
                     || [
-                        identity.pool_guid.get(),
-                        identity.guid.get(),
-                        identity.createtxg.get(),
-                        identity.objsetid.get(),
+                        point.identity.guid.get(),
+                        point.identity.createtxg.get(),
+                        point.identity.objsetid.get(),
                     ]
                     .contains(&0)
-                    || identity.pool_guid != tree.endpoint.identity.pool_guid
-                    || member.placement.identity != *identity
+                    || !snapshot_names.insert(&point.name)
+                    || !snapshot_guids.insert(point.identity.guid)
+                    || previous_txg.is_some_and(|txg| txg >= point.identity.createtxg)
                 {
-                    return Err(refuse("pair plan member scope or incarnation is invalid"));
+                    return Err(refuse("pair snapshot scope or ancestry is invalid"));
                 }
-                previous = Some(member.endpoint.name.as_str());
-                if member.endpoint != tree.endpoint
-                    && member
-                        .endpoint
-                        .name
-                        .rsplit_once('/')
-                        .is_none_or(|(parent, _)| !names.contains(parent))
-                {
-                    return Err(refuse("pair plan lacks a parent member"));
-                }
-                Placement::parse(&member.placement.encode()?)?;
-                let mut snapshot_names = BTreeSet::new();
-                let mut snapshot_guids = BTreeSet::new();
-                let mut previous_txg = None;
-                for point in &member.snapshots {
-                    zfs_tools::engine::validate_snapshot_name(&point.name)?;
-                    if point.name.split_once('@').map(|(name, _)| name)
-                        != Some(member.endpoint.name.as_str())
-                        || point.dataset_guid != identity.guid
-                        || point.identity.pool_guid != identity.pool_guid
-                        || [
-                            point.identity.guid.get(),
-                            point.identity.createtxg.get(),
-                            point.identity.objsetid.get(),
-                        ]
-                        .contains(&0)
-                        || !snapshot_names.insert(&point.name)
-                        || !snapshot_guids.insert(point.identity.guid)
-                        || previous_txg.is_some_and(|txg| txg >= point.identity.createtxg)
-                    {
-                        return Err(refuse("pair snapshot scope or ancestry is invalid"));
-                    }
-                    previous_txg = Some(point.identity.createtxg);
-                }
+                previous_txg = Some(point.identity.createtxg);
             }
         }
         if history::contains_dataset(&self.left.endpoint.name, &self.right.endpoint.name)
@@ -363,62 +345,46 @@ pub fn plan_with(
             name: root.into(),
             identity: dataset.identity.clone(),
         };
-        let mut members = Vec::new();
-        for dataset in state.inspection.datasets.iter().filter(|d| d.name == root) {
-            let properties = management::bound_properties(state, &dataset.name)?;
-            let placement = match properties
-                .get(management::PLACEMENT_PROPERTY)
-                .filter(|p| p.source == "local")
-            {
-                Some(p) => Placement::parse(&p.value)?,
-                None => Placement::observed(dataset, properties),
-            };
-            let mut snapshots: Vec<_> = state
-                .inspection
-                .snapshots
-                .as_ref()
-                .unwrap()
-                .iter()
-                .filter(|s| {
-                    s.name
-                        .split_once('@')
-                        .is_some_and(|(name, _)| name == dataset.name)
-                })
-                .map(|s| s.point())
-                .collect();
-            snapshots.sort_by_key(|p| p.identity.createtxg);
-            members.push(Member {
-                endpoint: Endpoint {
-                    name: dataset.name.clone(),
-                    identity: dataset.identity.clone(),
-                },
-                placement,
-                mountpoint: dataset.mountpoint.clone(),
-                snapshots,
-            });
-        }
-        members.sort_by(|a, b| a.endpoint.name.cmp(&b.endpoint.name));
-        Ok(BoundTree { endpoint, members })
+        let properties = management::bound_properties(state, root)?;
+        let placement = match properties
+            .get(management::PLACEMENT_PROPERTY)
+            .filter(|p| p.source == "local")
+        {
+            Some(p) => Placement::parse(&p.value)?,
+            None => Placement::observed(dataset, properties),
+        };
+        let mut snapshots: Vec<_> = state
+            .inspection
+            .snapshots
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|s| s.name.split_once('@').is_some_and(|(name, _)| name == root))
+            .map(|s| s.point())
+            .collect();
+        snapshots.sort_by_key(|p| p.identity.createtxg);
+        let member = Member {
+            endpoint: endpoint.clone(),
+            placement,
+            mountpoint: dataset.mountpoint.clone(),
+            snapshots,
+        };
+        Ok(BoundTree {
+            endpoint,
+            members: vec![member],
+        })
     };
     let left = bind(&request.left)?;
     let right = bind(&request.right)?;
-    let mut anchors = Vec::new();
-    for (relative, guid) in admission.anchors {
-        let point = |tree: &BoundTree| -> Result<SnapshotRef, Error> {
-            let name = if relative.is_empty() {
-                tree.endpoint.name.clone()
-            } else {
-                format!("{}/{relative}", tree.endpoint.name)
-            };
-            tree.members
-                .iter()
-                .find(|m| m.endpoint.name == name)
-                .and_then(|m| m.snapshots.iter().find(|s| s.identity.guid == guid))
-                .cloned()
-                .ok_or_else(|| refuse("admitted anchor disappeared from frozen inventory"))
-        };
-        anchors.push((point(&left)?, point(&right)?));
-    }
+    let point = |tree: &BoundTree| -> Result<SnapshotRef, Error> {
+        tree.members[0]
+            .snapshots
+            .iter()
+            .find(|s| s.identity.guid == admission.anchor)
+            .cloned()
+            .ok_or_else(|| refuse("admitted anchor disappeared from frozen inventory"))
+    };
+    let anchors = vec![(point(&left)?, point(&right)?)];
     let plan = PairPlan {
         schema_version: 1,
         left,

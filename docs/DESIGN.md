@@ -14,36 +14,26 @@ or the network. The **menu** is the screen it shows.
 
 The early boot implementation used
 [ZFSBootMenu's source](https://github.com/zbm-dev/zfsbootmenu) directly as a
-reference for discovery, `kexec` handoff, startup and device readiness. This
-was source-informed development, and the upstream copyright notice is retained
-in [LICENSE](../LICENSE). [README](../README.md#origins-and-attribution)
-provides the attribution.
-
-The current boot path uses Debian kernel/initramfs layouts and a custom
-bootstrap. It starts udev, triggers device events and runs `udevadm settle`
-before the menu. During handoff it checks and stages the selected files in
-RAM, unmounts the boot environment, loads the kernel and exports the read-only
-pool before execution. The implementations are zboot's `handoff`,
-`boot_environment` and `menu::hostid_adopt` modules and the UKI's bootstrap,
-[`dist/initramfs/init.sh`](../dist/initramfs/init.sh).
+reference for discovery, `kexec` handoff, startup and device readiness
+([attribution](../README.md#origins-and-attribution)). The current boot path
+uses Debian kernel and initramfs layouts and its own bootstrap,
+[`dist/initramfs/init.sh`](../dist/initramfs/init.sh): it starts udev,
+triggers device events and runs `udevadm settle` before the menu. During
+handoff it checks and stages the selected files in RAM, unmounts the boot
+environment, loads the kernel and exports the read-only pool before execution
+(zboot's `handoff`, `boot_environment` and `menu::hostid_adopt` modules).
 
 ## Product boundary
 
 zboot manages boot environments, ordinary dataset trees, pairs, disks, ESPs
 and whole-disk restore, both on a running system and in the menu. zsnap manages
-snapshot policy and supervised readers of protected snapshots. The workspace
-has four Cargo packages:
-
-- **zfs-tools** (`crates/zfs-tools`): the supported Rust API (its `api`,
-  `effects`, `inventory` and `reader` modules) and the private engine: native ZFS
-  access, the writer lock, operation records, holds and streams. The non-default `internal`
-  feature exposes the engine to zboot and zsnap only; it is unsupported and
-  unstable.
-- **zboot** (`crates/zboot`): the boot application.
-- **zsnap** (`crates/zsnap`): the snapshot application, a library plus a
-  binary; the library's root holds the retention policy API.
-- **zboot-helpers** (`crates/zboot-helpers`): two internal, dynamically linked
-  helpers, `zboot-probe-signatures` and `zboot-change-key`.
+snapshot policy and supervised readers of protected snapshots. The
+`zfs-tools` library holds the supported Rust API (its `api`, `effects`,
+`inventory` and `reader` modules) and the private engine: native ZFS access,
+the writer lock, operation records, holds and streams. The engine is a
+hidden public module for zboot and zsnap only; it is unsupported and
+unstable. `zboot-helpers` holds two internal, dynamically
+linked helpers, `zboot-probe-signatures` and `zboot-change-key`.
 
 The library depends on neither application. zboot is standalone: recovery
 needs no catalog, controller or network service. Its syntax, tokens, JSON and
@@ -129,39 +119,32 @@ and refuses a tree or pool that changed between its queries.
 
 [CLI.md](CLI.md) is the interface. The rules behind it:
 
-- **Names are resolved by how they are written, never by what exists.** A
-  name with `/` is that dataset; a name without `/` is the boot environment
-  beside the running one; `NAME/` is the root of pool NAME. The menu's
-  shorthand is the numbers `status` shows, each bound to a native identity.
-  *Why short names:* almost every daily command names the running boot
-  environment or a sibling. *Why by spelling only:* a rule that asked "is
-  there a sibling, else a pool, of this name?" would let the same line change
-  meaning when a dataset is created, between a preview and its confirmation,
-  or between two hosts. Plans and typed confirmations print full names.
+- **Names are resolved by how they are written, never by what exists**
+  ([Names](CLI.md#names)). *Why short names:* almost every daily command
+  names the running boot environment or a sibling. *Why by spelling only:* a
+  rule that asked "is there a sibling, else a pool, of this name?" would let
+  the same line change meaning when a dataset is created, between a preview
+  and its confirmation, or between two hosts. The menu's numbers are each
+  bound to a native identity for the same reason.
 - **Targets are resolved after parsing.** The grammar marks which arguments
   are targets; nothing else is rewritten, so quoted values and a `chroot --`
   tail pass through untouched. One clap definition parses both the command
   line and a menu line. *Why:* "the menu takes the same verbs" then holds by
   construction.
-- **Shared options.** Every verb that changes a pool, a disk or an ESP takes
-  `--dry-run`; every verb but the two interactive ones takes `--json`. Only a
-  verb whose plan can lose data, always or in some cases, takes
-  `--confirm TOKEN`, and it checks the token even when this plan loses
-  nothing. A verb that cannot lose data plans once, under the writer lock,
-  and prints no token. *Why:* a script can run exactly what it previewed
-  wherever that binding protects data; on a creation or metadata verb a
-  token bound nothing worth binding and cost a second plan on every run.
-- **Each form carries only its legal options.** `deploy DISK` and
-  `deploy --image` make a disk or an image with its own ESP and pool;
-  `deploy into POOL`, a subcommand, adds a boot environment to an imported
-  pool. *Why a subcommand:* the two share the content options and nothing
+- **`--confirm TOKEN` only where data can be lost.** Every verb that changes
+  a pool, a disk or an ESP takes `--dry-run`; only a verb whose plan can lose
+  data takes `--confirm`, and it checks the token even when this plan loses
+  nothing. *Why:* a script can run exactly what it previewed wherever that
+  binding protects data; on a creation or metadata verb a token bound nothing
+  worth binding and cost a second plan on every run.
+- **Each form carries only its legal options.** *Why `deploy into POOL` is a
+  subcommand:* it shares the content options with `deploy DISK` and nothing
   else; as one flat form every pool, ESP and hostid option needed a conflict
   rule and a refusal for the pool form. A disk path starts with `/dev/`, so
   it is never read as `into`.
 - **A token that no longer matches is refused**, with no new token. *Why:* a
   caller that retries with whatever token the output contains would otherwise
-  confirm a plan nobody reviewed. Generated values (a snapshot name, a random
-  hostid) are not bound; the result reports them.
+  confirm a plan nobody reviewed.
 - **Exit status 4** applies from the first durable effect on, an operation
   record included; verbs that keep no record (`wipe`, `deploy`, `esp`) count
   their first write. *Why:* a script can tell "nothing happened" (1, 3) from
@@ -170,20 +153,18 @@ and refuses a tree or pool that changed between its queries.
   every pool imported read-only. Any zboot command there, at the menu, in its
   shell or over SSH, plans on the read-only pools; only after the answer, under
   its writer lock, does it reopen writable the pools its plan names, by GUID,
-  and then it returns them to read-only. A pool already imported writable is
-  refused there; one the command exported stays exported until `rescan`.
-  *Why:* an agent that got in over SSH runs `zboot deploy` or `zboot sync`
-  directly; if only menu lines had this handling, those would fail. *Why the
-  plan:* it already names every pool the verb writes.
-- **`fork` forks only a boot environment**, one dataset with no children.
-  `fork DEST` snapshots the running one and clones it in one resumable record.
-  *Why:* the common upgrade flow takes one command, and the operator does not
-  fork data trees (`zfs clone` remains for those). With one member the record
-  stays under the 6000-byte limit, so fork keeps no separate receipt.
-- **There is no cross-pool move.** Moving a leaf is `sync SRC DEST`,
-  `primary DEST`, `unpair DEST --release-anchors`, `drop SRC`: each step is
-  resumable with its own checks, and no record spans the four. MOVE-BY-PAIR
-  checks the recipe.
+  and then it returns them to read-only. *Why:* an agent that got in over SSH
+  runs `zboot deploy` or `zboot sync` directly; if only menu lines had this
+  handling, those would fail. *Why the plan:* it already names every pool the
+  verb writes.
+- **`fork` forks only a boot environment**, and `fork DEST` snapshots the
+  running one and clones it in one resumable record. *Why:* the common
+  upgrade flow takes one command, and the operator does not fork data trees
+  (`zfs clone` remains for those). With one member the record stays under
+  the 6000-byte limit, so fork keeps no separate receipt.
+- **There is no cross-pool move.** Moving a leaf is `sync`, `primary`,
+  `unpair --release-anchors`, `drop`: each step is resumable with its own
+  checks, and no record spans the four. MOVE-BY-PAIR checks the recipe.
 
 ## Consent
 
@@ -216,26 +197,27 @@ prompt never holds it, so a zsnap timer never waits on a prompt.
 
 An application that keeps its own policy (Fleet's volumes, bound pools and
 data preparation) runs its native effects through the library rather than
-its own `zfs` and `zpool` children. `WriterSession::admit_effects` admits
-exact targets: a dataset incarnation alone or with its subtree, an imported
-pool by name and GUID (optionally its `load_guid`), a pool name no imported
-pool has, or a pool GUID that is not imported. `EffectScope::dispatch` runs
-one closed `Effect` ([library guide](../crates/zfs-tools/README.md#caller-owned-effects)
-lists the shapes and the caller each was added for).
+its own `zfs` and `zpool` children: `WriterSession::admit_effects` admits
+exact targets and `EffectScope::dispatch` runs one closed `Effect`. The
+[library guide](../crates/zfs-tools/README.md#caller-owned-effects) owns the
+API, the shapes and the caller each was added for, the revalidation order and
+the observation deadlines. The rules and why:
 
 - **One constructor per shape, each argv pinned.** Required flags are part
   of the shape: import is `-N -o cachefile=none -d LEAF GUID`, create has no
-  `-f`, destroy and rollback take no flags, set and clone are `-u`. *Why:* a general
-  effect grammar would let each caller choose its own flags, and binding the
-  operands of an arbitrary argv cannot be checked. zboot's typed verbs were
-  rejected too: the library would absorb the caller's executors and policy.
-- **Operands are admitted targets.** Each operand must be an admitted target
-  or a member of an admitted subtree, with the same incarnation, and is
-  bound against the observation made for this dispatch: a created name must
-  be absent below an admitted filesystem parent, a clone origin must be the
-  exact admitted snapshot and not marked for deferred destruction, a
-  rollback point must be the newest snapshot, a key load needs an
-  encryption root whose `keylocation` is `prompt`.
+  `-f`, destroy and rollback take no flags, set and clone are `-u`. *Why:* a
+  general effect grammar would let each caller choose its own flags, and
+  binding the operands of an arbitrary argv cannot be checked. zboot's typed
+  verbs were rejected too: the library would absorb the caller's executors
+  and policy.
+- **Operands are admitted targets**, with the same incarnation, bound against
+  the observation made for this dispatch: a created name must be absent below
+  an admitted filesystem parent, a clone origin must be the exact admitted
+  snapshot and not marked for deferred destruction, a rollback point must be
+  the newest snapshot, a key load needs an encryption root whose
+  `keylocation` is `prompt`. The guard runs again right before the spawn and
+  sees the effect with its bound argv, so a caller's consent can name exactly
+  one effect.
 - **No management key.** No shape sets or inherits a `zboot:` or
   `org.zfs-tools:` key, and pool targets refuse a pool carrying one.
   *Why:* zboot refuses what it does not read in its namespace, so another
@@ -257,74 +239,34 @@ lists the shapes and the caller each was added for).
   half-done unpair as unpaired.
 - **Destroy refuses what a flagless destroy must not take:** descendants,
   snapshots, a boot default and the last clone of an external origin marked
-  for deferred destruction, the same rule as `zboot drop`
-  (`engine::deferred_origin`).
+  for deferred destruction, the same rule as `zboot drop`.
 - **`volsize` is never set.** OpenZFS truncates a volume set to a smaller
   size without refusing, so a set would lose a VM disk's tail; no caller
   resizes, so there is no grow shape.
-- **Revalidation order.** Before each spawn: the caller's guard, a fresh
-  observation under the session, the original admission again (the same
-  members and incarnations, management included), operand binding against
-  that observation, and the guard again with no observation between it and
-  the spawn. The guard gets a `GuardCheck`: nothing at admission, the
-  effect before the observation, and the effect with its bound argv before
-  the spawn, so a caller's consent can name exactly one effect.
 - **Custody from the session.** The child inherits the session's own flock
-  open-file description, not the thread-local custody zboot's engine uses,
-  so it holds the lock from any thread and after its caller dies. It runs in
-  its own process group. Its pipes are read on the calling thread, as an
-  observation's are (one bounded read per ready pipe per wakeup), so neither
-  a busy writer nor a descendant that keeps one open can hold the caller past
-  the deadline or leave a thread or descriptor behind; it only loses the
-  stderr, which gets two seconds after the exit. A deadline kills the group
-  and waits for the reap; a group signal or reap not confirmed within ten
-  seconds poisons the session, which then refuses every admission and
-  dispatch, because the child may still run, and the library keeps the
-  unreaped leader.
+  open-file description, not the thread-local custody zboot's engine uses, so
+  it holds the lock from any thread and after its caller dies. A deadline
+  kills its process group; a kill or reap not confirmed within ten seconds
+  poisons the session, which then refuses every admission and dispatch,
+  because the child may still run.
 - **A caller-set deadline bounds a whole observation, not each query.**
-  `admit_effects_within` bounds the admission's and every dispatch's fresh
-  observation, `InventoryRequest::within` and `observe_management_within`
-  theirs; without them nothing has a deadline. One deadline covers every
-  query, each query's pipe completion and exit, and the observation's own
-  work on the output (checked before a query's output is accepted and
-  before the result is returned). A query's stdout is capped at 64 MiB (parsing
-  allocates well beyond the raw bytes; tens of thousands of snapshots are a
-  few MiB), a typed stop rather than a truncated parse. *Why:* a fixed per-query
-  bound is the wrong policy for a big or degraded pool, and only the caller
-  knows its budget (Fleet sums it into its stop budget). zboot's and zsnap's
-  own reads keep `native::run`, which has none.
-- **A stop signals only a known child and owns the reap.** Pipes are polled
-  on the calling thread, and the leader is waited for with `WNOWAIT` so its
-  PID still names its group until the reap; on a stop the group is sent
-  SIGKILL, the leader reaped within ten seconds, the query's output
-  discarded and no later query started. The error is typed
-  (`ObservationStop` with a `QueryCleanup` that claims only what was
-  established: no query running, leader reaped after the group signal, or
-  unconfirmed); an unreaped leader is kept by the library and reaped by a
-  later bounded query, dropped only once it is reaped or no longer ours
-  (ECHILD). Nothing is signalled once the leader is not known to be this
-  process's unreaped child, and a bounded run refuses while SIGCHLD is
-  ignored or `SA_NOCLDWAIT` is set, since the kernel would then reap the
-  leader and free its PID; callers must not reap the library's children.
-  *Why:* a runner that stops timing at
-  the leader's exit, joins detached readers, or treats partial output as a
-  result turns a hung `zpool` into a hung caller or a false observation. A
-  read-only query holds no writer lock, so expiry does not poison the
-  session.
+  *Why:* a fixed per-query bound is the wrong policy for a big or degraded
+  pool, and only the caller knows its budget (Fleet sums it into its stop
+  budget). zboot's and zsnap's own reads have none.
+- **A stop signals only a known child and owns the reap.** Pipes are read on
+  the calling thread and the leader is waited for with `WNOWAIT`, so its PID
+  still names its group until the reap; a stopped query's output is
+  discarded. *Why:* a runner that stops timing at the leader's exit, joins
+  detached readers, or treats partial output as a result turns a hung `zpool`
+  into a hung caller or a false observation. A read-only query holds no
+  writer lock, so its expiry does not poison the session.
 - **The reply is what the command said:** `Succeeded`, `Failed{status,
   stderr}` or `Uncertain{why}`. A failed or uncertain command may still have
   changed ZFS; the caller reads back and never retries blindly. An effect
   that adds or removes a dataset or pool, or rolls one back, ends the
-  admission; the caller admits again.
-- **Devices are taken as given.** A `DevicePath` is checked only for shape.
-  The library cannot tell which disk a path names: the caller sources it
-  from its reviewed selection and keeps its own wrong-disk proof.
-
-Key and passphrase bytes are borrowed and written once to the child's
-standard input (at most 4096 bytes, one pipe write); the library keeps no
-copy, so zeroizing them is the caller's. `observe_management` reads a
-dataset's pair role and unfinished zboot work (an operation record on its
-pool, a `zboot:pending` or `zboot:staging` mark) without a session.
+  admission.
+- **Devices are taken as given.** A `DevicePath` is checked only for shape;
+  the caller keeps its own wrong-disk proof.
 
 ## Operation records and resume
 
@@ -388,8 +330,9 @@ record; they are rerun.
 | 7 | Common anchors stay held on both sides until a newer verified base replaces them. |
 | 8 | A secondary, an inactive boot environment's children and staging never mount by themselves. Roles set at creation and the host-wide automount check enforce it. |
 
-The Rust tests for each rule sit beside the engines; they cut every effect and
-record write against in-memory fakes and compare with an uninterrupted run.
+Each rule's engine tests sit beside the engine they cover;
+[TESTING](TESTING.md#coverage-of-the-safety-rules) lists the QEMU cases that
+exercise it natively.
 
 ## Pairs
 
@@ -397,17 +340,14 @@ zboot's `pairs` module implements `pair`, `sync`, `primary` and `unpair` with
 the operation record and snapshot holds; `sync` runs the `transfer` engine
 under that record.
 
-- **A pair joins leaves.** `pair`, a bootstrapping `sync` and `primary` refuse
-  a dataset with children and name them. A child that appears later under a
-  paired leaf does not stop `sync`: refusing would stop the backup of data
-  that is still fine, so `sync` copies the leaf and names the child, and
-  `sync --all` exits 4. `primary` refuses while either side has a child: a
-  child is `canmount=on` by default and inherits the leaf's path, so on the
-  side that becomes dormant the next boot would mount it over the live copy.
-  `status` lists every dataset below a paired leaf, whatever its `canmount`,
-  so the operator moves it out before a switch needs that.
-- **Only an absent DEST is created.** `sync SRC DEST` into an existing DEST
-  needs DEST to be SRC's peer; an existing unpaired DEST is refused.
+- **A pair joins leaves**, and `pair`, a bootstrapping `sync` and `primary`
+  refuse a dataset with children. A child that appears later does not stop
+  `sync`, because refusing would stop the backup of data that is still fine;
+  `sync` names it and `sync --all` exits 4. `primary` refuses while either
+  side has one: a child is `canmount=on` by default and inherits the leaf's
+  path, so on the side that becomes dormant the next boot would mount it over
+  the live copy. `status` lists such children so the operator moves them out
+  first.
 - **A sync receives only into the fenced copy.** From a pair's secondary it
   is refused before any effect, and the message names `primary SRC`, which
   is how the working copy changes. *Why:* receiving into the working copy
@@ -418,28 +358,23 @@ under that record.
   planned peer loss again once the peer is fenced, so a write between plan and
   fence is never rolled back unconfirmed. Activation needs the peer fenced, so
   a resumed switch never activates both sides.
-- **One stuck pair never holds its pool.** An interrupted `sync` can be
-  abandoned until its data is verified. The copy stays fenced with the
-  snapshots it received, a valid prefix of the source's history that the next
-  `sync` continues from; a new copy stays fenced in its receive container.
-  After its data is verified, `abandon` refuses: resume it.
+- **One stuck pair never holds its pool.** The pool has one operation slot,
+  so an interrupted `sync` can be abandoned until its data is verified: the
+  snapshots the copy received are a valid prefix of the source's history,
+  which the next `sync` continues from. After its data is verified, `abandon`
+  refuses: resume it.
 - **A volume's `volmode` follows the working copy.** A fence saves a local
   `volmode` other than `none` in the volume's placement record, and
-  activation sets it back. `primary` gives the new working copy the value
-  the old one had, read before its fence, even over a value the new one
-  saved earlier; the old one keeps its value saved for its next activation.
-  The plan names the value, so the token binds it. *Why the old working
-  copy's value:* it is the operator's latest intent. A survivor activated
-  alone gets its own saved value. A local `none` is not saved, because at
-  rest it cannot be told from the fence's: a volume hidden by hand stays
-  hidden, but across `primary` the new working copy inherits. The field is
-  omitted when absent, so a filesystem's record and every earlier record
-  are unchanged; a build without the field refuses a record that carries it.
+  activation sets it back; `primary` gives the new working copy the value the
+  old one had, read before its fence ([CLI](CLI.md#pairs)). The plan names
+  the value, so the token binds it. *Why the old working copy's value:* it is
+  the operator's latest intent; a survivor activated alone gets its own saved
+  value. A local `none` is not saved, because at rest it cannot be told from
+  the fence's. The field is omitted when absent, so a
+  filesystem's record and every earlier record are unchanged; a build without
+  the field refuses a record that carries it.
 - **One host's disks.** `pair` refuses pools whose labels record different
   hostids, before any import or record.
-- **Pruning happens on the working copy.** zsnap retention works there as on
-  an unpaired dataset and skips the held anchor. A fenced copy refuses
-  snapshot deletion and follows the working copy only through `sync`.
 - **Pending deletions are reviewed.** A snapshot only on the copy and older
   than the anchor is deleted, before the transfer, only with `--confirm` or the
   typed summary; its identity is in the token, and the transfer runs either
@@ -448,9 +383,6 @@ under that record.
   confirmed, the copy is the last place it exists. These deletions and the
   renames by GUID run from native state before the operation record, so a cut
   leaves only finished steps.
-- **zboot cleans its own boundaries.** After a verified transfer zboot deletes
-  its older boundary snapshots on both sides, those carrying its
-  `zboot:capture` marker on the side that captured them.
 
 ### How a transfer runs
 
@@ -492,16 +424,13 @@ loosening change is made before data and a tightening one after, so no limit
 can refuse a valid history, and a limit the copy cannot take is reported, not
 a failure.
 
-**Space review.** A copy holds a space key when it holds the working copy's
-explicit (local or received) limit as a local value, or when neither sets a
-limit; a value that sets none (`none`, `0`) is no limit on either side. One
-rule finds every key a copy does not hold, and three places report it: a
-sync's result when its transfer ends, `status` for each mutual pair whose
-sides are both imported, and the `primary` plan for the side it activates
-and its peer. *Why before `primary`:* afterwards the activated side's limits
-are the pair's, and the next sync gives them to the peer, so a limit the copy
-could not take is then gone from both. The differences are shown, not bound
-into the token. *Why:* they lose no data, and the token covers loss scope and
+**Space review.** One rule finds every space key a copy does not hold
+([CLI](CLI.md#pairs)), and three places report it: a sync's result, `status`
+for each mutual pair whose sides are both imported, and the `primary` plan.
+*Why before `primary`:* afterwards the activated side's limits are the
+pair's, and the next sync gives them to the peer, so a limit the copy could
+not take is then gone from both. The differences are shown, not bound into
+the token. *Why:* they lose no data, and the token covers loss scope and
 placement ([Consent](#consent)); binding them would also make a plan stale
 for a quota set while it waits.
 
@@ -542,11 +471,9 @@ A snapshot of the clone or the container, even another tool's
 `zfs snapshot -r POOL@x`, never stops a fork, its resume or its abandon, and
 zboot leaves it in place. *Why:* a snapshot changes none of the identities
 fork binds, and refusing it held the pool's one record until someone destroyed
-the snapshot by hand. Fork destroys its container only when it is empty. One
-that holds a snapshot or a dataset zboot did not make stays, still marked as
-the fork's staging; the fork completes and names it, and `drop` lists what it
-holds before removing it. An abandoned fork's unpublished clone stays staging
-with its snapshots.
+the snapshot by hand. Fork destroys its container only when it is empty;
+otherwise the container stays as the fork's staging, for `drop`
+([CLI](CLI.md#boot-environments-and-trees)).
 
 A fork destination cannot be below a `zboot:staging` or `zboot:pending` mark,
 set on its parent or inherited by it. Fork refuses one when it plans, when it
@@ -677,22 +604,18 @@ off: REASON` once per reason.
 
 ## Remote access
 
-The menu supports wired networking only. SSH is off unless one-boot keys on the
-ESP (`zboot/authorized_keys`), `zboot.ssh_key=` on the command line or
-`connect` at the console turn it on;
-[RECOVERY.md](RECOVERY.md#getting-in-remotely) says what each does.
+The menu supports wired networking only, and SSH is off unless one-boot keys
+on the ESP, `zboot.ssh_key=` or `connect` turn it on
+([RECOVERY.md](RECOVERY.md#getting-in-remotely) gives the procedure).
 
-- **Reading the file.** The menu accepts only `TYPE BASE64 [comment]` lines,
-  deletes the file and syncs before the network starts; if it cannot delete
-  the file, SSH does not start.
-- **Where the request goes.** `reboot --menu` writes one ESP: the one `--esp`
-  names, or else the one this boot came from, which must be on a fixed disk.
-  *Why:* the menu deletes the file only from the ESP it started from, so a
-  copy on any other ESP would stay live for a later boot.
-- **The wait.** Unless a console key or a login holds the menu, SSH stops
-  after ten minutes and the ordinary countdown runs. *Why:* a machine nobody
-  can reach must not sit in the menu until someone walks to it. Only a
-  successful authentication counts as a login.
+- **One write, one ESP.** The menu deletes `zboot/authorized_keys` and syncs
+  before the network starts, and only from the ESP it started from, so
+  `reboot --menu` writes exactly that one ESP. *Why:* a copy on any other ESP
+  would stay live for a later boot.
+- **The wait.** Unless a console key or a successful login holds the menu,
+  SSH stops after ten minutes and the ordinary countdown runs. *Why:* a
+  machine nobody can reach must not sit in the menu until someone walks to
+  it.
 - **The password** (12 characters, 60 random bits) exists for someone at the
   console; SSH that started by itself never offers it.
 - **Trust.** Whoever can write the ESP or run the boot server can already
@@ -710,21 +633,20 @@ ESP (`zboot/authorized_keys`), `zboot.ssh_key=` on the command line or
 
 zboot ships as the Debian package `zboot`: the `zboot` and `zsnap` binaries,
 the two helpers and the UKI. The binary embeds two overlays, `builtin:rescue`
-and the portable overlay that only `--portable` applies.
+and the portable overlay that only `--portable` applies. [CLI.md](CLI.md#install)
+gives each verb's behavior; the rules and why:
 
 ### factory
 
 `factory` builds an ordinary root tar with `mmdebstrap --mode=unshare`, without
-root or a VM: the kernel and headers, `zfs-dkms`, `zfs-initramfs`,
-`systemd-sysv` and the `zboot` package built from the installation it runs
-from. A host adds its network and firmware with `--packages`.
+root or a VM, with the `zboot` package built from the installation it runs
+from.
 
-- All OpenZFS packages use one version; `--snapshot TIME` takes every archive
-  from snapshot.debian.org.
 - The build machine's identity (hostid, hostname, pool cache, machine ids,
   SSH host keys and more) is removed before any initrd is made, because the
   ZFS hook copies `/etc/hostid` and the pool cache. Every installed kernel,
-  never the builder's own, gets its DKMS module and a checked initrd.
+  never the builder's own, gets its DKMS module and a checked initrd. All
+  OpenZFS packages use one version.
 - Root's password is locked and nothing listens. With `openssh-server`,
   factory installs a unit that makes missing host keys at any boot. *Why not
   Debian's `sshd-keygen.service`:* it has `ConditionFirstBoot=yes`, and a
@@ -744,37 +666,27 @@ from. A host adds its network and firmware with `--packages`.
 | overlay `post-install` | what files cannot express | `deploy` only |
 | `deploy` options | disk, pool, BE, ESP, swap, hostid, hostname, portable | zboot itself uses the value |
 
-- Overlays apply left to right, files then hook; a later file replaces an
-  earlier one, nothing is merged. The plan, and a `deploy DISK` token, bind
-  every entry's digest, built-ins included. Writes never follow a symlink already in the root. After
-  all hooks, `deploy` enforces `/etc/hostid` and an explicit `--hostname`.
-  `builtin:` overlays are files only, so `boot --tar` applies them as deploy
-  does.
-- **`builtin:rescue`** gives root console autologin, DHCP on every ethernet
-  link (client id from the MAC, since the machine-id is new at every rescue
-  boot), `PermitRootLogin yes` and the IPv4 address on the console banner,
-  with **no default password**. *Why no default password:* it would be the
-  same published password on every rescue, while sshd answers on whatever
-  network the machine is plugged into, with every disk attached. *Why no
-  generated password printed at boot:* `passwd` at the autologin shell already
-  does it, and consoles are often logged.
+Writes never follow a symlink already in the root. `builtin:` overlays are
+files only, so `boot --tar` applies them as deploy does. **`builtin:rescue`**
+has **no default password**. *Why:* it would be the same published password
+on every rescue, while sshd answers on whatever network the machine is
+plugged into, with every disk attached. *Why no generated password printed at
+boot:* `passwd` at the autologin shell already does it, and consoles are often
+logged. Its DHCP client id comes from the MAC, since the machine-id is new at
+every rescue boot.
 
 ### deploy
 
-`deploy` unpacks a root tar as a boot environment on a disk (erased, then
-partitioned) or on a new image file through a loop device, sized to its
-content; `deploy into` unpacks one in an existing pool. `deploy` sets only
-the new pool's `bootfs` and never clears another's; `deploy into` sets none. A host deploy writes `/etc/hostid` and rebuilds no initrd, because
-the UKI passes the hostid at every kexec.
+A host deploy writes `/etc/hostid` and rebuilds no initrd, because the UKI
+passes the hostid at every kexec. `deploy` sets only the new pool's `bootfs`;
+`deploy into` sets none.
 
 - **Deploy keeps no record and has no resume.** The token binds the erase
   (disk, method, scope) and the selection (root tar, overlay and EFI digests,
   external ESP, geometry, hostid and hostname). After the erase, deploy plans
   again on the erased disk, which must still be bare and pass every usage
   guard, and proceeds only if the binding is unchanged. After a failure it is
-  rerun with a fresh plan and confirmation. Its attempt directory under
-  `/run/zboot/deploy/` holds only the post-install hook logs; `deploy into`
-  has no attempt directory and writes its hook logs directly in `/run`.
+  rerun with a fresh plan and confirmation.
 - **One zap before partitioning.** Deploy runs `sgdisk --zap-all` on the erased
   disk. *Why:* after an NVMe sanitize, LBA 0 holds whatever the controller
   returns, and a stray MBR boot signature (0x55AA) there is no partition table
@@ -782,15 +694,10 @@ the UKI passes the hostid at every kexec.
 - **Order.** Extract the tar and snapshot `BE@factory`; apply the identity and
   overlays; check the boot files, snapshot `BE@deployed` and set `bootfs`
   last. A hook runs in a chroot in its own PID namespace, with service starts
-  refused and its output in a 0600 log, `deploy-ID-post-install-N.log`
-  (`zboot-deploy-into-ID-post-install-N.log` for `deploy into`). A
-  failed overlay or hook rolls the unpublished BE back to `@factory`; hooks
-  are never replayed.
+  refused and its output in a 0600 log. A failed overlay or hook rolls the
+  unpublished BE back to `@factory`; hooks are never replayed.
 - `--image` creates its file exclusively and holds it throughout; on failure
   it removes the file only after proving its loop device detached.
-- `--esp-partition PART` writes `EFI/zboot/zboot.efi` on another disk's ESP,
-  never the fallback, and refuses when either path holds another system's
-  file.
 
 ### deploy --portable
 
@@ -823,39 +730,26 @@ writing to its pool; changes live in RAM until the next boot.
 
 ### esp
 
-zboot writes two paths on an ESP: `EFI/zboot/zboot.efi` and the firmware
-fallback `EFI/BOOT/BOOTX64.EFI`. A file there is zboot's when it is a UKI
-whose `.osrel` has `ID=zboot`. Nothing else on the ESP is written.
+zboot writes exactly two paths on an ESP, `EFI/zboot/zboot.efi` and the
+firmware fallback `EFI/BOOT/BOOTX64.EFI`, and owns a file there only when it
+is a UKI whose `.osrel` has `ID=zboot` ([CLI](CLI.md#esp)).
 
-- **Refresh (`esp`)** takes every ESP holding one of zboot's loaders on a
-  disk that also holds an imported pool. That covers a pair's second disk and
-  leaves a rescue stick alone, so the fallback medium is never updated in the
-  same step. It also takes the ESP this boot came from when the root is on a
-  writable pool and that ESP is on a fixed NVMe or SATA disk. *Why:* a host
-  whose firmware starts the menu from another internal disk would otherwise
-  keep booting the old menu, while a stick booted after a bad update is the
-  fallback. On each ESP it writes each of the two paths that holds zboot's
-  loader or nothing, and leaves another system's file at either in place and
-  names it. It needs no confirmation.
-- **Install (`esp PART`).** Where `EFI/zboot/zboot.efi` is not zboot's it
-  writes both paths; replacing another system's file at either is typed. The
-  fallback is written first, so a rerun after a failure finishes the
-  install. Where zboot is installed it refreshes. A zboot fallback alone does
-  not count as installed.
+- **Refresh (`esp`)** takes the ESPs on disks that also hold an imported
+  pool, which covers a pair's second disk and leaves a rescue stick alone, so
+  the fallback medium is never updated in the same step. It also takes the
+  ESP this boot came from when the root is on a writable pool and that ESP is
+  on a fixed NVMe or SATA disk. *Why:* a host whose firmware starts the menu
+  from another internal disk would otherwise keep booting the old menu, while
+  a stick booted after a bad update is the fallback.
 - **Fixed names.** zboot's own UKIs under other names directly in
   `EFI/zboot/` (earlier builds refreshed them in place, and older installs
-  wrote `zboot-recovery.efi`) are stale: `esp` and `status --devices` name
-  each and say to point the firmware entry at `EFI/zboot/zboot.efi` and then
-  remove it. *Why not refresh or remove them:* refreshing every name took
-  directory scanning, case matching and a bounded write set for little use,
-  and removing one could take away the file firmware boots. An ESP holding
-  only a stale loader still counts as zboot's, so `esp` adds the canonical
-  name there.
-- One plan covers all the ESPs and binds every partition, path and finding;
-  free space is checked when it is made. Each ESP is checked against the plan
-  again as it is written, and each file is replaced atomically. A failure
-  after an earlier ESP changed is partial (exit 4); `esp` keeps no record and
-  is rerun. It writes no firmware boot entry.
+  wrote `zboot-recovery.efi`) are stale and only reported. *Why not refresh or
+  remove them:* refreshing every name took directory scanning, case matching
+  and a bounded write set for little use, and removing one could take away
+  the file firmware boots.
+- One plan covers all the ESPs and binds every partition, path and finding.
+  Each ESP is checked against the plan again as it is written, and each file
+  is replaced atomically. `esp` keeps no record and is rerun.
 
 ### Building the UKI
 
@@ -913,9 +807,9 @@ sanitize failure or an uncertain outcome refuses and never falls back.
   The probe does not prove secure erasure. A system without it refuses every
   erase plan.
 
-QEMU's emulated NVMe has no Sanitize command: WIPE-NATIVE covers metadata
-clearing, and WIPE-SANITIZE-NATIVE runs the native sanitize path against a
-fake `nvme`. [TESTING](TESTING.md#real-hardware) records real-hardware runs.
+QEMU has no NVMe Sanitize command, so the sanitize path is tested natively
+against a fake `nvme` and on real controllers
+([TESTING](TESTING.md#real-hardware)).
 
 ## Booting a root tar in RAM
 
@@ -954,18 +848,15 @@ first, as raw streams without properties, `-R` or `-F`, so encrypted data
 moves without keys. A saved *manifest* records the properties and key
 information to check each copy against.
 
-The steps ([RECOVERY.md](RECOVERY.md#restore-a-disk) lists them for the
-operator): plan; snapshot and hold the source on B; stage the kept trees with
-the receipt and manifest; verify staging without keys, hold it and scrub B;
-erase A and deploy an empty pool and ESP; return the data, relink encryption,
-apply the manifest and verify; make A the boot default and export it. Staging
-stays on B until the operator drops it. Decryption is never exercised, so a
-raw-send bug visible only in decrypted data's MAC would go undetected.
+[RECOVERY.md](RECOVERY.md#restore-a-disk) lists the steps for the operator.
+Staging stays on B until the operator drops it. Decryption is never
+exercised, so a raw-send bug visible only in decrypted data's MAC would go
+undetected.
 
 The source is an explicit recursive `BE@SNAP` or the running BE, snapshotted
 now; nothing chooses a snapshot for a bare BE, so the snapshot the disk's
-serial is typed for is the one the operator named. A returns with the source BE's own `/etc/hostid`, and every import of
-A runs under it.
+serial is typed for is the one the operator named. A returns with the source
+BE's own `/etc/hostid`, and every import of A runs under it.
 
 State is one `zboot:operation` record on B. Staging is `B/zboot-restore-<id>`,
 fenced and marked `zboot:staging=<id>`, with snapshots `@zboot-restore-<id>`
@@ -1073,19 +964,12 @@ no open operation; no persistent writer epoch enforces this across builds.
   transfer ends makes its resume refuse, and once the data is verified an
   abandon refuses too. The refusal names what changed; set it back and
   resume.
-- **Diverged copy.** A snapshot that only the fenced copy has after the last
-  common one stops every sync. `primary` keeps that copy's side; keeping the
-  working copy's has no verb, so destroy the snapshot by hand
-  ([CLI](CLI.md#pairs)).
-- **Key change.** After a key change on the working copy, a sync into an
-  own-root copy makes it need the new key, with no dedicated notice.
-- **Fork leftovers.** A fork leaves in place a staging container that holds
-  something zboot did not make, another tool's snapshot for one, and names
-  it; `drop` removes it after listing what it holds.
-- **ESP copies elsewhere.** A zboot UKI outside zboot's two paths and
-  `EFI/zboot/` itself (in `EFI/Linux/` or a subdirectory, say) is neither
-  refreshed nor reported. Old `EFI/zboot/operations/*.json` files are inert;
-  remove them by hand.
+- **No verb for the rest** ([CLI](CLI.md)): keeping the working copy's side
+  of a diverged pair (destroy the copy's newer snapshot by hand); a notice
+  that a working copy's key change now applies to an own-root copy; removing
+  a fork's staging container that holds something zboot did not make
+  (`drop` it); and zboot UKIs elsewhere on an ESP, which are neither
+  refreshed nor reported.
 - **User property values in tab-separated output.** OpenZFS validates user
   property names, not values, and `zfs get -H` cannot delimit a value that
   holds a tab and a newline. The library's inventory keeps user properties
@@ -1097,58 +981,31 @@ no open operation; no persistent writer epoch enforces this across builds.
   host trusts. JSON output (`-j`) would remove it, but it needs OpenZFS 2.3,
   and the package depends on an unversioned `zfsutils-linux` (Debian 12
   ships 2.1) and is qualified only on 2.4.4.
-- **Qualification.** Results qualify only the exact source, runtime and
-  application combination tested. NVMe sanitize has fake-backend tests,
-  WIPE-SANITIZE-NATIVE and real-hardware runs on two controller models, a
-  block erase on one and a crypto erase on the other.
-  Engine tests alone, with no acceptance case yet, cover `primary` and an
-  incremental sync on a volume, a `canmount=off` leaf in a pair, a power cut
-  in the middle of a sync, and a restore whose boot environment is encrypted
-  or holds a volume. `pair` publishes through the bootstrapping `sync`
-  executor (4e1d4d88, fb1557c4); `PAIR-UNPAIR-NATIVE` and
-  `PAIR-REFUSALS-NATIVE` cover it at qualification, but no case pairs a
-  mounted receiver or resumes an interrupted pair. Not yet run on hardware:
-  `chroot`'s resolver copy, `deploy` without root, and RECOVERY's shell
-  recipes for an older OpenZFS and for an unread property.
-  `EFI-HANDOFF-NATIVE` (a marked boot environment through the Menu)
-  has not run since d4c0b240.
-- **Caller-owned effects.** `EffectScope::dispatch` has offline tests for
-  every shape's argv, its refusals, the revalidation order, custody from
-  another thread, the deadline kill and poisoning, a descendant holding the
-  child's pipes (descriptor and thread counts, in an isolated rerun of the
-  test binary), and native guest cases
-  (`tests/native-api`) for the volume, pool and key shapes, a target
-  replaced between admission and spawn, a refused management key, a
-  refused deferred origin and a child that keeps the lock after its caller
-  is killed. An unreaped child is simulated only; no case puts a child in
-  uninterruptible sleep. Between the last observation and the exec the
+- **Caller-owned effects.** Between the last observation and the exec the
   argv names its operands by name: a writer outside the lock (a raw `zfs`
   command) that destroys a target and creates another at its name in that
   window gets the effect applied to the replacement; cooperating writers
-  cannot, because they wait for the lock. The thread-local custody zboot's own engine uses
-  still runs a writer without the lock on a thread that holds none.
-- **Observation deadlines.** Offline tests run real shell queries: a leader
-  that exits while its descendant keeps stdout, a leader that never exits, a
-  writer that never stops (`yes`, for queries and effects), stdout over its
-  cap, an exit seen only after the deadline, a deadline passed between
-  queries and after the last, a leader reaped elsewhere (never signalled),
-  SIGCHLD ignored (isolated reruns, and through the public API), an effect
-  dispatch whose observation expires (no effect child), and an integration test (`tests/observation_deadline.rs`) through
-  the public API that checks the process's descriptor, thread and child
-  counts after expiry. An unreaped leader is simulated with an ignored
-  signal; a guest case expires a real `zpool` whose wrapper's descendant
-  keeps its pipe. No case holds a query in uninterruptible sleep, and the
-  late reap needs a later bounded query: a caller that makes none keeps the
-  zombie until it exits. Signal safety rests on two things the library checks
-  only at the start of each query and dispatch: a stable SIGCHLD disposition
-  and exclusive reaping of its children for the whole run. A disposition
-  changed to ignored, or a competing reaper (`waitpid(-1)`, a reaping
-  SIGCHLD handler), during the run can release the leader's PID between the
-  `WNOWAIT` check and the kill, so the kill could reach a reused PID's
-  group.
-- **Review coverage.** The pre-publication audit of 8a742c28 did not read the
-  bodies of `restore`, `handoff`, `device`, most of `menu`, the zsnap modules
-  beyond unused code, CLI.md's pairs prose or RECOVERY.md's restore steps.
+  cannot, because they wait for the lock. The thread-local custody zboot's
+  own engine uses still runs a writer without the lock on a thread that holds
+  none.
+- **Observation deadlines.** Signal safety rests on a stable SIGCHLD
+  disposition and exclusive reaping of the library's children, which it
+  checks only at the start of each query and dispatch. A disposition changed
+  to ignored, or a competing reaper (`waitpid(-1)`, a reaping SIGCHLD
+  handler), during the run can release the leader's PID between the
+  `WNOWAIT` check and the kill, so the kill could reach a reused PID's group.
+  An unreaped leader is reaped only by a later bounded query: a caller that
+  makes none keeps the zombie until it exits. No test holds a query or an
+  effect child in uninterruptible sleep; an unreaped child is simulated only.
+- **Test coverage.** Results qualify only the exact source, runtime and
+  application combination tested ([TESTING](TESTING.md#qualification)).
+  Engine tests alone, with no acceptance case, cover `primary` and an
+  incremental sync on a volume, a `canmount=off` leaf in a pair, a power cut
+  in the middle of a sync, and a restore whose boot environment is encrypted
+  or holds a volume. No case pairs a mounted receiver or resumes an
+  interrupted pair. Not yet run on hardware: `chroot`'s resolver copy,
+  `deploy` without root, and RECOVERY's shell recipes for an older OpenZFS
+  and for an unread property.
 
 ### Open questions and follow-ups
 

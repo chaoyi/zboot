@@ -1,6 +1,6 @@
 """A rescue in RAM from a network-booted UKI: `zboot boot --tar -`.
 
-Setup deploys the session's root tar (`prepare-efi --factory`, the docs/RECOVERY.md
+Setup deploys the session's root tar (`prepare --factory`, the docs/RECOVERY.md
 rescue recipe) to A, so the first network boot finds a local pool and
 adopts its hostid. In each RAM leg one SSH session, admitted by `connect`'s
 one-time password, writes ACCESS (the login key and a login marker) in
@@ -21,10 +21,11 @@ import subprocess
 import tarfile
 import time
 
-from cases import efi_connect as _connect, pxe_menu as _pxe
-from cases.rescue_stick import PACKAGES
+from cases import pxe_menu as _pxe
 from host.case import Boot
 from host.console import ConsoleError
+from host.deploy import RESCUE_PACKAGES as PACKAGES
+from host.ssh import command, connect, keygen, keyscan, password_env, record, ssh_argv, write_askpass
 from host.vm import default_memory_mib, sha256
 
 
@@ -32,7 +33,7 @@ ID = 'RAM-BOOT'
 GROUP = 'efi'
 SECONDS = 4200
 DISKS = {'A': 8, 'B': 2, 'D': 2}
-BOOTS = [Boot(1, extra={'setup': 'neutral'}),
+BOOTS = [Boot(1),
          Boot(2, efi=True, network=True, extra={'pxe': True}),
          Boot(3, efi=True, network=True, fresh_disks=True, extra={'pxe': True}),
          Boot(4, efi=True, network=True, fresh_disks=True, extra={'pxe': True, 'memory': 'short'})]
@@ -51,17 +52,7 @@ export PS1
 
 def root_tar(run_dir):
     """The host's copy of the root tar the setup stage deploys."""
-    return Path(run_dir).parents[1] / 'efi-setup-neutral-fixtures' / 'e2e-factory.tar.zst'
-
-
-def generate_key(run_dir):
-    """ACCESS's login key; only its public half leaves this case."""
-    result = subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
-                             '-f', str(run_dir / 'login')], capture_output=True, timeout=30)
-    (run_dir / 'keygen.out').write_bytes(result.stdout)
-    (run_dir / 'keygen.err').write_bytes(result.stderr)
-    if result.returncode:
-        raise RuntimeError(f'login key generation failed: {result.returncode}')
+    return Path(run_dir).parents[1] / 'fixtures/e2e-factory.tar.zst'
 
 
 def memory_plan(tar_bytes, logical_bytes, kernel_bytes):
@@ -107,8 +98,8 @@ def tar_sizes(tar):
 
 
 def prepare(run_dir):
-    generate_key(run_dir)
-    _pxe.write_askpass(run_dir)
+    keygen(run_dir, 'login')  # ACCESS's login key; only its public half leaves this case
+    write_askpass(run_dir)
     # ACCESS, a tar overlay: owners and modes are its own.
     with tarfile.open(run_dir / 'access.tar', 'w', format=tarfile.PAX_FORMAT) as archive:
         for name, mode, data in (('rootfs/root', 0o700, None), ('rootfs/root/.ssh', 0o700, None),
@@ -162,14 +153,14 @@ def session(console, known, after=''):
             + ('exec ' if not after else 'rc=0; ')
             + 'zboot boot --tar - --overlay builtin:rescue --overlay /run/zt-access.tar'
             + (f' || rc=$?; {after}' if after else ''))
-    argv = _connect.ssh_argv(console, known, password=True)
+    argv = ssh_argv(console, known, password=True)
     # A kexec ends the session without a close; keepalives end the client.
     return [argv[0], '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=6', *argv[1:], body]
 
 
 def ram_boot(console):
     """Upload and boot the tar; return once the RAM system's serial login runs."""
-    known, environment = _pxe.connect(console)
+    known, environment = connect(console)
     argv = session(console, known)
     output, errors = (console.case_dir / f'upload-{console.out.name}.{kind}' for kind in ('out', 'err'))
     start = console.pos
@@ -187,7 +178,7 @@ def ram_boot(console):
                 child.wait(timeout=10)
     console._record('ram-boot', 'UKI console from the upload to the RAM system login',
                     console._text(start, console.pos), 0)
-    _connect.record(console, 'ram-upload', argv, subprocess.CompletedProcess(
+    record(console, 'ram-upload', argv, subprocess.CompletedProcess(
         argv, child.returncode, output.read_text(errors='replace'), errors.read_text(errors='replace')))
 
 
@@ -208,20 +199,9 @@ def rescue(console, pool):
                  'test "$i" -lt 60 || exit 1; i=$((i+1)); sleep 1; done; '
                  'ssh-keygen -l -E sha256 -f /etc/ssh/ssh_host_ed25519_key.pub', seconds=90)
     native = (console.out / f'{console.n:02d}-ram-fingerprint.out').read_text().split()[1:2]
-    scan = ['/usr/bin/ssh-keyscan', '-T', '10', '-t', 'ed25519', '-p', str(console.ssh_port), '127.0.0.1']
-    for _ in range(30):  # sshd may start after the login; wait unrecorded
-        if subprocess.run(scan, capture_output=True, timeout=30).stdout.strip():
-            break
-        time.sleep(2)
-    found = _connect.command(console, 'ram-keyscan', scan)
-    if found.returncode or not found.stdout.strip():
-        raise ConsoleError('the RAM system has no SSH listener')
-    known = console.case_dir / f'known-ram-{console.out.name}'
-    known.write_text(found.stdout)
-    checked = _connect.command(console, 'ram-keyscan-fingerprint',
-                               ['/usr/bin/ssh-keygen', '-l', '-E', 'sha256', '-f', known])
-    if checked.returncode or checked.stdout.split()[1:2] != native:
-        raise ConsoleError('the RAM system SSH host key differs from its console fingerprint')
+    # sshd may start after the login.
+    known = keyscan(console, console.case_dir / f'known-ram-{console.out.name}', native,
+                    scan_step='ram-keyscan', check_step='ram-keyscan-fingerprint', tries=30, pause=2)
     script = r'''set -e
 printf 'KEY_LOGIN_OK\n'
 printf 'ROOT_PASSWORD='; awk -F: '$1 == "root" {print $2}' /etc/shadow
@@ -231,11 +211,11 @@ for tty in tty1 ttyS0; do
 done
 journalctl --sync
 journalctl -u ssh.service --no-pager -o cat'''
-    login = _connect.command(console, 'key-login', _connect.ssh_argv(console, known) + [script], timeout=90)
+    login = command(console, 'key-login', ssh_argv(console, known) + [script], timeout=90)
     if login.returncode:
         raise ConsoleError('the RAM system did not accept the ACCESS key')
-    _connect.command(console, 'locked-password', _connect.ssh_argv(console, known, password=True) + ['true'],
-                     env=_connect.password_env(console, 'not-a-password'))
+    command(console, 'locked-password', ssh_argv(console, known, password=True) + ['true'],
+            env=password_env(console, 'not-a-password'))
     if pool:
         console.must('import-local', f'set -e; zpool list -H -o name {POOL} 2>/dev/null || '
                      f'zpool import -N -o readonly=on -o cachefile=none {POOL}; '
@@ -255,7 +235,7 @@ def stage_3(console):
 
 
 def stage_4(console):
-    known, environment = _pxe.connect(console)
+    known, environment = connect(console)
     argv = session(console, known, after='printf "ZT_BOOT_RC=%s\\n" "$rc"; '
                    'printf "UPLOADS="; /bin/busybox ls -A /run/zboot/upload | /bin/busybox wc -l; '
                    '/bin/busybox grep MemAvailable /proc/meminfo')
@@ -267,7 +247,7 @@ def stage_4(console):
                                     timeout=left, env=environment, start_new_session=True)
         except subprocess.TimeoutExpired as error:
             raise ConsoleError('boot --tar neither refused nor returned on a short machine') from error
-    _connect.record(console, 'short-boot', argv, result)
+    record(console, 'short-boot', argv, result)
     console._record('short-console', 'UKI console during the refused boot', console._text(start, None), 0)
     if 'ZT_BOOT_RC=' not in result.stdout:
         raise ConsoleError('the short-RAM session did not report boot --tar')

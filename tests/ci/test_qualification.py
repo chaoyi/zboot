@@ -23,7 +23,7 @@ class Aggregation(unittest.TestCase):
                      if shard['suite'] == 'acceptance' else ['native-proof-complete'])
             (directory / 'result.json').write_text(json.dumps({
                 **shard, 'expected_cases': shard['cases'], 'cases': cases,
-                'source_oid': CI.head(), 'build_sha256': 'a' * 64, 'passed': True, 'vm_accelerator': 'kvm',
+                'source_oid': CI.head(), 'build_sha256': 'a' * 64, 'passed': True,
             }))
 
     def combine(self, root, succeeds):
@@ -61,7 +61,7 @@ class Aggregation(unittest.TestCase):
             self.records(root)
             path = root / 'acceptance-00/result.json'
             saved = json.loads(path.read_text())
-            for field, value in [('source_oid', 'b' * 40), ('build_sha256', 'b' * 64), ('vm_accelerator', 'tcg')]:
+            for field, value in [('source_oid', 'b' * 40), ('build_sha256', 'b' * 64)]:
                 record = {**saved, field: value}
                 path.write_text(json.dumps(record))
                 self.combine(root, False)
@@ -76,18 +76,24 @@ class Aggregation(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'omits required'):
                 CI.verify_build(root)
 
-    def test_equivalent_source_does_not_allow_changed_runtime_bytes(self):
+    def test_changed_runtime_bytes_or_another_source_are_refused(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             files = {}
-            for name in ('usr/lib/zboot/zboot.efi', 'vmlinuz', 'usr/bin/zboot', 'usr/bin/zsnap'):
+            for name in ('usr/lib/zboot/zboot.efi', 'vmlinuz', 'usr/bin/zboot', 'usr/bin/zsnap', 'SHA256SUMS'):
                 path = root / 'distribution' / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b'original')
                 files[str(path.relative_to(root))] = CI.sha(path)
             (root / 'build.json').write_text(json.dumps({'source_oid': 'a' * 40, 'files': files}))
+            with self.assertRaisesRegex(RuntimeError, 'not of this checkout'):
+                CI.verify_build(root)
+            (root / 'factory.tar.zst').write_bytes(b'factory')
+            (root / 'factory.sha256').write_text(f"{CI.sha(root / 'factory.tar.zst')}  factory.tar.zst\n")
+            (root / 'build.json').write_text(json.dumps({'source_oid': CI.head(), 'files': files}))
+            CI.verify_build(root)
             (root / 'distribution/usr/bin/zboot').write_bytes(b'changed')
-            with patch.object(CI, 'verify_product_source'), self.assertRaisesRegex(RuntimeError, 'changed distribution'):
+            with self.assertRaisesRegex(RuntimeError, 'changed distribution'):
                 CI.verify_build(root)
 
     def test_failed_prepare_retains_raw_assertion_evidence_and_excludes_keys(self):
@@ -130,6 +136,16 @@ class Aggregation(unittest.TestCase):
         selected = [case for shard in CI.plan()['include'] for case in shard['cases']]
         self.assertEqual(sorted(selected), sorted(CI.cases()))
         self.assertEqual(len(selected), len(set(selected)))
+
+    def test_efi_connect_runs_alone_and_no_other_shard_outlasts_it(self):
+        shards = [shard['cases'] for shard in CI.plan()['include'] if shard['suite'] == 'acceptance']
+        self.assertIn(['EFI-CONNECT'], shards)
+        self.assertLessEqual(len(shards) + 2, 20, 'every job fits in the concurrent-job limit')
+        longest = CI.minutes('EFI-CONNECT')
+        for cases in shards:
+            if cases != ['EFI-CONNECT']:
+                self.assertLess(sum(map(CI.minutes, cases)), longest, cases)
+        self.assertEqual(set(CI.MINUTES) - set(CI.cases()), set(), 'timings name current cases')
 
 
 if __name__ == '__main__':

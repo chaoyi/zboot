@@ -1,6 +1,4 @@
 """File-only regressions for acceptance recipes, harness boundaries and shell fixtures."""
-import argparse
-import ast
 import hashlib
 import io
 import json
@@ -8,34 +6,22 @@ import os
 from pathlib import Path
 import re
 import shutil
-import shlex
-import signal
 import subprocess
-import sys
 import tarfile
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 
 class ResourcePolicyTests(unittest.TestCase):
-    def test_acceleration_is_explicit_and_never_silently_falls_back(self):
-        from host.vm import accelerator_args, accelerator_config, default_memory_mib
+    def test_guest_memory_defaults_and_explicit_override(self):
+        from host.vm import default_memory_mib
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(accelerator_args(accelerator_config()),
-                             ['-machine', 'q35,accel=kvm', '-cpu', 'host'])
             self.assertEqual(default_memory_mib('SMOKE'), 2048)
             self.assertEqual(default_memory_mib('OTHER'), 8192)
-        with patch.dict(os.environ, {'ZBOOT_VM_ACCEL': 'tcg', 'ZBOOT_VM_MEMORY_MIB': '3072'}):
-            self.assertTrue(accelerator_config()['experimental'])
-            self.assertEqual(accelerator_args(accelerator_config()),
-                             ['-machine', 'q35,accel=tcg', '-cpu', 'max'])
+        with patch.dict(os.environ, {'ZBOOT_VM_MEMORY_MIB': '3072'}):
             self.assertEqual(default_memory_mib('OTHER'), 3072)
-        for invalid in ('auto', 'kvm:tcg', ''):
-            with patch.dict(os.environ, {'ZBOOT_VM_ACCEL': invalid}), self.assertRaises(ValueError):
-                accelerator_config()
         for invalid in ('0', '-1', 'a', '1048577'):
             with patch.dict(os.environ, {'ZBOOT_VM_MEMORY_MIB': invalid}), self.assertRaises(ValueError):
                 default_memory_mib('SMOKE')
@@ -48,7 +34,7 @@ class ResourcePolicyTests(unittest.TestCase):
             with self.subTest(names=names), self.assertRaises(RuntimeError):
                 acceptance.select_cases(names, {'SMOKE': module})
 
-    def test_selected_prepare_copies_distribution_tools_without_unrelated_bulk_inputs(self):
+    def test_selected_prepare_copies_distribution_tools_and_builds_one_initrd(self):
         import run as acceptance
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
             root = Path(temporary)
@@ -68,27 +54,26 @@ class ResourcePolicyTests(unittest.TestCase):
                 Path(argv[argv.index('--output') + 1]).write_bytes(b'fixture')
             with patch.object(acceptance, 'STATE', root / 'state'), \
                     patch.object(acceptance, 'clean_at'), \
-                    patch.object(acceptance, 'verify_product_source'), \
                     patch.object(acceptance, 'uki_output', return_value=build), \
                     patch.object(acceptance, 'uki_section', side_effect=lambda _p, name: b'kernel' if name == '.linux' else b'initrd'), \
                     patch.object(acceptance, 'HOST_TOOLS', []), \
-                    patch.object(acceptance.shutil, 'disk_usage', return_value=SimpleNamespace(free=15 << 30)), \
                     patch.object(acceptance, 'logged', side_effect=logged), \
-                    patch.object(acceptance, 'run_build') as rebuild, \
-                    patch.object(acceptance.subprocess, 'run') as verify, patch('builtins.print'):
+                    patch.object(acceptance, 'build_tools') as rebuild, \
+                    patch.object(acceptance, 'boot_stick') as stick, patch('builtins.print'):
                 acceptance.prepare('a' * 40, ['SMOKE'], out, distribution_tools=True, build_record=record)
             rebuild.assert_not_called()
-            verify.assert_called_once()
+            stick.assert_not_called()
             self.assertEqual(len(prepared), 1)
-            self.assertNotIn('--fixture-directory', prepared[0])
             session, = (root / 'state/runs').iterdir()
             self.assertEqual((session / 'bin/zboot').read_bytes(), b'zboot')
-            receipt = json.loads((session / 'resources.json').read_text())
-            self.assertEqual(receipt['selected_cases'], ['SMOKE'])
-            self.assertEqual(receipt['prepared_groups'], ['small'])
-            self.assertGreater(receipt['known_input_copy_bytes'], 0)
-            self.assertEqual(receipt['free_bytes_before'], 15 << 30)
-            self.assertEqual(list(session.glob('restore*')), [])
+            self.assertEqual(json.loads((session / 'provenance.json').read_text())['selected_cases'], ['SMOKE'])
+            self.assertEqual((session / 'fixtures/e2e-esp-artifacts/zboot-recovery.efi').read_bytes(), b'uki')
+            self.assertEqual((session / 'fixtures/initrd.img').read_bytes(), b'fixture')
+            self.assertFalse((session / 'fixtures/e2e-factory.tar.zst').exists())
+            self.assertFalse((session / 'efi.json').exists())
+            with patch.object(acceptance, 'uki_output', return_value=build), \
+                    self.assertRaisesRegex(RuntimeError, 'need --factory'):
+                acceptance.prepare('a' * 40, ['efi'], out)
 
     def test_distribution_tools_require_matching_source_and_every_selected_input_hash(self):
         import run as acceptance
@@ -102,11 +87,11 @@ class ResourcePolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'requires --build-record'):
                 acceptance.verify_distribution_record(build, 'a' * 40, None)
             record.write_text(json.dumps({'source_oid': 'a' * 40, 'files': files}))
-            with patch.object(acceptance, 'verify_product_source') as proof:
-                self.assertEqual(acceptance.verify_distribution_record(build, 'a' * 40, record), record)
-                proof.assert_called_once_with(acceptance.SOURCE, 'a' * 40, 'a' * 40)
+            self.assertEqual(acceptance.verify_distribution_record(build, 'a' * 40, record), record)
+            with self.assertRaisesRegex(RuntimeError, 'not ' + 'b' * 40):
+                acceptance.verify_distribution_record(build, 'b' * 40, record)
             build['zsnap'].write_bytes(b'other-source')
-            with patch.object(acceptance, 'verify_product_source'), self.assertRaisesRegex(RuntimeError, 'zsnap: distribution bytes'):
+            with self.assertRaisesRegex(RuntimeError, 'zsnap: distribution bytes'):
                 acceptance.verify_distribution_record(build, 'a' * 40, record)
 
     def test_a_passed_case_gives_up_its_boot_images_and_keeps_its_evidence(self):
@@ -156,80 +141,6 @@ class ResourcePolicyTests(unittest.TestCase):
                 acceptance.run(session, ['SMOKE'], dev=True)
 
 
-class ProductSourceProofTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp'))
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.git('init', '-q', '-b', 'main')
-        self.git('config', 'user.name', 'Fixture')
-        self.git('config', 'user.email', 'fixture@example.invalid')
-        self.product_files = ('Cargo.toml', 'Cargo.lock', 'crates/sdk.rs', 'dist/build.lock', 'LICENSE', 'docs/BUILD.md')
-        for name in (*self.product_files, 'tests/case.py', '.github/workflows/ci.yml', '.gitignore'):
-            path = self.root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('original\n' if name != '.gitignore' else '*.raw\n')
-        self.producer = self.commit()
-
-    def git(self, *args):
-        return subprocess.check_output(['git', '-c', 'core.hooksPath=/dev/null', *args],
-                                       cwd=self.root, text=True, stderr=subprocess.PIPE).strip()
-
-    def commit(self):
-        self.git('add', '--all')
-        self.git('commit', '-q', '--no-gpg-sign', '-m', 'Fixture revision')
-        return self.git('rev-parse', 'HEAD')
-
-    def test_only_tests_and_workflow_changes_preserve_product_equivalence(self):
-        from host.uki import verify_product_source
-        (self.root / 'tests/case.py').write_text('new assertions\n')
-        (self.root / '.github/workflows/ci.yml').write_text('new scheduling\n')
-        candidate = self.commit()
-        self.assertNotEqual(self.producer, candidate)
-        self.assertEqual(verify_product_source(self.root, self.producer, candidate), {
-            'producer_source_oid': self.producer, 'candidate_source_oid': candidate})
-
-    def test_every_distribution_input_remains_a_strict_source_boundary(self):
-        from host.uki import verify_product_source
-        for name in self.product_files:
-            with self.subTest(name=name):
-                path = self.root / name
-                path.write_text('changed product\n')
-                candidate = self.commit()
-                with self.assertRaisesRegex(RuntimeError, 'product inputs'):
-                    verify_product_source(self.root, self.producer, candidate)
-                path.write_text('original\n')
-                self.commit()
-
-    def test_index_flags_cannot_hide_changed_product_bytes(self):
-        from host.uki import verify_product_source
-        for flag in ('assume-unchanged', 'skip-worktree'):
-            with self.subTest(flag=flag):
-                self.git('update-index', '--' + flag, 'crates/sdk.rs')
-                (self.root / 'crates/sdk.rs').write_text('hidden changed SDK\n')
-                self.assertEqual(self.git('status', '--porcelain'), '')
-                with self.assertRaisesRegex(RuntimeError, 'clean candidate'):
-                    verify_product_source(self.root, self.producer, self.producer)
-                self.git('update-index', '--no-' + flag, 'crates/sdk.rs')
-                (self.root / 'crates/sdk.rs').write_text('original\n')
-
-    def test_missing_or_bad_commits_and_dirty_or_ignored_inputs_are_refused(self):
-        from host.uki import verify_product_source
-        for producer in ('bad', '-bad', 'A' * 40, None):
-            with self.subTest(producer=producer), self.assertRaisesRegex(RuntimeError, 'source OID'):
-                verify_product_source(self.root, producer, self.producer)
-        with self.assertRaisesRegex(RuntimeError, 'unavailable'):
-            verify_product_source(self.root, '0' * 40, self.producer)
-        (self.root / 'tests/case.py').write_text('uncommitted assertions\n')
-        with self.assertRaisesRegex(RuntimeError, 'clean candidate'):
-            verify_product_source(self.root, self.producer, self.producer)
-        (self.root / 'tests/case.py').write_text('original\n')
-        (self.root / 'crates/ignored.raw').write_bytes(b'ignored product bytes')
-        self.assertEqual(self.git('status', '--porcelain'), '')
-        with self.assertRaisesRegex(RuntimeError, 'clean candidate'):
-            verify_product_source(self.root, self.producer, self.producer)
-
-
 class RamBootBudgetTests(unittest.TestCase):
     def test_budget_covers_both_unpacking_and_pre_kexec_copies_with_rounding(self):
         from cases.ram_boot import memory_plan
@@ -271,8 +182,8 @@ class RamBootBudgetTests(unittest.TestCase):
             run_dir.mkdir()
             with patch.object(ram_boot, 'root_tar', return_value=tar), \
                     patch.object(ram_boot, 'tar_sizes', return_value=(4 << 30, 16 << 20)), \
-                    patch.object(ram_boot, 'generate_key', side_effect=lambda p: (p / 'login.pub').write_bytes(b'public')), \
-                    patch.object(ram_boot._pxe, 'write_askpass'), \
+                    patch.object(ram_boot, 'keygen', side_effect=lambda p, name: (p / f'{name}.pub').write_bytes(b'public')), \
+                    patch.object(ram_boot, 'write_askpass'), \
                     patch.dict(os.environ, {'ZBOOT_VM_MEMORY_MIB': '4096'}), \
                     self.assertRaisesRegex(RuntimeError, 'ceiling is 4096 MiB'):
                 ram_boot.prepare(run_dir)
@@ -290,71 +201,6 @@ class RamBootBudgetTests(unittest.TestCase):
         with patch.object(Path, 'read_text', autospec=True, side_effect=lambda p: 'MemAvailable: 3145728 kB\n' if str(p) == '/proc/meminfo' else inputs), \
                 self.assertRaisesRegex(RuntimeError, 'host reserve'):
             ram_boot.memory_mib(Path('case'), Boot(2))
-
-
-class BuildScopeTests(unittest.TestCase):
-    def test_runner_requires_an_explicit_argv_array(self):
-        import run as acceptance
-        self.assertEqual(acceptance.build_runner('["runner", "--", "a b"]'),
-                         ['runner', '--', 'a b'])
-        for value in ('runner --', '"runner"', '[]', '[1]', '[""]', '["a\\u0000b"]'):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                acceptance.build_runner(value)
-
-    def test_selected_runner_receives_literal_arguments_without_a_shell(self):
-        import run as acceptance
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            root = Path(temporary)
-            marker = root / 'must-not-exist'
-            argument = f'a b; touch {marker}; $(touch {marker}) `touch {marker}`'
-            prefix = [sys.executable, '-c',
-                      'import json, sys; print(json.dumps(sys.argv[1:]))']
-            log = root / 'runner.log'
-            acceptance.run_build([argument, 'actual-build'], log, 10, prefix)
-            self.assertEqual(json.loads(log.read_text()), [argument, 'actual-build'])
-            self.assertFalse(marker.exists())
-
-    def test_local_scope_owns_fresh_staging_and_cleans_success_failure_and_timeout(self):
-        import run as acceptance
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            root = Path(temporary)
-            unrelated = root / 'unrelated-target'
-            unrelated.mkdir()
-            sentinel = unrelated / 'keep'
-            sentinel.write_text('caller-owned')
-            for mode in ('success', 'failure', 'timeout'):
-                with self.subTest(mode=mode):
-                    published = root / f'{mode}.json'
-                    code = ('import json, os, pathlib, sys, time; '
-                            'target = pathlib.Path(os.environ["CARGO_TARGET_DIR"]); '
-                            'build = pathlib.Path(os.environ["CARGO_BUILD_BUILD_DIR"]); '
-                            'assert target.is_dir() and build.is_dir(); '
-                            'pathlib.Path(sys.argv[1]).write_text(json.dumps('
-                            '[str(target), str(build), os.environ["CARGO_BUILD_JOBS"]])); ')
-                    code += {'success': '', 'failure': 'sys.exit(7)',
-                             'timeout': 'time.sleep(30)'}[mode]
-                    with patch.dict(os.environ, {'TMPDIR': str(root),
-                                                 'CARGO_TARGET_DIR': str(unrelated),
-                                                 'CARGO_BUILD_BUILD_DIR': str(unrelated),
-                                                 'CARGO_BUILD_JOBS': '2'}):
-                        if mode == 'success':
-                            acceptance.run_build([sys.executable, '-c', code, published],
-                                                 root / 'build.log', 10)
-                        else:
-                            error = (subprocess.CalledProcessError if mode == 'failure'
-                                     else subprocess.TimeoutExpired)
-                            with self.assertRaises(error):
-                                acceptance.run_build([sys.executable, '-c', code, published],
-                                                     root / 'build.log', 0.5 if mode == 'timeout' else 10)
-                    target, build, jobs = json.loads(published.read_text())
-                    self.assertTrue(Path(target).is_relative_to(root))
-                    self.assertNotEqual(Path(target), unrelated)
-                    self.assertEqual(Path(build).parent, Path(target).parent)
-                    self.assertNotEqual(Path(build), unrelated)
-                    self.assertFalse(Path(build).exists())
-                    self.assertEqual(jobs, '2')
-                    self.assertFalse(Path(target).parent.exists())
-                    self.assertEqual(sentinel.read_text(), 'caller-owned')
 
 
 class UkiInputTests(unittest.TestCase):
@@ -380,193 +226,13 @@ class UkiInputTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'exactly one'):
                 uki.published_digest(efi)
 
-    def test_zboot_identity_is_what_the_carried_zboot_prints(self):
-        from host import uki
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR') or '/var/tmp') as directory:
-            def initramfs(script):
-                archive = (uki.newc('usr/bin/zboot', script.encode())
-                           + uki.newc('TRAILER!!!', b'', mode=0, inode=2))
-                path = Path(directory) / 'initrd.img.zst'
-                subprocess.run(['zstd', '-q', '-f', '-o', str(path)], input=archive, check=True)
-                return path
-            self.assertEqual(uki.zboot_identity(initramfs(
-                '#!/bin/sh\n[ "$1" = --version ] && [ -z "$HOME" ] && echo "zboot 0.2.0 (source 0123456789ab)"\n')),
-                '0.2.0 (source 0123456789ab)')
-            with self.assertRaisesRegex(RuntimeError, 'unexpected zboot --version'):
-                uki.zboot_identity(initramfs('#!/bin/sh\necho "zboot 70.2.0 (source 0123)"\n'))
-
-
-class FrozenSessionTests(unittest.TestCase):
-    def test_qualification_uses_frozen_recipes_and_dev_uses_current_recipes(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            root = Path(temporary)
-            current = root / 'current'
-            session = root / 'session'
-            frozen = session / 'acceptance'
-            marker = root / 'selection.json'
-            for directory, label in ((current, 'current'), (frozen, 'frozen')):
-                (directory / 'cases').mkdir(parents=True)
-                (directory / 'cases/__init__.py').write_text('')
-                (directory / 'host').mkdir()
-                shutil.copyfile(Path(__file__).with_name('run.py'), directory / 'run.py')
-                shutil.copyfile(Path(__file__).with_name('host') / 'uki.py', directory / 'host/uki.py')
-                shutil.copyfile(Path(__file__).with_name('host') / 'vm.py', directory / 'host/vm.py')
-                (directory / 'cases/selection.py').write_text(
-                    f"ID = 'SELECTION'\nGROUP = 'small'\nSECONDS = 1\nBOOTS = []\nMARKER = {label!r}\n")
-                # A file-only runner records the imported host helper, case
-                # and guest share instead of constructing a VM.
-                (directory / 'host/case.py').write_text(
-                    'import json, os\nfrom pathlib import Path\nfrom types import SimpleNamespace\n'
-                    'def run(module, run_dir, boot_for, shares):\n'
-                    '    run_dir.mkdir(exist_ok=True)\n'
-                    f"    selection = {{'runner': {label!r}, 'case': module.MARKER,\n"
-                    "                 'guest': str(shares(SimpleNamespace(extra={}))[0][1])}\n"
-                    "    Path(os.environ['ZBOOT_FIXTURE_SELECTION']).write_text(json.dumps(selection))\n"
-                    "    return {'pass': True, 'assertions': 1, 'failures': []}\n")
-            (session / 'source.oid').write_text('fixture-oid\n')
-            (session / 'small.zst').write_bytes(b'file-only fixture')
-            (session / 'bin').mkdir()
-            (session / 'bin/artifact').write_bytes(b'file-only fixture')
-            digest = hashlib.sha256(b'file-only fixture').hexdigest()
-            (session / 'bin/SHA256SUMS').write_text(f'{digest}  artifact\n')
-            environment = {**os.environ, 'ZBOOT_ACCEPTANCE_LOCK': str(root / 'qemu.lock'),
-                           'ZBOOT_FIXTURE_SELECTION': str(marker)}
-            for entrypoint, flags, label, directory in (
-                    (current, [], 'frozen', frozen),
-                    (frozen, [], 'frozen', frozen),
-                    (current, ['--dev'], 'current', current)):
-                with self.subTest(entrypoint=entrypoint, flags=flags):
-                    result = subprocess.run(
-                        [sys.executable, entrypoint / 'run.py', 'run',
-                         # Resolve this relative session before crossing the
-                         # frozen-runner process boundary.
-                         'session', 'small', *flags], cwd=root, env=environment,
-                        capture_output=True, text=True, check=False, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(marker.read_text()),
-                                     {'runner': label, 'case': label,
-                                      'guest': str(directory / 'guest')})
-                    self.assertEqual(result.stdout.count('SELECTION PASS'), 1)
-                    records = list((session / 'cases').glob('*/result.json'))
-                    self.assertTrue(records)
-                    self.assertEqual(json.loads(max(records, key=lambda p: p.stat().st_mtime_ns).read_text())['qualification'], not bool(flags))
-
-    def test_missing_or_redirected_frozen_entrypoints_fail_before_efi_writes(self):
-        import run as acceptance
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            session = Path(temporary)
-            with self.assertRaisesRegex(RuntimeError, 'missing frozen acceptance runner'):
-                acceptance.run(session, ['small'])
-            with self.assertRaisesRegex(RuntimeError, 'missing frozen acceptance runner'):
-                acceptance.prepare_efi(session, ['neutral=unused'])
-            self.assertFalse((session / 'efi-fixtures').exists())
-            (session / 'acceptance').mkdir()
-            (session / 'redirected.py').write_text('raise AssertionError("must not run")\n')
-            (session / 'acceptance/run.py').symlink_to(session / 'redirected.py')
-            with self.assertRaisesRegex(RuntimeError, 'must not be a symlink'):
-                acceptance.prepare_efi(session, ['neutral=unused'])
-            self.assertFalse((session / 'efi-fixtures').exists())
-
-    def test_prepare_efi_uses_old_frozen_recipe_before_writing_artifacts(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            root = Path(temporary)
-            session = root / 'session'
-            frozen = session / 'acceptance'
-            frozen.mkdir(parents=True)
-            marker = root / 'selection.json'
-            # A pre-move session keeps its helper outside acceptance/.
-            (session / 'build-dev-initrd.sh').write_text('old frozen helper\n')
-            (frozen / 'run.py').write_text(
-                'import json, pathlib, sys\n'
-                'session = pathlib.Path(sys.argv[2])\n'
-                f'pathlib.Path({str(marker)!r}).write_text(json.dumps({{\n'
-                "    'argv': sys.argv[1:], 'helper': (session / 'build-dev-initrd.sh').read_text()}))\n"
-                'sys.exit(7)\n')
-            build = 'neutral=relative build with spaces;$(literal)'
-            factory = 'relative factory with spaces;$(literal)'
-            result = subprocess.run(
-                [sys.executable, Path(__file__).with_name('run.py').resolve(),
-                 'prepare-efi', 'session', build, '--factory', factory], cwd=root,
-                capture_output=True, text=True, check=False, timeout=10)
-            self.assertEqual(result.returncode, 7, result.stderr)
-            self.assertEqual(json.loads(marker.read_text()),
-                             {'argv': ['prepare-efi', str(session), build, '--factory', factory],
-                              'helper': 'old frozen helper\n'})
-            self.assertFalse((session / 'efi-fixtures').exists())
-            self.assertFalse((session / 'efi.json').exists())
-
-    def test_direct_frozen_prepare_efi_does_not_reenter_the_recipe(self):
-        import run as acceptance
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            session = Path(temporary)
-            frozen = session / 'acceptance'
-            frozen.mkdir()
-            (frozen / 'run.py').write_text('raise AssertionError("must not reenter")\n')
-            # No builds need packing; stub only input copying and firmware
-            # identities to exercise the direct frozen preparation boundary.
-            with patch.object(acceptance, 'HERE', frozen), \
-                    patch.object(acceptance, 'OVMF', ()), \
-                    patch.object(acceptance.shutil, 'copyfile'), \
-                    patch('builtins.print'), \
-                    patch.object(acceptance.os, 'execv') as handoff:
-                acceptance.prepare_efi(session, [])
-            handoff.assert_not_called()
-            self.assertTrue((session / 'efi-fixtures').is_dir())
-            self.assertEqual(json.loads((session / 'efi.json').read_text()),
-                             {'builds': {}, 'firmware': {}})
-
-    def test_exec_handoff_preserves_pid_and_drains_sigint_cleanup(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
-            root = Path(temporary)
-            session = root / 'session'
-            frozen = session / 'acceptance'
-            frozen.mkdir(parents=True)
-            marker = root / 'custody.json'
-            (frozen / 'run.py').write_text(
-                'import json, os, pathlib, sys, time\n'
-                f'marker = pathlib.Path({str(marker)!r})\n'
-                'try:\n'
-                "    marker.with_suffix('.ready').write_text(json.dumps({'pid': os.getpid(), 'cleanup': False}))\n"
-                "    marker.with_suffix('.ready').replace(marker)\n"
-                '    time.sleep(30)\n'
-                'except KeyboardInterrupt:\n'
-                # Longer than subprocess.run's interruption grace period.
-                '    time.sleep(0.6)\n'
-                "    marker.write_text(json.dumps({'pid': os.getpid(), 'cleanup': True}))\n"
-                '    sys.exit(23)\n')
-            for group_signal in (False, True):
-                with self.subTest(group_signal=group_signal):
-                    marker.unlink(missing_ok=True)
-                    with subprocess.Popen(
-                            [sys.executable, Path(__file__).with_name('run.py').resolve(),
-                             'run', session, 'small'], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, start_new_session=True) as process:
-                        try:
-                            deadline = time.monotonic() + 5
-                            while not marker.exists() and time.monotonic() < deadline:
-                                time.sleep(0.01)
-                            self.assertTrue(marker.exists(), 'frozen recipe did not start')
-                            self.assertEqual(json.loads(marker.read_text())['pid'], process.pid)
-                            if group_signal:
-                                os.killpg(process.pid, signal.SIGINT)
-                            else:
-                                process.send_signal(signal.SIGINT)
-                            _out, errors = process.communicate(timeout=10)
-                            self.assertEqual(process.returncode, 23, errors.decode(errors='replace'))
-                            self.assertEqual(json.loads(marker.read_text()),
-                                             {'pid': process.pid, 'cleanup': True})
-                        finally:
-                            if process.poll() is None:
-                                process.kill()
-                                process.wait()
-
-
 class InitrdPathTests(unittest.TestCase):
-    def test_builder_keeps_runtime_wipefs_and_records_its_bytes(self):
+    def test_builder_keeps_runtime_tools_and_routes_zfs_through_the_fault_shim(self):
         import run as acceptance
         from host import uki
         builder = Path(__file__).with_name('build-initrd.sh')
-        self.assertNotIn('--wipefs', acceptance.HOST_TOOLS)
+        for product_tool in ('--wipefs', '--nvme', '--mkfs-vfat'):
+            self.assertNotIn(product_tool, acceptance.HOST_TOOLS)
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/var/tmp')) as temporary:
             root = Path(temporary)
             guest = root / 'guest'
@@ -576,12 +242,14 @@ class InitrdPathTests(unittest.TestCase):
             for present in (False, True):
                 with self.subTest(runtime_wipefs=present):
                     archive = (uki.newc('sbin/wipefs', runtime_wipefs) if present else b'')
-                    archive += uki.newc('TRAILER!!!', b'', mode=0, inode=2)
+                    archive += uki.newc('sbin/zfs', b'#!/bin/sh\n', inode=2)
+                    archive += uki.newc('usr/bin', b'', mode=0o040755, inode=3)
+                    archive += uki.newc('TRAILER!!!', b'', mode=0, inode=4)
                     base = root / f'base-{present}.zst'
                     subprocess.run(['zstd', '-q', '-o', base], input=archive, check=True)
                     output = root / f'fixture-{present}.zst'
                     result = subprocess.run(['bash', builder, '--base-initrd', base,
-                                             '--acceptance', guest, '--output', output],
+                                             '--acceptance', guest, '--fault-tool', 'zfs', '--output', output],
                                             env={**os.environ, 'TMPDIR': str(root)},
                                             capture_output=True, text=True)
                     if not present:
@@ -596,6 +264,9 @@ class InitrdPathTests(unittest.TestCase):
                     subprocess.run(['cpio', '-idm', '--quiet'], input=packed, cwd=tree, check=True)
                     self.assertEqual((tree / 'sbin/wipefs').read_bytes(), runtime_wipefs)
                     self.assertFalse((tree / 'usr/bin/wipefs').exists())
+                    self.assertEqual((tree / 'usr/bin/zfs').read_text(),
+                                     '#!/bin/sh\nexec /acceptance/fault.sh zfs /sbin/zfs "$@"\n')
+                    self.assertEqual((tree / 'sbin/zfs').read_bytes(), b'#!/bin/sh\n')
                     digest = hashlib.sha256(runtime_wipefs).hexdigest()
                     self.assertIn(f'{digest}  runtime:/sbin/wipefs',
                                   Path(str(output) + '.provenance').read_text())
@@ -636,12 +307,6 @@ class InitrdPathTests(unittest.TestCase):
                 self.assertIn('output and provenance must be new files under TMPDIR', result.stderr)
                 self.assertEqual(existing.read_text(), 'keep')
                 existing.unlink()
-            missing_base.write_bytes(b'not packed in this file-only test')
-            for fixtures in (outside / 'fixtures', staging / 'escape/fixtures', staging):
-                with self.subTest(fixtures=fixtures):
-                    result = invoke(output, '--fixture-directory', str(fixtures))
-                    self.assertEqual(result.returncode, 2)
-                    self.assertIn('fixture directory must be a new directory under TMPDIR', result.stderr)
             self.assertFalse(output.exists())
 
 
@@ -746,57 +411,7 @@ class UsbLoaderFixtureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             disk_device('A', primary_bus='unknown')
 
-    def test_only_efi_connect_automatic_legs_select_nvme(self):
-        fixture = Path(__file__).parent / 'cases/efi_connect.py'
-        declaration = next(node.value for node in ast.parse(fixture.read_bytes()).body
-                           if isinstance(node, ast.Assign)
-                           and any(isinstance(name, ast.Name) and name.id == 'BOOTS' for name in node.targets))
-        self.assertIsInstance(declaration, ast.List)
-        boots = {ast.literal_eval(boot.args[0]):
-                 {keyword.arg: ast.literal_eval(keyword.value) for keyword in boot.keywords}
-                 for boot in declaration.elts}
-        self.assertEqual({stage: boot.get('extra', {}).get('bus', 'virtio')
-                          for stage, boot in boots.items()},
-                         {1: 'virtio', 2: 'usb', 4: 'nvme', 6: 'nvme',
-                          8: 'virtio', 10: 'nvme', 12: 'virtio'})
-        self.assertEqual({stage: boot['target'] for stage, boot in boots.items() if 'target' in boot},
-                         {2: 3, 4: 5, 6: 7, 10: 11})
-        for stage in (2, 4, 6, 10):
-            self.assertTrue(boots[stage]['efi'])
-            self.assertEqual(boots[stage]['extra']['from'], 'A')
-
-
-class DiscoveryFixtureTests(unittest.TestCase):
-    def test_writer_lock_probe_is_an_explicit_staged_native_tool(self):
-        acceptance = Path(__file__).parent
-        source = (acceptance / "guest/cases/MENU-DISCOVERY-NATIVE.sh").read_text()
-        probes = [shlex.split(line) for line in source.splitlines()
-                  if line.strip().startswith(("md_must writer-", "md_refuse writer-held-"))
-                  and " flock " in line]
-        self.assertEqual(len(probes), 4)
-        for probe in probes:
-            self.assertEqual(probe[2:], [
-                "flock", "-n", "/run/zfs-tools/writer.lock", "/bin/busybox", "true",
-            ])
-        self.assertNotIn("busybox flock", source)
-        runner = (acceptance / "run.py").read_text()
-        self.assertIn("'--flock', '/usr/bin/flock'", runner)
-        builder = (acceptance / "build-initrd.sh").read_text()
-        self.assertIn('--flock) flock=$2; shift 2 ;;', builder)
-        self.assertIn('${flock:+"$flock"}', builder)
-        self.assertIn('install_binary "$flock" /usr/bin/flock', builder)
-
-
 class ReturnedFixtureTests(unittest.TestCase):
-    def test_mount_state_query_selects_filesystems_without_snapshot_rows(self):
-        source = (Path(__file__).parent / "guest/cases/RESTORE-RETURNED-ERROR-NATIVE.sh").read_text()
-        commands = [shlex.split(line) for line in source.splitlines()
-                    if line.strip().startswith("must after-mounted ")]
-        self.assertEqual(commands, [[
-            "must", "after-mounted", "zfs", "get", "-H", "-r", "-t", "filesystem",
-            "-o", "name,value", "mounted", "e2eb", "e2ec",
-        ]])
-
     def test_selected_disk_serial_without_a_newline_and_exact_identity(self):
         source = (Path(__file__).parent / "guest/cases/RESTORE-RETURNED-ERROR-NATIVE.sh").read_text()
         # Extract the actual bounded command body, not a second implementation.

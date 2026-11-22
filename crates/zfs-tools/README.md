@@ -14,9 +14,9 @@ private engine representations.
 zfs-tools = { path = "../zfs-tools/crates/zfs-tools" }
 ```
 
-The supported API needs no feature. The non-default `internal` feature exists
+The supported API is the crate root. The hidden `engine` module is public
 only for this workspace's `zboot` and `zsnap` applications; it is unsupported
-and unstable, and no other package should enable it. The supported native
+and unstable, and no other package should use it. The supported native
 platform is Linux/OpenZFS; the boot distribution additionally targets x86-64
 UEFI/Debian.
 
@@ -99,50 +99,39 @@ have no serialization interface.
 
 ## Observation deadlines
 
-By default an observation's queries have no deadline. A caller that must
-bound one sets a deadline for the **whole observation**:
+By default an observation's queries have no deadline; zboot's and zsnap's own
+reads never have one. A caller that must bound one sets a deadline for the
+**whole observation** ([why](../../docs/DESIGN.md#caller-owned-effects)):
 `InventoryRequest::within(d)`, `observe_management_within(name, d)`, or
 `WriterSession::admit_effects_within(targets, guard, d)`, which bounds the
-admission's observation and each dispatch's fresh one, every observation
-separately (not the guard or the effect child, whose deadline is
-`dispatch`'s). The deadline starts when the observation does and covers every query it
-runs, each until both of its pipes reach end of file and it exits, and the
-observation's own work on the output: the clock is checked again before a
-query's output is accepted and before the result is returned. Pipes are read
-on the calling thread, one bounded read per ready pipe per wakeup, so
-neither a busy writer nor a descendant that keeps a pipe open can hold the
-caller past the deadline, and no reader thread is left behind. A query's
-standard output is capped at `MAX_QUERY_OUTPUT` (64 MiB): parsing allocates
-rows and fields well beyond the raw bytes, and a host with tens of thousands
-of snapshots emits a few MiB.
+admission's observation and each dispatch's fresh one separately (not the
+guard or the effect child, whose deadline is `dispatch`'s). The deadline
+covers every query, until both of its pipes reach end of file and it exits,
+and the observation's own work on the output. Pipes are read on the calling
+thread, so neither a busy writer nor a descendant holding a pipe open can
+keep the caller past the deadline, and no reader thread is left behind. A
+query's standard output is capped at `MAX_QUERY_OUTPUT` (64 MiB; tens of
+thousands of snapshots are a few MiB). A zero deadline is refused.
 
 A stopped observation returns no result, not even absence: the running
-query's output is discarded, never parsed, no later query starts, and the
-error's `observation_stop()` says why: `Deadline`, `OutputLimit`,
-`QueryFailed` (a pipe or wait error; each with a `QueryCleanup`) or
-`ChildrenNotWaitable`. `QueryCleanup` says exactly what
-was established: `NoneRunning` (the deadline passed between queries or after
-the last; nothing was signalled), `LeaderReaped` (SIGKILL was sent to the
-running query's process group and its leader reaped; members that left the
-group are not proven gone) or `Unconfirmed` (the signal or the reap within
-ten seconds could not be confirmed; the library keeps a leader that is still
-its child and reaps it during later bounded queries, and the error's text
-names the failed step). A read-only query holds no writer lock, so a stop
-does not poison a session. A zero deadline is refused.
+query's output is discarded and no later query starts. The error's
+`observation_stop()` says why: `Deadline`, `OutputLimit`, `QueryFailed` (a
+pipe or wait error), each with a `QueryCleanup`, or `ChildrenNotWaitable`.
+`QueryCleanup` claims only what was established: `NoneRunning` (nothing was
+signalled), `LeaderReaped` (SIGKILL went to the query's process group and its
+leader was reaped; members that left the group are not proven gone) or
+`Unconfirmed` (the library keeps a leader that is still its child and reaps
+it during later bounded queries). A read-only query holds no writer lock, so
+a stop does not poison a session.
 
-The leader is waited for unreaped until its output is complete, so its PID
-still names its group for the kill. That needs this process to keep its
-children waitable: a bounded observation (and a dispatch) refuses before any
-spawn while SIGCHLD is ignored or `SA_NOCLDWAIT` is set
+**Do not reap the library's children yourself** (`waitpid(-1)`, a SIGCHLD
+handler that reaps): the leader is waited for unreaped so its PID still names
+its group for the kill. A bounded observation or a dispatch refuses before
+any spawn while SIGCHLD is ignored or `SA_NOCLDWAIT` is set
 (`ChildrenNotWaitable`), and nothing is signalled once the leader is not
-known to be this process's unreaped child. **Do not reap the library's
-children yourself** (`waitpid(-1)`, a SIGCHLD handler that reaps): the
-library then cannot vouch for what it stopped. The `-v` announcement is
-written to your stderr before each spawn; its time counts against the
-deadline, but a blocked stderr is not interrupted; the deadline is checked
-again after it, before the spawn. zboot's and zsnap's own
-reads never have a deadline: on a large or degraded pool a slow read is not
-a failure there.
+known to be this process's unreaped child. The `-v` announcement written to
+your stderr before each spawn counts against the deadline, but a blocked
+stderr is not interrupted.
 
 ## Caller-owned effects
 
@@ -167,18 +156,16 @@ An application that keeps its own policy runs its native ZFS effects through
    `Uncertain { why }`: what the command said, never what ZFS now holds, so
    read back before continuing and never retry blindly.
 
-The deadline kills the child's process group and waits for the reap. The
-child's pipes are read on the calling thread, a bounded read at a time, so
-the deadline holds whatever the child writes: a descendant that keeps one
-open leaves nothing behind, and only costs the reply's stderr (two seconds
-after the exit, then `(stderr unavailable)`). A kill whose group signal or
-leader reap is not confirmed poisons the session, which then refuses every
-later admission, dispatch and reader protection, release or recovery; its
-holds stay in place. An effect that adds or removes a dataset or pool, or
-rolls one back, ends its admission. No shape sets or inherits a `zboot:` or
-`org.zfs-tools:` key or sets `volsize`; an inheritable key needs a subtree
-admission. Every shape refuses a paired dataset, one another pair record
-still names as its peer, and a pool holding a zboot operation record.
+The deadline kills the child's process group and waits for the reap. A
+descendant that keeps the child's pipes open costs only the reply's stderr
+(two seconds after the exit, then `(stderr unavailable)`). A kill whose group
+signal or leader reap is not confirmed poisons the session, which then
+refuses every later admission, dispatch and reader protection, release or
+recovery; its holds stay in place. An effect that adds or removes a dataset
+or pool, or rolls one back, ends its admission. The rules every shape
+enforces (no management keys or `volsize`, subtree admission for inheritable
+keys, zboot's pairs and unfinished work left alone) and why are in
+[DESIGN](../../docs/DESIGN.md#caller-owned-effects).
 
 The guard takes a `GuardCheck`: no effect at admission, then the effect
 before its observation, then the effect with its bound argv (`argv()`)
@@ -188,7 +175,8 @@ consent names.
 `DevicePath` is taken as given: the library checks its shape, not which disk
 it names. Source it only from your reviewed device selection and keep your
 own wrong-disk proof. Key and passphrase bytes are borrowed, written once to
-the child's standard input and never copied; zeroize them yourself.
+the child's standard input (at most 4096 bytes, one pipe write) and never
+copied; zeroize them yourself.
 
 Each shape exists for a named caller in Fleet (paths in Fleet's
 `engine/fleet-data/src` unless noted):
@@ -256,21 +244,16 @@ and recovery.
 
 ## Applications and compatibility
 
-`zboot` (`crates/zboot`) and `zsnap` (`crates/zsnap`) are separate application
-packages in this workspace. They use the private engine through the `internal`
-feature; their grammar, menu, JSON and exit statuses are compatibility
-contracts. zsnap's pure snapshot policy values and calculations are the root
-API of the `zsnap` library crate; its native transport and property modules
-stay private.
-
-This library builds no command binary and enables no feature by default.
+`zboot` and `zsnap` use the private engine through the hidden `engine` module;
+their grammar, menu, JSON and exit statuses are compatibility contracts.
+zsnap's pure snapshot policy API is the root of the `zsnap` library crate.
+This library builds no command binary and has no Cargo features.
 Reader receipts keep the schema-2 `zctl1:` hold-tag format. Only `zboot:`
 properties are management state; a `zboot:` property this build does not
-read refuses the dataset. Effects also never write the reserved
-`org.zfs-tools:` namespace. Upgrade consumers together with their
-persistent state and recovery paths. There is no public inherited-lock
-protocol (only a closed effect's child inherits the lock), generic RPC
-service or mirrored plumbing CLI.
+read refuses the dataset, and effects never write the reserved
+`org.zfs-tools:` namespace. There is no public inherited-lock protocol (only
+a closed effect's child inherits the lock), generic RPC service or mirrored
+plumbing CLI.
 
 The [checkpoint example](examples/checkpoint.rs) uses only the supported API.
 The [native SDK proof](../../tests/native-api/README.md) runs it against real
@@ -279,7 +262,8 @@ qualify. Offline child-custody and uncertain-outcome tests provide separate
 coverage.
 
 Active writers that touch the same target need qualified shared-state
-compatibility; a matching version is not enough.
-[The design](../../docs/DESIGN.md#consumers-and-compatibility) gives the full rule.
-Qualification applies to the exact source revision, native runtime and
-application combination tested ([testing](../../docs/TESTING.md)).
+compatibility, and are upgraded together with their persistent state and
+recovery paths; a matching version is not enough
+([the rule](../../docs/DESIGN.md#consumers-and-compatibility)). Qualification
+applies to the exact source revision, native runtime and application
+combination tested ([testing](../../docs/TESTING.md)).

@@ -225,7 +225,7 @@ impl Access {
     }
 }
 
-fn brief_lock(purpose: &str) -> Result<Option<zfs_tools::engine::lock::WriterLock>> {
+fn brief_lock(purpose: &str) -> Result<zfs_tools::engine::lock::WriterLock> {
     crate::menu::after_imports(|| {
         zfs_tools::engine::lock::for_command("zboot", purpose).map_err(|e| refuse(e.to_string()))
     })

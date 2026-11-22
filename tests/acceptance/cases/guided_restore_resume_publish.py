@@ -15,7 +15,7 @@ ID = 'GUIDED-RESTORE-RESUME-PUBLISH'
 GROUP = 'efi'
 SECONDS = 7200
 DISKS = guided.DISKS
-BOOTS = [Boot(1, extra={'setup': 'neutral'}), Boot(2, efi=True), Boot(3, efi=True),
+BOOTS = [Boot(1), Boot(2, efi=True), Boot(3, efi=True),
          Boot(4, efi=True, poweroff=True, extra={'from': 'A'}), Boot(5, efi=True)]
 
 

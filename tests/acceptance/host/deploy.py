@@ -2,6 +2,10 @@
 import re
 from host.console import FAILURES
 
+# The docs/RECOVERY.md rescue recipe's packages, which the factory root installs.
+RESCUE_PACKAGES = {'openssh-server', 'systemd-resolved', 'ca-certificates', 'curl', 'rsync',
+                   'less', 'vim-tiny', 'pciutils', 'usbutils', 'smartmontools', 'cryptsetup'}
+
 
 def boot(console, dataset):
     console.ready()

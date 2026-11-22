@@ -10,6 +10,9 @@ pub(crate) struct Cli {
     /// Print native commands and diagnostic details to stderr.
     #[arg(short = 'v', global = true)]
     pub(crate) verbose: bool,
+    /// Print the plan (with its token, if any) or the outcome as JSON.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
     #[command(subcommand)]
     pub(crate) command: Verb,
 }
@@ -30,8 +33,9 @@ pub(crate) enum Verb {
         into: Option<DeployInto>,
         /// Whole-disk device, e.g. /dev/disk/by-id/nvme-...
         disk: Option<String>,
-        /// Create a new image file, sized to its content; an existing file is refused.
-        #[arg(long, value_name = "FILE")]
+        /// Create a new image file, sized to its content; an existing file is
+        /// refused. An image loses nothing, so it takes no --confirm.
+        #[arg(long, value_name = "FILE", conflicts_with = "confirm")]
         image: Option<std::path::PathBuf>,
         /// No host identity, swap or boot default; read-only root with RAM writes.
         #[arg(long,conflicts_with_all=["hostid","swap","esp_partition","empty"])]
@@ -82,16 +86,8 @@ pub(crate) enum Verb {
         /// Swap partition size, e.g. 8G (default: none).
         #[arg(long, value_parser = parse_size)]
         swap: Option<u64>,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed
-        /// (DISK only: an image loses nothing).
-        #[arg(long, conflicts_with_all = ["dry_run", "image"])]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Rebuild disk A from a boot environment on surviving disk B, keeping
     /// selected dataset trees of A; erases A after typed confirmation.
@@ -112,35 +108,20 @@ pub(crate) enum Verb {
         /// Swap size, e.g. 8G, or 0 (default: A's current swap, else none).
         #[arg(long, value_parser = parse_size)]
         swap: Option<u64>,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Continue an interrupted operation, selected by ID or as the only record.
     Resume {
         id: Option<String>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// End an interrupted operation without destroying data.
     Abandon {
         id: Option<String>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Build a host-agnostic Debian root tar that boots from ZFS, rootless.
     Factory {
@@ -161,9 +142,6 @@ pub(crate) enum Verb {
         /// More packages, e.g. openssh-server.
         #[arg(long, value_name = "PKG,...", value_delimiter = ',')]
         packages: Vec<String>,
-        /// Print the outcome as JSON.
-        #[arg(long)]
-        json: bool,
     },
     /// Internal factory construction stage.
     #[command(hide = true)]
@@ -178,12 +156,8 @@ pub(crate) enum Verb {
         /// The zboot UKI, otherwise the shipped zboot.efi.
         #[arg(long, value_name = "FILE")]
         efi: Option<std::path::PathBuf>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Rename an unpaired tree within its pool. Across pools use sync,
     /// primary, unpair --release-anchors, then drop.
@@ -194,23 +168,13 @@ pub(crate) enum Verb {
         /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Print the plan or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
     },
     /// Rewind a tree to a snapshot every member has (loss-capable).
     Rollback {
         #[arg(value_name = "DATASET@SNAP")]
         target: String,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Make DATASET's side the working copy: fence a reachable peer and catch
     /// up from it, or take over when DATASET is ahead or diverged (the peer's
@@ -219,15 +183,8 @@ pub(crate) enum Verb {
     Primary {
         /// Pair root, or an unpaired dataset to activate from its saved placement.
         dataset: String,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Open writable maintenance in an eligible working or standalone BE.
     Chroot {
@@ -240,15 +197,8 @@ pub(crate) enum Verb {
     Wipe {
         /// Whole-disk device path, preferably /dev/disk/by-id/...
         disk: String,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Copy new snapshots one way, never overwriting the receiver's history:
     /// a pair from its working copy, SRC into DEST (a primary into its
@@ -263,35 +213,28 @@ pub(crate) enum Verb {
         /// Sync every imported pair from its working copy.
         #[arg(long, conflicts_with = "source")]
         all: bool,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Select the pool's default boot environment after validating ownership.
     Default {
         #[arg(value_name = "BE")]
         dataset: Option<String>,
+        /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Read or replace saved kernel argument additions.
     Cmdline {
         #[arg(value_name = "BE")]
         dataset: Option<String>,
-        #[arg(long)]
-        json: bool,
         /// Replace the saved additions.
         #[arg(long, allow_hyphen_values = true, value_name = "ARGS")]
         set: Option<String>,
         /// Remove the saved additions.
         #[arg(long, conflicts_with = "set")]
         clear: bool,
+        /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -303,25 +246,17 @@ pub(crate) enum Verb {
         snapshot: Option<String>,
         #[arg(value_name = "DEST")]
         destination: String,
+        /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Destroy snapshots, whole unpaired trees or leftover staging (loss-capable).
     Drop {
         /// Snapshots (DATASET@SNAP) and dataset trees, all in one pool.
         #[arg(required = true, value_name = "TARGET")]
         targets: Vec<String>,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Boot a boot environment, using the boot default when BE is omitted,
     /// or a root tar in RAM.
@@ -345,9 +280,6 @@ pub(crate) enum Verb {
             conflicts_with_all = ["dataset", "kernel"]
         )]
         overlay: Vec<std::path::PathBuf>,
-        /// Print the boot result as JSON.
-        #[arg(long)]
-        json: bool,
     },
     /// Reboot into the loader ESP's menu, requesting a one-boot remote wait.
     Reboot {
@@ -364,8 +296,6 @@ pub(crate) enum Verb {
         /// Show the selected ESP and key fingerprints without changing it.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Enter the zboot menu in the self-contained UKI.
     Menu {
@@ -382,15 +312,8 @@ pub(crate) enum Verb {
         /// after an earlier unpair too).
         #[arg(long)]
         release_anchors: bool,
-        /// Show the plan and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed with the token an earlier preview of this plan printed.
-        #[arg(long, conflicts_with = "dry_run")]
-        confirm: Option<String>,
-        /// Print the plan (with its token) or the outcome as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        consent: Consent,
     },
     /// Establish a mutual pair: fence the receiver and hold the common
     /// snapshots; nothing is transferred or deleted.
@@ -399,20 +322,18 @@ pub(crate) enum Verb {
         left: String,
         #[arg(value_name = "SECONDARY")]
         right: String,
+        /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Capture a recursive point on a working or unpaired tree.
     Snapshot {
         /// Recursive targets, each optionally naming its snapshot after @.
         #[arg(value_name = "DATASET[@NAME]|@NAME")]
         datasets: Vec<String>,
+        /// Show the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Show storage, boot selection and observed management state.
     Status {
@@ -425,8 +346,6 @@ pub(crate) enum Verb {
         snapshots: bool,
         #[arg(long)]
         devices: bool,
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -460,9 +379,17 @@ pub(crate) struct IntoArgs {
     /// Show the plan and change nothing.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Print the plan or the outcome as JSON.
+}
+
+/// The consent flags of a verb whose plan can lose data.
+#[derive(Debug, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct Consent {
+    /// Show the plan and change nothing.
     #[arg(long)]
-    pub(crate) json: bool,
+    pub(crate) dry_run: bool,
+    /// Proceed with the token an earlier preview of this plan printed.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub(crate) confirm: Option<String>,
 }
 
 impl Cli {
@@ -480,6 +407,9 @@ impl Cli {
 
     pub(crate) fn validate(&self) -> Result<(), clap::Error> {
         let message = match &self.command {
+            Verb::Chroot { .. } | Verb::Menu { .. } | Verb::FactoryFinish { .. } if self.json => {
+                Some("--json is not available for a session")
+            }
             Verb::Default {
                 dataset: None,
                 dry_run: true,
@@ -641,6 +571,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
+        assert!(cli.json);
         assert!(matches!(
             cli.command,
             Verb::Reboot {
@@ -648,8 +579,6 @@ mod tests {
                 key: Some(_),
                 esp: Some(ref esp),
                 dry_run: true,
-                json: true,
-                ..
             } if esp == "/dev/nvme0n1p1"
         ));
         assert!(Cli::parse_from_args(["zboot", "reboot", "--menu", "--esp", "sda1"]).is_err());
@@ -690,6 +619,8 @@ mod tests {
             &["drop"],
             &["recovery", "status"],
             &["menu", "--json"],
+            &["--json", "menu"],
+            &["chroot", "a", "--json"],
             &["menu", "--debug"],
         ] {
             assert_eq!(parse(args).unwrap_err().exit_code(), 2, "{args:?}");
@@ -698,9 +629,11 @@ mod tests {
 
     #[test]
     fn boot_names_a_kernel_version_or_a_root_tar() {
+        // `boot --json` reports a refusal as the common JSON envelope.
         let cli = parse(&["boot", "a/ROOT/be", "--kernel", "6.12.1-amd64", "--json"]).unwrap();
+        assert!(cli.json);
         assert!(matches!(cli.command, Verb::Boot {
-            dataset: Some(dataset), kernel: Some(kernel), tar: None, json: true, ..
+            dataset: Some(dataset), kernel: Some(kernel), tar: None, ..
         } if dataset == "a/ROOT/be" && kernel == "6.12.1-amd64"));
         assert!(matches!(
             parse(&["boot"]).unwrap().command,
@@ -708,13 +641,12 @@ mod tests {
                 dataset: None,
                 kernel: None,
                 tar: None,
-                json: false,
                 ..
             }
         ));
         assert!(matches!(
             parse(&["boot", "--kernel", "6.12.1-amd64"]).unwrap().command,
-            Verb::Boot { dataset: None, kernel: Some(kernel), json: false, .. }
+            Verb::Boot { dataset: None, kernel: Some(kernel), .. }
                 if kernel == "6.12.1-amd64"
         ));
         let ram = [
@@ -731,7 +663,6 @@ mod tests {
             kernel: None,
             tar: Some(tar),
             overlay,
-            json: false,
         } = parse(&ram).unwrap().command
         else {
             panic!("boot --tar did not parse as a RAM boot");
@@ -948,9 +879,9 @@ mod tests {
                     assert_eq!(into.overlay, [std::path::PathBuf::from("work")]);
                     assert_eq!(into.be.as_deref(), Some("work"));
                 }
-                Verb::Resume { id, confirm, .. } | Verb::Abandon { id, confirm, .. } => {
+                Verb::Resume { id, consent } | Verb::Abandon { id, consent } => {
                     assert_eq!(id.as_deref(), Some("work"));
-                    assert_eq!(confirm.as_deref(), Some("token"));
+                    assert_eq!(consent.confirm.as_deref(), Some("token"));
                 }
                 Verb::Wipe { disk, .. } => assert_eq!(disk, "/dev/disk"),
                 Verb::Esp {
@@ -1152,14 +1083,17 @@ mod tests {
             keep,
             esp,
             swap,
-            dry_run,
+            consent,
             ..
         } = cli.command
         else {
             panic!("restore fixture")
         };
         assert_eq!(keep, ["a/home", "a/srv"]);
-        assert_eq!((esp, swap, dry_run), (Some(512 << 20), Some(0), true));
+        assert_eq!(
+            (esp, swap, consent.dry_run),
+            (Some(512 << 20), Some(0), true)
+        );
         assert!(parse_size("1G").is_ok_and(|n| n == 1 << 30));
         assert!(parse_size("1.5G").is_err());
         assert!(parse(&["resume", "--dry-run"]).is_ok());
@@ -1546,14 +1480,10 @@ mod tests {
         else {
             panic!("deploy into did not parse as its subcommand");
         };
+        assert!(cli.json);
         assert_eq!(
-            (
-                into.pool.as_str(),
-                into.overlay.len(),
-                into.dry_run,
-                into.json
-            ),
-            ("pool", 2, true, true)
+            (into.pool.as_str(), into.overlay.len(), into.dry_run),
+            ("pool", 2, true)
         );
         for extra in [
             vec!["/dev/sdz"],
