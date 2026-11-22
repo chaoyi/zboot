@@ -36,6 +36,8 @@ jobs:
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'release_tag must be vMAJOR.MINOR.PATCH' >&2; exit 2; }
           [[ "$RUN_VM" == true ]] || { echo 'a release needs run_vm: only a fully qualified build is published' >&2; exit 2; }
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          [[ "$RELEASE_TAG" == "v$version" ]] || { echo "release_tag $RELEASE_TAG does not match the workspace version $version in Cargo.toml" >&2; exit 2; }
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
               gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > /dev/null 2>&1; then
             echo "release or tag $RELEASE_TAG already exists" >&2; exit 2
@@ -172,6 +174,7 @@ jobs:
       - name: Verify the qualified distribution and stage its release assets
         env:
           SOURCE_OID: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/inputs"
@@ -183,6 +186,9 @@ jobs:
           build = json.load(open('build.json'))
           if build['source_oid'] != os.environ['SOURCE_OID']:
               raise SystemExit('the qualified build is not of the release commit')
+          expected = 'zboot ' + os.environ['RELEASE_TAG'].removeprefix('v') + ' '
+          if not build['version'].startswith(expected):
+              raise SystemExit(f"the qualified build reports {build['version']!r}, not release {os.environ['RELEASE_TAG']}")
           open('version', 'w').write(build['version'] + '\n')
           PY
           mkdir "$RUNNER_TEMP/assets"
