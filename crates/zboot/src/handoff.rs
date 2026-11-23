@@ -594,14 +594,31 @@ pub(crate) fn deployment_hostid(pool: zfs_tools::engine::Guid) -> Result<u32> {
 pub(crate) struct NativeRecovery {
     /// Booting a root tar in RAM (`boot --tar`), not an installed BE.
     ram_root: bool,
+    /// Progress lines only with `-v`: the menu's background listing reads
+    /// every BE's boot files after each pool event, and its console must
+    /// not scroll the SSH lines away.
+    quiet: bool,
 }
 impl NativeRecovery {
     pub(crate) fn new() -> Self {
-        Self { ram_root: false }
+        Self {
+            ram_root: false,
+            quiet: false,
+        }
     }
     /// For `boot --tar`, whose progress names the tar, not an installed system.
     pub(crate) fn for_ram_root() -> Self {
-        Self { ram_root: true }
+        Self {
+            ram_root: true,
+            quiet: false,
+        }
+    }
+    /// For the menu's own listing; failures still surface as errors.
+    pub(crate) fn for_listing() -> Self {
+        Self {
+            ram_root: false,
+            quiet: true,
+        }
     }
 }
 
@@ -691,7 +708,11 @@ impl RecoveryBackend for NativeRecovery {
         prove_ram()?;
         let description = describe_action(action, self.ram_root);
         let started = std::time::Instant::now();
-        eprintln!("{description}...");
+        if self.quiet {
+            diagnostic!("{description}...");
+        } else {
+            eprintln!("{description}...");
+        }
         // The serial controller distinguishes a successful kexec disconnect
         // from a returned command.
         if matches!(action, Action::Execute) {
@@ -753,7 +774,11 @@ impl RecoveryBackend for NativeRecovery {
                 ),
             });
         }
-        eprintln!("Done ({:.1}s).", started.elapsed().as_secs_f64());
+        if self.quiet {
+            diagnostic!("Done ({:.1}s).", started.elapsed().as_secs_f64());
+        } else {
+            eprintln!("Done ({:.1}s).", started.elapsed().as_secs_f64());
+        }
         if matches!(action, Action::Execute) {
             diagnostic!("ZBOOT_HANDOFF_ACTION_READY kexec-execute");
         }

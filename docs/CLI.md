@@ -899,8 +899,9 @@ Menu-only commands:
 | Command | Does |
 |---|---|
 | `N`, `N.M` | Boot environment N; `.M` picks its M-th kernel. Same as `boot N`. Options need the long form: `boot N -v`. |
-| `connect` | Start wired DHCP and SSH; print the address, the host key fingerprint and a one-time password, valid until its first login or the end of that session. It needs exactly one wired interface with a link ([RECOVERY](RECOVERY.md#getting-in-remotely)), and a UKI built with the SSH tools; the shipped one has them. |
-| `rescan` | Look for pools again and import new ones read-only. |
+| `connect` | Start wired DHCP and SSH; print the address, the host key fingerprint and its six words ([RECOVERY](RECOVERY.md#getting-in-remotely)), and a one-time password, valid until its first login or the end of that session. It needs exactly one wired interface with a link ([RECOVERY](RECOVERY.md#getting-in-remotely)), and a UKI built with the SSH tools; the shipped one has them. |
+| `rescan` | Look for pools again and import new ones read-only, then list. |
+| `list`, Enter | Show the whole listing again. |
 | `ls` | Same as `status`. |
 | `shell` | A root shell; `exit` returns. |
 | `reboot`, `poweroff` | Restart or power off. |

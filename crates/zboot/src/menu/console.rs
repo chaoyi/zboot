@@ -150,7 +150,11 @@ pub fn render_help(writer: &mut impl Write, can_connect: bool) -> std::io::Resul
     )?;
     writeln!(
         writer,
-        "Menu-only commands: N | N.M | rescan | ls | shell | reboot | poweroff | help"
+        "Menu-only commands: N | N.M | list | rescan | ls | shell | reboot | poweroff | help"
+    )?;
+    writeln!(
+        writer,
+        "Enter or list shows the menu again; pool discovery after it prints one line each."
     )?;
     if can_connect {
         writeln!(

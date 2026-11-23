@@ -31,6 +31,8 @@ enum ImportState {
 struct PoolJob {
     guid: u64,
     name: String,
+    /// Label paths, for the console's one-line discovery report.
+    devices: Vec<String>,
     local: bool,
     state: ImportState,
 }
@@ -65,6 +67,35 @@ impl Progress {
 
     pub(super) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// One line per pool that has reached its result, plus a discovery
+    /// failure. After the first listing the menu prints each new line once
+    /// instead of reprinting the whole listing.
+    pub(super) fn findings(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .jobs
+            .iter()
+            .filter_map(|job| {
+                let name = zfs_tools::engine::escape_display(&job.name);
+                let devices = zfs_tools::engine::escape_display(&job.devices.join(", "));
+                match &job.state {
+                    ImportState::Queued | ImportState::Importing => None,
+                    ImportState::Imported => Some(format!("found pool {name} on {devices}")),
+                    ImportState::Failed(reason) => Some(format!(
+                        "pool {name} on {devices}: {}",
+                        zfs_tools::engine::escape_display(reason)
+                    )),
+                }
+            })
+            .collect();
+        if let Some(error) = &self.error {
+            lines.push(format!(
+                "Pool discovery failed: {}",
+                zfs_tools::engine::escape_display(error)
+            ));
+        }
+        lines
     }
 
     pub(super) fn render(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -291,6 +322,12 @@ fn pool_jobs(
     let mut jobs = Vec::new();
     for (guid, labels) in pools {
         let name = labels[0].name.clone();
+        let paths: Vec<String> = labels
+            .iter()
+            .map(|label| label.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let mut local = true;
         for label in &labels {
             local &= local_transport(label)?;
@@ -345,6 +382,7 @@ fn pool_jobs(
         jobs.push(PoolJob {
             guid,
             name,
+            devices: paths,
             local,
             state,
         });
@@ -615,7 +653,8 @@ impl ImportBackend for NativeImports<'_> {
         let child = zfs_tools::engine::native::announced(&mut command).spawn();
         drop(command);
         let output = child?.wait_with_output()?;
-        eprintln!(
+        // The menu prints `found pool NAME on DEV` from progress instead.
+        crate::handoff::diagnostic!(
             "Pool {} import finished in {:.3}s",
             zfs_tools::engine::escape_display(&job.name),
             started.elapsed().as_secs_f64()
@@ -660,6 +699,7 @@ mod tests {
         PoolJob {
             guid,
             name: format!("pool{guid}"),
+            devices: vec![format!("/dev/disk{guid}")],
             local,
             state: ImportState::Queued,
         }

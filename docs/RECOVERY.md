@@ -19,6 +19,15 @@ anything, then lists the boot environments it found, numbered, with their
 kernels; interrupted operations; and pools it could not import, with the
 reason (another host's, a name already taken, damaged).
 
+The console only appends lines, so a serial console or a screen without
+scrollback reads the same. The menu waits to list until pool discovery has
+been quiet for a second, at most three seconds after it starts, then lists
+once. After that a pool that arrives prints one line, `found pool NAME on
+DEVICE` (or the reason it was refused); the whole listing comes back when you
+press Enter or type `list`, after a command, or when what you can select
+changes. While SSH runs, its lines (address, host key words and fingerprint)
+are printed again after each of these, so they stay at the bottom.
+
 It prints `ZBOOT_MENU_READY`, and the prompt is `zboot> `. With exactly one
 boot default on the host it counts down five seconds and boots it; a key
 cancels the countdown for good. With no default or more than one it waits.
@@ -71,6 +80,21 @@ several cabled interfaces, leave one connected.
 | A stick | Write plain OpenSSH public keys (no key options) to `zboot/authorized_keys` on the stick's ESP. The next boot from it behaves as above. |
 | Network boot | Have the loader (iPXE, say) pass `zboot.ssh_key=TYPE:BASE64` (repeatable). Its arguments replace the UKI's embedded command line, so repeat that line too: `zboot.recovery=1` and the consoles ([BUILD](BUILD.md)). Firmware HTTP boot passes no arguments, and under Secure Boot the stub ignores them; use `connect` then. |
 | Someone at the console | They type `connect`, which prints the address, the host key fingerprint and a one-time password. Check the fingerprint before you accept the key. The password is valid until its first login or the end of that session. |
+
+Whichever way SSH starts, the console shows
+
+```
+Menu SSH enabled on ADDRESS (IFACE). Host key fingerprint: SHA256:...
+Host key words: 1 WORD 2 WORD 3 WORD 4 WORD 5 WORD 6 WORD
+```
+
+The host key is made in RAM at each boot. The six words are the first 66
+bits of its SHA-256 fingerprint, 11 bits per word, from the BIP-39 English
+list: word N is bits 11(N-1) to 11N of the digest. They are easier to read
+out and type than base64. A tool can still read the `SHA256:` line. Fleet's
+deploy controller shows words 1-5 of the key it scanned and asks you to type
+word 6: compare all five with this screen, since only the typed word is
+checked by machine (11 bits; all six would be 66).
 
 A key pressed at the console cancels automatic boot for the rest of that menu
 run, and a successful SSH login pauses it until its session ends. Otherwise,

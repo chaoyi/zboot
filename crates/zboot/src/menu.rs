@@ -4,12 +4,14 @@
 
 mod console;
 mod discovery;
+mod host_words;
 pub(crate) mod hostid_adopt;
 pub(crate) mod inventory;
 mod menu_connect;
 mod menu_view;
 pub mod pool_access;
 pub(crate) mod ram_boot;
+mod screen;
 pub(crate) mod select;
 
 use crate::handoff::{
@@ -17,6 +19,7 @@ use crate::handoff::{
     readonly_pools,
 };
 use inventory::{MenuInventory, boot_entries, menu_inventory, render_menu};
+use screen::{Screen, Update, View};
 use select::{
     AccessHold, CountdownOutcome, TerminalMode, auto_boot_request, boot_request, boot_shortcut,
     countdown_refusal, input_ready, listed_boot_request, parsed_menu_command, poll_remote_access,
@@ -321,6 +324,51 @@ fn announce_menu_ready(
     Ok(())
 }
 
+fn view(inventory: &MenuInventory) -> View {
+    View {
+        entries: inventory.entries.clone(),
+        adoption: hostid_adopt::adopted()
+            .map(|adoption| hostid_adopt::banner(&adoption))
+            .unwrap_or_default(),
+    }
+}
+
+/// The full listing, recorded as shown. Its first line is a fresh one.
+fn list_menu(
+    screen: &mut Screen,
+    inventory: &MenuInventory,
+    prompt_shown: &mut bool,
+) -> Result<()> {
+    render_menu(&inventory.entries)?;
+    screen.listing(view(inventory), discovery::progress().findings());
+    *prompt_shown = false;
+    Ok(())
+}
+
+/// Discovery lines, on a fresh line when the prompt is showing.
+fn print_findings(
+    lines: &[String],
+    prompt_shown: &mut bool,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    if *prompt_shown {
+        writeln!(output)?;
+    }
+    for line in lines {
+        writeln!(output, "{line}")?;
+    }
+    *prompt_shown = false;
+    Ok(())
+}
+
+/// The live SSH session's lines, repeated so they stay the console's last.
+fn print_ssh_lines(lines: &[String], output: &mut impl Write) -> io::Result<()> {
+    for line in lines {
+        writeln!(output, "{line}")?;
+    }
+    Ok(())
+}
+
 /// Held for the life of the UKI's menu. A second `menu`, typed at the prompt,
 /// in the shell or over SSH, finds it taken and is refused.
 const MENU_LOCK: &str = "/run/zboot-menu.lock";
@@ -414,14 +462,21 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
     let mut import_revision = discovery::progress().revision();
     let mut inventory = MenuInventory::default();
     inventory.refresh_with(menu_inventory);
-    render_menu(&inventory.entries)?;
+    // The first listing waits for discovery to settle (screen.rs); the
+    // countdown below still starts on its own readiness, listing first.
+    let mut screen = Screen::new(Instant::now());
     let mut ready_announced = false;
     let mut countdown_reason_checked = false;
     let mut last_countdown_reason = None;
     let mut autoboot_consumed = no_autoboot;
     let mut prompt_shown = false;
     let mut displayed_access = access_hold;
-    println!("{}", menu_shortcuts(connect_available()));
+    let list_first =
+        |screen: &mut Screen, inventory: &MenuInventory, prompt_shown: &mut bool| -> Result<()> {
+            list_menu(screen, inventory, prompt_shown)?;
+            println!("{}", menu_shortcuts(connect_available()));
+            Ok(())
+        };
     loop {
         if poll_remote_access(&mut access_hold) {
             prompt_shown = false;
@@ -435,25 +490,55 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
         }
         displayed_access = access_hold;
         let progress = discovery::progress();
+        // SSH lines go last after anything this pass prints.
+        let mut printed = false;
         if access_released || inventory.retry_needed() || progress.revision() != import_revision {
             let revision_changed = progress.revision() != import_revision;
             let previous_error = inventory.error.clone();
-            if inventory.refresh_with(menu_inventory) {
+            let refreshed = inventory.refresh_with(menu_inventory);
+            if refreshed {
                 countdown_reason_checked = false;
-                render_menu(&inventory.entries)?;
-            } else if revision_changed {
-                render_menu(&inventory.entries)?;
             }
-            if revision_changed || inventory.error != previous_error || !inventory.retry_needed() {
+            if revision_changed {
+                screen.changed(Instant::now());
+            }
+            if refreshed || revision_changed {
+                match screen.update(&view(&inventory), progress.findings()) {
+                    Update::Nothing => {}
+                    Update::Lines(lines) => {
+                        print_findings(&lines, &mut prompt_shown, &mut io::stdout())?;
+                        printed = true;
+                    }
+                    Update::Listing => {
+                        list_menu(&mut screen, &inventory, &mut prompt_shown)?;
+                        printed = true;
+                    }
+                }
+            }
+            if inventory.error != previous_error {
                 prompt_shown = false;
             }
             import_revision = progress.revision();
         }
-        if !ready_announced && menu_ready_to_announce(&progress, &inventory, None) {
+        if screen.due(
+            Instant::now(),
+            progress.settled() && !inventory.retry_needed(),
+        ) {
+            list_first(&mut screen, &inventory, &mut prompt_shown)?;
+            printed = true;
+        }
+        if screen.listed()
+            && !ready_announced
+            && menu_ready_to_announce(&progress, &inventory, None)
+        {
             if let Some(error) = progress.error() {
                 eprintln!("menu import: {}", zfs_tools::engine::escape_display(error));
             }
             announce_menu_ready(&mut ready_announced, &mut prompt_shown, &mut io::stdout())?;
+            printed = true;
+        }
+        if printed {
+            print_ssh_lines(&menu_connect::banner(), &mut io::stdout())?;
         }
         let check_countdown_refusal = |observed: &NativeState,
                                        last_reason: &mut Option<String>,
@@ -495,9 +580,13 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
             )?
             && let Some(request) = auto_boot_request(&inventory.entries)
         {
+            if !screen.listed() {
+                list_first(&mut screen, &inventory, &mut prompt_shown)?;
+            }
             if menu_ready_to_announce(&progress, &inventory, Some(&request)) {
                 announce_menu_ready(&mut ready_announced, &mut prompt_shown, &mut io::stdout())?;
             }
+            print_ssh_lines(&menu_connect::banner(), &mut io::stdout())?;
             autoboot_consumed = true;
             let mut retry_inventory = false;
             let countdown =
@@ -536,10 +625,13 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                     zfs_tools::engine::escape_display(&error.to_string())
                 ),
             }
-            render_menu(&inventory.entries)?;
-            prompt_shown = false;
+            list_menu(&mut screen, &inventory, &mut prompt_shown)?;
+            print_ssh_lines(&menu_connect::banner(), &mut io::stdout())?;
         }
-        menu_prompt(&mut io::stdout(), &mut prompt_shown)?;
+        // No prompt before the first listing: it would precede the menu.
+        if screen.listed() {
+            menu_prompt(&mut io::stdout(), &mut prompt_shown)?;
+        }
         let mut terminal = if access_hold.watches_console() {
             TerminalMode::enter(input_fd.as_fd())?
         } else {
@@ -551,6 +643,9 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                 break;
             }
             if discovery::progress().revision() != import_revision || inventory.retry_needed() {
+                break;
+            }
+            if screen.due(Instant::now(), false) {
                 break;
             }
         }
@@ -592,9 +687,14 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
         }
         let borrowed = words.iter().map(String::as_str).collect::<Vec<_>>();
         let mut pre_execution = false;
+        // Enter, list, rescan and a completed command show the full listing.
+        let mut relist = false;
         let result = (|| -> Result<()> {
             match borrowed.as_slice() {
-                [] => return Ok(()),
+                [] | ["list"] => {
+                    relist = true;
+                    return Ok(());
+                }
                 ["help"] => {
                     return Ok(console::render_help(
                         &mut io::stdout(),
@@ -623,7 +723,7 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
                 ["rescan"] => {
                     discovery::start()?;
                     inventory.refresh_with(menu_inventory);
-                    render_menu(&inventory.entries)?;
+                    relist = true;
                     return Ok(());
                 }
                 ["shell"] => {
@@ -668,10 +768,18 @@ fn run_menu(no_autoboot: bool) -> Result<()> {
             }
             if !listing {
                 inventory.refresh_with(menu_inventory);
-                render_menu(&inventory.entries)?;
+                relist = true;
             }
             Ok(())
         })();
+        if relist {
+            if screen.listed() {
+                list_menu(&mut screen, &inventory, &mut prompt_shown)?;
+            } else {
+                list_first(&mut screen, &inventory, &mut prompt_shown)?;
+            }
+            print_ssh_lines(&menu_connect::banner(), &mut io::stdout())?;
+        }
         if let Err(error) = result {
             if pre_execution {
                 crate::cli::finish_menu_pre_execution(&words, Box::new(error));
@@ -818,6 +926,29 @@ mod tests {
                 assert!(bytes.is_empty(), "{case} must not emit JSON");
             }
         }
+    }
+
+    #[test]
+    fn a_discovery_line_starts_a_fresh_line_and_the_ssh_lines_follow_it() {
+        let mut output = Vec::new();
+        let mut shown = false;
+        menu_prompt(&mut output, &mut shown).unwrap();
+        print_findings(
+            &["found pool data on /dev/vdb".into()],
+            &mut shown,
+            &mut output,
+        )
+        .unwrap();
+        print_ssh_lines(
+            &["Menu SSH enabled".into(), "Host key words: 1 a".into()],
+            &mut output,
+        )
+        .unwrap();
+        assert!(!shown, "the prompt returns below the SSH lines");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "zboot> \nfound pool data on /dev/vdb\nMenu SSH enabled\nHost key words: 1 a\n"
+        );
     }
 
     #[test]

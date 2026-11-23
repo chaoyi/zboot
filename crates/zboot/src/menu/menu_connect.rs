@@ -61,6 +61,9 @@ struct Manager {
     failure: Option<PollError>,
     cleanup_failed: bool,
     recovered: bool,
+    /// The live session's console lines: address, host key words and
+    /// fingerprint, and the admitted keys. The menu repeats them last.
+    banner: Vec<String>,
 }
 impl Manager {
     fn queue(&mut self, event: Event) -> Result<()> {
@@ -818,7 +821,10 @@ fn host_identity(work: &Path) -> Result<String> {
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| refuse("Menu SSH fingerprint unavailable"))?;
-    if !fingerprint.starts_with("SHA256:") || fingerprint.len() != 50 {
+    if !fingerprint.starts_with("SHA256:")
+        || fingerprint.len() != 50
+        || super::host_words::words(fingerprint).is_none()
+    {
         return Err(refuse("Menu SSH fingerprint is invalid"));
     }
     Ok(fingerprint.into())
@@ -1161,6 +1167,7 @@ fn drain_log(session: &mut SshSession) -> Result<Vec<Event>> {
 }
 
 fn finish(manager: &mut Manager) -> Result<()> {
+    manager.banner.clear();
     if let Some(session) = manager.session.as_mut() {
         let cleaned = stop_session(session);
         manager.stopped(cleaned)?;
@@ -1367,6 +1374,39 @@ pub(super) fn stop() -> Result<()> {
     finish(&mut manager)
 }
 
+/// The address line keeps its 0.4.0 shape (`Host key fingerprint: SHA256:...`)
+/// for tools; the words line follows it for people.
+fn session_banner(
+    address: Ipv4Addr,
+    iface: &str,
+    fingerprint: &str,
+    keys: Option<&PublicKeys>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Menu SSH enabled on {address} ({iface}). Host key fingerprint: {fingerprint}"
+    )];
+    lines.extend(super::host_words::line(fingerprint));
+    if let Some(keys) = keys {
+        lines.push(format!("Key-only SSH: {}", keys.fingerprints().join(", ")));
+    }
+    lines
+}
+
+/// The live SSH session's console lines, empty when none runs. The menu
+/// prints them after its listing and after each discovery line, so they stay
+/// the bottom lines of a console without scrollback.
+pub(super) fn banner() -> Vec<String> {
+    let Some(lock) = SSHD.get() else {
+        return Vec::new();
+    };
+    let manager = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    if manager.session.is_some() {
+        manager.banner.clone()
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) fn start_keys(keys: &PublicKeys) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -1512,11 +1552,12 @@ fn start(keys: Option<&PublicKeys>) -> Result<()> {
     };
     let deadline = session.deadline;
     manager.session = Some(session);
-    println!("Menu SSH enabled on {address} ({iface}). Host key fingerprint: {fingerprint}");
+    manager.banner = session_banner(address, &iface, &fingerprint, keys);
+    for line in &manager.banner {
+        println!("{line}");
+    }
     if let Some(password) = password {
         println!("One-time root password: {password}");
-    } else if let Some(keys) = keys {
-        println!("Key-only SSH: {}", keys.fingerprints().join(", "));
     }
     println!(
         "SSH lease window ends in at most {} seconds.",
@@ -1545,6 +1586,21 @@ mod tests {
     }
     fn observe(log: &mut LogState, bytes: &[u8]) -> Option<Event> {
         log.record(bytes, || Ok(())).unwrap()
+    }
+
+    #[test]
+    fn the_ssh_lines_keep_the_fingerprint_line_and_add_the_words() {
+        let fingerprint = "SHA256:7R47Vfjv11EU/pHF5UnS60ljM38uX1q9DzZX0HLvBCg";
+        let lines = session_banner(Ipv4Addr::new(192, 168, 25, 11), "enp0s2", fingerprint, None);
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "Menu SSH enabled on 192.168.25.11 (enp0s2). Host key fingerprint: {fingerprint}"
+                ),
+                "Host key words: 1 unfair 2 vault 3 step 4 vault 5 word 6 possible".to_owned(),
+            ]
+        );
     }
 
     #[test]

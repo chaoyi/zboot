@@ -601,6 +601,17 @@ off: REASON` once per reason.
   damaged), so two copies of one stick show up instead of failing silently.
 - If a refresh fails, the menu keeps its last validated state, disables the
   countdown and retries. A busy writer leaves the menu and SSH usable.
+- The console is append-only: no cursor control, so serial consoles, the
+  simulator and transcripts see what a screen sees. The first listing waits
+  until discovery is quiet for one second, at most three seconds from the
+  start; a countdown that becomes due earlier lists first and keeps its own
+  timing. After the first listing a pool event prints one line, and the whole
+  listing returns only on request (Enter, `list`, `rescan`, a command) or when
+  the numbered boot environments, their kernels or the adopted identity
+  change. Background listings print their mount steps only with `-v`. *Why:*
+  a full reprint per import event, three in a second on a laptop, scrolled
+  the SSH host key off a console without scrollback; the live SSH lines are
+  now printed again after every listing and discovery line, so they stay last.
 
 ## Remote access
 
@@ -618,6 +629,11 @@ on the ESP, `zboot.ssh_key=` or `connect` turn it on
   it.
 - **The password** (12 characters, 60 random bits) exists for someone at the
   console; SSH that started by itself never offers it.
+- **Host key words.** The host key is made in RAM at each boot; the console
+  prints its `SHA256:` fingerprint and six words, the digest's first 66 bits
+  as 11-bit indexes into the published BIP-39 English list (pinned by
+  SHA-256 in a test). *Why:* people misread base64 case and 0/O, 1/l/I;
+  the fingerprint line keeps its 0.4.0 form for tools.
 - **Trust.** Whoever can write the ESP or run the boot server can already
   replace the UKI, so a key they place adds no authority. Deleting the file is
   the one write a boot makes, to the ESP it started from; no boot writes to a

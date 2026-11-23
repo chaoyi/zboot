@@ -237,7 +237,7 @@ pub(super) fn menu_entries(state: &NativeState) -> Result<Vec<menu_view::MenuEnt
     entries_with(
         state,
         candidates(state),
-        &mut NativeRecovery::new(),
+        &mut NativeRecovery::for_listing(),
         kernel_choices,
     )
 }
