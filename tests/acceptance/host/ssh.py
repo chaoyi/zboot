@@ -87,9 +87,8 @@ def keyscan(console, known, expected, *, scan_step='host-keyscan', check_step='h
 
 
 def fingerprint(console, ready):
-    """The menu's sshd: its one printed fingerprint in READY must be the key
-    the listener presents. Returns the known_hosts file."""
-    hits = re.findall(SSH_ENABLED, ready)
+    """Match this boot's advertised key, including any menu redraws, to the listener."""
+    hits = sorted(set(re.findall(SSH_ENABLED, ready)))
     if len(hits) != 1:
         raise ConsoleError(f'expected one native host fingerprint, got {hits}')
     # The menu prints the fingerprint as it starts sshd, which may not listen yet.

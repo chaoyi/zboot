@@ -14,6 +14,22 @@ import unittest
 from unittest.mock import Mock, patch
 
 
+class MenuFingerprintTests(unittest.TestCase):
+    def test_redraws_must_show_one_distinct_key_for_the_listener(self):
+        from host import ssh
+        console = SimpleNamespace(case_dir=Path('case'), out=Path('boot-2'))
+        key = 'SHA256:' + 'A' * 43
+        line = f'Host key fingerprint: {key}\n'
+        with patch.object(ssh, 'keyscan') as scan:
+            ssh.fingerprint(console, line + line)
+            scan.assert_called_once_with(console, Path('case/known-boot-2'), [key], tries=10)
+            scan.reset_mock()
+            for text in ('', line + 'Host key fingerprint: SHA256:' + 'B' * 43):
+                with self.subTest(text=text), self.assertRaises(ssh.ConsoleError):
+                    ssh.fingerprint(console, text)
+            scan.assert_not_called()
+
+
 class ResourcePolicyTests(unittest.TestCase):
     def test_guest_memory_defaults_and_explicit_override(self):
         from host.vm import default_memory_mib
