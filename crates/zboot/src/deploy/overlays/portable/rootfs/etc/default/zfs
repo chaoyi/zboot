@@ -1,0 +1,1 @@
+ZPOOL_IMPORT_OPTS="-o readonly=on"

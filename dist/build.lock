@@ -1,0 +1,16 @@
+# zboot build lock: what dist/dist.sh builds from. The snapshot
+# timestamp fixes every Debian input (snapshot.debian.org); `rust` is a
+# release whose components are checked against their published digests;
+# crates come from Cargo.lock. `set uki` is the one root the UKI is built in:
+# the build tools, the UKI tools and the packages its initramfs takes its
+# programs from. Edit any line; `kernel` is the release the snapshot's
+# linux-image-amd64 installs, which the build checks.
+zboot-build-lock 6
+suite forky
+snapshot 20261108T022935Z
+components main contrib non-free non-free-firmware
+set uki buildd build-essential ca-certificates python3 libblkid-dev systemd-ukify python3-pefile systemd-boot-efi cpio zstd binutils xz-utils curl linux-image-amd64 linux-headers-amd64 zfsutils-linux zfs-dkms kexec-tools busybox udev kmod mount fdisk gdisk parted nvme-cli dosfstools openssh-server iproute2 firmware-realtek
+rust 1.97.1
+kernel 7.2.15+deb14-amd64
+firmware rtl_nic/rtl8156a-2.fw
+firmware rtl_nic/rtl8156b-2.fw

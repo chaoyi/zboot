@@ -1,0 +1,22 @@
+{
+  "nvme0": {
+    "sprog": 65535,
+    "sstat": {
+      "media_verification_canceled": 0,
+      "global_erased": 0,
+      "no_cmplted_passes": 0,
+      "status": "(0) NVM Subsystem has never been sanitized."
+    },
+    "cdw10_info": 0,
+    "time_over_write": 4294967295,
+    "time_block_erase": 4294967295,
+    "time_crypto_erase": 4294967295,
+    "time_over_write_no_dealloc": 0,
+    "time_block_erase_no_dealloc": 0,
+    "time_crypto_erase_no_dealloc": 0,
+    "time_post_verification_dealloc": 0,
+    "sanitize_state_information": {
+      "sanitize_state": "(0) Idle state"
+    }
+  }
+}

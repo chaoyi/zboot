@@ -1,0 +1,26 @@
+[package]
+name = "zsnap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ZFS snapshot scheduling and retention"
+
+[dependencies]
+zfs-tools = { path = "../zfs-tools" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+clap.workspace = true
+nix.workspace = true
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+toml = "1.1"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,986 @@
+# zboot command line
+
+Use zboot to manage boot environments, keep copies on another disk, and
+recover a system. Start with the examples below, or use `zboot --help` to
+list commands. [DESIGN.md](DESIGN.md#command-line) explains the design choices.
+
+The boot menu runs from a unified kernel image (UKI). The EFI system
+partition (ESP) holds this loader. Some commands run only in the UKI;
+others run on an ordinary system, as listed below.
+
+```
+zboot VERB [TARGET...] [OPTIONS]
+```
+
+## The verbs
+
+| Job | Verbs |
+|---|---|
+| Look | `status` |
+| Boot environments and trees | `snapshot`, `fork`, `default`, `cmdline`, `chroot`, `rename`, `rollback` †, `drop` † |
+| Pairs | `pair`, `sync` (†), `primary` (†), `unpair` (†) |
+| Install | `factory`, `deploy` (†), `esp` (†), `wipe` † |
+| Recover | `restore` †, `resume` (†), `abandon` † |
+| Menu | `reboot --menu`, and in the zboot UKI `boot` and `menu` |
+
+† can lose data and needs confirmation. (†) needs confirmation only in the
+cases described in that command's section.
+
+Where each runs:
+
+| Environment | Verbs |
+|---|---|
+| A running system | all but `boot` and `menu` |
+| The zboot UKI (its menu, its shell, an SSH session into it) | all but `factory`, `reboot --menu` and `menu` |
+
+A command run in the wrong environment is refused (exit 1); the message
+says where to run it.
+
+## Everyday use
+
+```sh
+# Try an upgrade in a copy of the running system.
+zboot fork try                  # snapshot the running system now, then clone it
+zboot chroot try -- /usr/bin/apt full-upgrade
+zboot default try --once        # arm this BE for one boot; reboot separately
+
+# See boot environments, pairs, interrupted operations and what needs attention.
+zboot status
+zboot status --devices          # adds disks and ESPs
+
+# Keep a second disk in step.
+zboot deploy /dev/disk/by-id/nvme-B --empty --pool bpool
+zpool import bpool                                  # deploy leaves the new pool exported
+zboot sync rpool/ROOT/default bpool/ROOT/default    # creates it and pairs the two
+zboot sync --all                                    # later, from a timer
+
+# Install a host.
+zboot factory host.tar.zst --packages openssh-server
+zboot deploy /dev/disk/by-id/nvme-A --tar host.tar.zst --overlay ./host --hostname box
+
+# Make a rescue stick (RECOVERY.md has the full package list).
+zboot factory rescue.tar.zst --packages openssh-server,systemd-resolved
+zboot deploy /dev/disk/by-id/usb-STICK --tar rescue.tar.zst --portable --overlay builtin:rescue
+
+# Run a verb that needs confirmation from a script.
+token=$(zboot drop rpool/ROOT/old --dry-run --json | jq -r .token)
+zboot drop rpool/ROOT/old --confirm "$token"
+
+# After a zboot update, rewrite the loaders on this host's ESPs.
+zboot esp
+
+# On the machine to reboot, open its menu for local console use.
+zboot reboot --menu
+# Alternatively, enable one-boot menu SSH for a controller's public key.
+# The .pub file must already be on this machine. The controller keeps the private key.
+zboot reboot --menu --key /path/to/controller.pub
+```
+
+## Names
+
+How you write a name determines what it means. zboot does not guess from
+the datasets that exist, so a name keeps the same meaning after a change
+([why](DESIGN.md#command-line)).
+
+| Written | Means |
+|---|---|
+| `rpool/ROOT/be1` (contains `/`) | that dataset |
+| `rpool/` (ends in `/`) | the root dataset of pool `rpool` |
+| `try` (no `/`) | the boot environment beside the running one: with `rpool/ROOT/be1` running, `rpool/ROOT/try` |
+| `@SNAP` | that snapshot of the running boot environment |
+| `NAME@SNAP` | split at the first `@`; NAME is then resolved by the rows above |
+| nothing, where a synopsis shows `[BE]` or `[DATASET]` | for `snapshot`, `fork` and `cmdline`, the running boot environment; `default` prints the current default, `boot` takes it and `status` reports everything |
+
+- Short names, `@SNAP` and omitted targets need a running boot environment
+  whose root filesystem is a ZFS dataset with a parent. Without one (the UKI,
+  a system booted in RAM, a rescue stick) they are refused, and the message
+  says to write the full name, or `NAME/` for a pool.
+- The rule also covers a destination that does not exist yet (`fork`,
+  `rename`, `sync`): `try` is a new sibling.
+- In the menu a boot environment may also be named by its number
+  ([In the menu](#in-the-menu)).
+- Plans, results and typed confirmations always print full names. Only
+  dataset and boot-environment targets are resolved, `--keep` included; other
+  option values and everything after `--` pass through untouched.
+
+Other argument kinds: `DISK` is a whole-disk path (prefer
+`/dev/disk/by-id/...`). `PART` is a partition path. `SIZE` is a number with
+an optional binary suffix `K`, `M`, `G` or `T` (`512M`, `1G`). `HOSTID` is
+eight lowercase hex digits, not `00000000` or `ffffffff`. `TOKEN` is 32
+lowercase hex digits. `ID` is an operation id as `status` prints it.
+
+## Options every verb shares
+
+- `--dry-run`: print the plan and change nothing. Exit 0. Accepted by
+  every command that changes a pool, a disk or an ESP: `snapshot`, `fork`,
+  `default BE`, `cmdline --set|--clear`, `rename`, `rollback`, `drop`,
+  `pair`, `sync`, `primary`, `unpair`, `deploy`, `esp`, `wipe`,
+  `restore`, `resume`, `abandon` and `reboot --menu`. `chroot` opens a
+  session and takes neither option.
+- `--confirm TOKEN`: run only if the plan still has this token (see
+  [Confirmation](#confirmation)). Accepted only by the verbs that can lose
+  data, always or in some cases: `rollback`, `drop`, `sync`, `primary`,
+  `unpair`, `deploy DISK`, `esp`, `wipe`, `restore`, `resume` and
+  `abandon`. Such a verb checks a token it is given even when this plan
+  loses nothing, so a script can run exactly what it previewed. It cannot
+  be combined with `--dry-run`.
+- `--json`: accepted by every command except `chroot` and `menu`. Stdout then
+  contains exactly one object (see [Output and exit status](#output-and-exit-status)),
+  and prompts and other dialogue go to stderr; a terminal on stdin and
+  stderr still allows typed confirmation. A successful `boot` replaces the
+  kernel and ends the stream, so `boot --json` reports only refusals and
+  failures.
+- `-v`: taken by every verb. Each native command (`zfs`, `zpool`, `sgdisk`,
+  ...) is printed to stderr as a `+ ...` line before it runs; `boot -v` also
+  prints each stage of the handoff as a `ZBOOT_HANDOFF_...` line. A zboot
+  that zboot starts gets `ZBOOT_VERBOSE=1`, which has the same effect.
+
+## Confirmation
+
+`--dry-run` previews an operation. Add `--json` when a program will read
+the plan and token. Both formats describe the same operation and neither
+applies it. On a later invocation, `--confirm TOKEN` binds execution to
+the consent details from that particular preview. Running the command again
+without the token uses the plan it sees then. A routine lossless `sync` or
+`primary` can proceed directly.
+
+When the current plan requires confirmation:
+
+- **On a terminal** it asks you to type the thing that loses data. It then
+  plans again and proceeds only if the token is unchanged.
+- **In a script** pass `--confirm TOKEN` from an earlier `--dry-run`.
+- Without a terminal and without `--confirm` it prints the plan, never
+  waits, changes nothing and exits 3. `sync` is the exception: its transfer
+  loses nothing and runs anyway, and only its deletions wait (see
+  [Pairs](#pairs)).
+- A token that no longer matches is refused. zboot says the plan changed and
+  prints no new token. It exits 3 before the first durable effect and 4 after
+  that effect; a UKI writable pool import counts as an effect. Preview again
+  to see the new plan.
+
+The token is a hash of what you consent to: native identities, what is lost,
+and the digests of the files used ([Consent](DESIGN.md#consent)). It does not
+cover values zboot makes when the verb runs (a default snapshot name, a
+random hostid, an operation id); the plan says they will be generated and the
+result reports them.
+
+What you type:
+
+| Verb | You type |
+|---|---|
+| `wipe`, `deploy DISK`, `restore` | the disk's serial, else its WWN |
+| `esp PART` | the serial (else WWN) of the disk that holds the partition; for several partitions, the summary the plan prints |
+| `rollback` | `DATASET@SNAP` |
+| `drop` | the target; for several, the summary the plan prints (`2 snapshots and 1 tree in rpool`) |
+| `primary` | the dataset whose changes are lost, or the surviving dataset when the peer is gone |
+| `sync`, to delete snapshots only the copy keeps | the summary the plan prints (`3 snapshots on bpool/data`; for several pairs `5 snapshots on 2 copies`) |
+| `unpair` | the dataset |
+| `resume`, when it asks | what the interrupted verb asked for |
+| `abandon` | the operation id |
+
+A disk must have a name to type, so these refuse to plan at all, even with
+`--dry-run` or `--confirm`:
+
+- `wipe`, `deploy DISK`, `restore` and `esp PART` refuse a disk with no
+  serial and no WWN (`stable serial or WWN required`).
+- `wipe`, `deploy DISK` and `restore` refuse a disk whose WWN another
+  attached disk also reports or, when it has no WWN, whose serial another
+  attached disk also reports, as some USB sticks do. Both disks are refused,
+  and the message names the other one; attach only one of them.
+
+`status --devices` gives the reason on each such disk's line.
+`deploy --image` creates its own loop device, which needs no typed name.
+
+## Output and exit status
+
+| Status | Meaning | `"mode"` with `--json` |
+|---|---|---|
+| 0 | Done, or previewed because of `--dry-run`. | `applied`, `preview` |
+| 1 | Refused or failed before changing anything. | `refused` |
+| 2 | Usage error. Nothing on stdout. | none |
+| 3 | Not confirmed; nothing changed. | `preview`; `refused` for a stale token before any effect |
+| 4 | Changed something but did not finish, counted from the first durable effect (an operation record is one). The message names the next step: `zboot resume ID`, or run the verb again. | `partial` |
+
+The object `--json` prints:
+
+```
+{"schema_version": 1,
+ "mode": "preview" | "applied" | "partial" | "refused",
+ "operation": ID,        only when an operation record was written
+ "token": TOKEN,         only from a verb that takes --confirm, when a plan was made
+ "result": ...}
+```
+
+- `result` is the plan for `preview` and the outcome for `applied` and
+  `partial`. Each verb's fields are its own and are stable within
+  `schema_version` 1.
+- For `refused`, `result` is `{"reason": CODE, "message": TEXT}`. CODE is
+  `stale_token`, or `error` for every other refusal or failure.
+- A verb that only reads (`status`, `default` and `cmdline` without
+  a change) prints `applied` with its report as `result`.
+- Without `--json`, every verb prints plain text.
+
+## Look
+
+```
+zboot status [DATASET...] [--all] [--snapshots] [--devices]
+```
+
+`status` is short by default:
+
+```
+Boot environments
+  rpool/ROOT/default  running, default, primary of bpool/ROOT/default, snapshots level, candidate, kernels unprobed
+  rpool/ROOT/try  candidate, kernels unprobed
+  bpool/ROOT/default  secondary of rpool/ROOT/default, snapshots level, boot blocked (see Attention)
+Pairs
+  rpool/home -> bpool/home  secondary behind
+Interrupted
+  sync 6f1c0b9e-... on rpool after step 1  zboot resume 6f1c0b9e-...
+Attention
+  bpool/ROOT/default: boot candidate blocked: secondary cannot boot as a writable environment
+  rpool/ROOT/try/var has canmount=on inside boot environment rpool/ROOT/try
+  boot environment rpool/ROOT/try has child dataset rpool/ROOT/try/var: fork and pair refuse a boot environment with children
+  rpool/home -> bpool/home: secondary behind
+  rpool/home -> bpool/home: quota 100G on rpool/home, none on bpool/home; a sync applies it when bpool/home can take it
+```
+
+The sections come in this order, empty ones left out; with nothing to show,
+`status` says so in one line. Spacing may vary. Short `status` reads ZFS state and the attached disks (path, size, model and serial) without mounting filesystems. It names each imported pool, summarizes its other datasets, and shows the snapshot count with commands for the full inventory. A BE marked `once` takes precedence over the persistent default when its pool is visible.
+
+- **Boot environments**: every one found on the imported pools, marked
+  `running` and `default`, with its pair role or clone origin.
+- **Pairs**: every pair that is not a boot environment, with its direction
+  and whether the secondary is level, behind or diverged. `snapshots level`
+  means the copy has every snapshot and the working copy has changed since
+  its last one, as a running system always has.
+- **Interrupted**: every operation record, with the command that continues
+  it, and every orphaned attachment, with the `zfs inherit` command that
+  removes it when that is safe
+  ([RECOVERY](RECOVERY.md#interrupted-operations)).
+- **Attention**: a second boot default; a `canmount=on` dataset inside a boot
+  environment; a pair that is behind, diverged or whose peer is gone;
+  snapshots only on a fenced copy that await review; a space limit a fenced
+  copy does not hold as its working copy sets it ([Pairs](#pairs)); clones of
+  a working copy's snapshots, which make `primary` refuse; an anchor hold an
+  earlier pair left, with the `zfs release` command that frees it; and,
+  whatever their `canmount`, the datasets below each boot environment (`fork`
+  and `pair` refuse it; it still boots) and below each paired leaf (a sync
+  does not copy them, and `primary` refuses while either side has one).
+- `DATASET...` limits the report to those trees and adds, for each, its
+  zboot records (`--json` carries every property) and, for a boot
+  environment, its kernels (the names `boot --kernel` takes).
+- `--all` lists every dataset of every imported pool. `--snapshots` adds
+  snapshots. `--devices` adds disks (model, serial, size, what uses them, and
+  how `wipe` would erase them and why) and ESPs (whose file each of zboot's
+  two paths holds and whether zboot's match the installed `zboot.efi`, and
+  each [stale](#esp) zboot loader in `EFI/zboot/`); an ESP with an older or
+  a stale zboot loader is then listed under Attention.
+- `--json` always carries the whole inventory of the selection plus
+  `attention`; "short" applies to the text only. Two lists repeat attention
+  items as data: `space_differences`, one entry per key with `working_copy`,
+  `copy`, `key`, `working_value` and `copy_value` (as `zfs get -p` shows
+  them, `null` for no limit) and the copy's `copy_source` when it holds a
+  limit; and `child_datasets`, one entry per boot environment or paired leaf
+  with `parent`, `boot_environment`, `paired_with` (its peer, when paired)
+  and `children`.
+
+## Boot environments and trees
+
+```
+zboot snapshot [DATASET[@NAME] | @NAME]...
+zboot fork [[BE]@SNAP] DEST [--boot]
+zboot default [BE [--once | --clear-once]]
+zboot cmdline [BE] [--set ARGS | --clear]
+zboot chroot BE [-- COMMAND...]
+zboot rename SRC DEST
+zboot rollback DATASET@SNAP                                                †
+zboot drop TARGET...                                                       †
+```
+
+- `snapshot` snapshots each tree recursively; with no target, the running
+  boot environment. Without `@NAME` the name is `zboot-YYYYMMDDTHHMMSSZ`
+  (UTC), made when the verb runs and reported in the result. An existing name
+  is refused. With more than one target each must name its dataset, so
+  `snapshot a @x` is a usage error. With `--json`, `result` is an array of
+  capture outcomes, one per snapshot-label group, each with its capture
+  marker, status and verified snapshot points.
+- `fork` clones a snapshot of a boot environment as a new boot environment
+  in the same pool. With only DEST, it snapshots the running boot
+  environment now (named as for `snapshot`; a preview makes none) and clones
+  that. A source written explicitly must include `@SNAP`. The new boot
+  environment is `canmount=noauto` (`off` when its source is `off`) and keeps
+  its source's saved kernel arguments. The capture and clone share one
+  resumable operation; abandoning it keeps the snapshot and destroys nothing.
+- `fork DEST --boot` also selects the new BE for one launch. It leaves the
+  persistent default in place. Reboot separately. To arm an existing BE,
+  use `default BE --once`; to cancel, use `default BE --clear-once`.
+  All three support `--dry-run`. The request is local to that BE's pool.
+  With its disk detached the ordinary default can boot; the request remains
+  on that disk until a menu sees and consumes it or you clear it.
+- `fork` takes only a boot environment: one dataset with no children. It
+  refuses any other source (copy a data tree with `zfs clone`) and a boot
+  environment with child datasets, which it names; datasets mounted below a
+  boot environment belong outside `POOL/ROOT`. The source may be unpaired or
+  a pair's working copy, which keeps syncing ([Pairs](#pairs)); fork the
+  working copy, not the fenced one.
+- `fork` refuses a destination below a `zboot:staging` or `zboot:pending`
+  mark, on its parent or inherited by it: finish or abandon that operation,
+  or drop its staging, first. Snapshots other tools take of the new clone or
+  of its staging container `POOL/zboot-fork-ID` never stop it, and are left
+  in place. A staging container that holds anything zboot did not make is
+  left, still marked as staging, and named in the result; `zboot drop` on it
+  lists what it holds. `abandon` leaves an unpublished clone, with its
+  snapshots, as staging for `drop` ([why](DESIGN.md#trees)).
+- `default BE` makes BE the host's one boot default: it sets its pool's
+  `bootfs` and clears `bootfs` on every other imported pool. Without BE it
+  prints the current default, or says there is none or more than one. This query reports the persistent default; `status` also shows the one-time selection.
+- `fork` and `default BE` refuse while any boot environment on the host
+  holds a `canmount=on` dataset (its root or anything below it), and name
+  that dataset: stock mounting would mount it over whichever other boot
+  environment is running. The fix is `zfs set canmount=noauto DATASET`.
+  Until then the menu boots only the boot environment that owns the dataset.
+- `cmdline` prints the kernel arguments saved for BE, which the menu adds
+  when it boots BE. `--set ARGS` replaces them (one argument; quote it),
+  `--clear` removes them. `--set` refuses what the menu itself decides
+  (`root`, `boot`, `ro`, `rw`, `init`, `rdinit`, a hostid or a ZFS force
+  argument, `zboot.recovery`, `zboot.trace`), any quote or backslash, and a
+  resulting command line over 2047 bytes.
+- `chroot` opens a shell, or runs COMMAND, inside BE with BE mounted
+  writable. BE must be a working copy or unpaired, and not the running boot
+  environment. COMMAND is an absolute path inside BE (`/usr/bin/apt`, not
+  `apt`); it defaults to BE's `/bin/bash`, else `/bin/sh`. Its exit status
+  is COMMAND's. Inside, `/run` is new and empty; when BE's
+  `/etc/resolv.conf` is a symlink into `/run` (as `systemd-resolved`
+  installs), `chroot` puts a copy of the running system's resolver there, so
+  `apt` resolves names as the host does.
+- `rename` renames an unpaired tree inside its pool. To move a dataset to
+  another pool: `sync SRC DEST`, `primary DEST`,
+  `unpair DEST --release-anchors`, `drop SRC`. A tree moves leaf by leaf:
+  make its containers on the other pool with `zfs create`, then move each
+  leaf.
+- `rollback` rewinds an unpaired tree and every descendant to `@SNAP`, which
+  each must have. The plan lists the newer snapshots destroyed and says that
+  changes not in a snapshot are lost. For example,
+  `zboot rollback rpool/ROOT/test@before-update --dry-run` selects the
+  `ROOT/test` tree on `rpool`. The pool prefix selects the local copy.
+  zboot refuses a pool root and refuses either member of a pair.
+  Native `zfs rollback DATASET@SNAP` is a separate operation on one dataset
+  and has no dry-run flag. The running boot environment cannot be
+  rewound in place: `fork @SNAP NEW`, `default NEW`, reboot.
+- `drop` deletes snapshots and whole unpaired trees, all in one pool,
+  including leftover staging. It refuses a pool's root, the running boot
+  environment, the boot default, and a tree with clones outside itself.
+
+## Pairs
+
+A pair is two copies of one dataset, normally on two pools. One is the
+working copy (primary). The other (secondary) is fenced: read-only, never
+mounted by itself, and a volume has no device (`volmode=none`). Snapshots
+flow from the working copy to the fenced one ([DESIGN](DESIGN.md#pairs)).
+
+A pair joins two datasets with no children, called leaves. Create containers
+such as `rpool/data` on each side with `zfs create`, then pair each leaf
+separately. A boot environment is one leaf, and so is a volume. Snapshots of
+separate leaves are not guaranteed to capture the same moment.
+
+Clones of a working copy's snapshots, such as a `fork` of a paired boot
+environment, stay with the working copy: syncs go on, a snapshot a clone
+depends on is kept rather than deleted, and `status` lists the clones.
+`primary` refuses while either side has one: drop the clone first, or, to
+keep a fork, unpair before `zfs promote` (promoting takes the paired leaf's
+older snapshots, its anchor among them, to the fork). `pair` and `sync`
+refuse clones of the fenced copy's snapshots, and a leaf that is itself a
+clone; `zfs promote` it first.
+
+`pair`, `sync` and `primary` refuse pools imported with an alternate root
+(`zpool import -R`), and an interrupted sync does not continue while either
+pool is; export and import without `-R` first.
+
+```
+zboot pair PRIMARY SECONDARY
+zboot sync (DATASET | SRC DEST | --all)          † when it deletes snapshots only the copy keeps
+zboot primary DATASET                            † when the peer loses changes or is gone
+zboot unpair DATASET [--release-anchors]         † with --release-anchors or a gone peer
+```
+
+`pair` records two existing datasets as a pair, fences SECONDARY and holds
+their common snapshots. It transfers and deletes nothing. It needs a common
+snapshot, and refuses when SECONDARY is ahead of PRIMARY and says to swap
+them. It refuses a dataset with children and names them. Snapshots older
+than the newest common one may differ: either side may have pruned some.
+
+`sync` copies new snapshots one way. It never overwrites history on the
+receiving side that the sender lacks. `primary` on the receiving side keeps
+that history instead; to keep the sender's, remove by hand what only the
+receiver has after their last common snapshot (`zfs destroy` its newer
+snapshots, `zfs rollback` its unsnapshotted changes), then sync.
+
+| Form | Needs | Does |
+|---|---|---|
+| `sync DATASET` | DATASET is one side of a pair whose peer is reachable | Transfers from the working copy to the fenced one, whichever was named. |
+| `sync SRC DEST`, DEST absent | SRC is unpaired and has no children; DEST's parent exists and is not in a pair | Creates DEST, transfers everything and pairs the two with SRC as the working copy. Says so. |
+| `sync SRC DEST`, DEST exists | SRC is the working copy and DEST its pair peer | Transfers from SRC to DEST. With SRC the fenced copy it refuses before any effect: `zboot primary SRC` makes SRC the working copy. An unpaired DEST is refused: `pair` it first. |
+| `sync --all` | at least one pair imported | Syncs every pair and reports each. One failure does not stop the rest; the exit status is then 4. |
+
+### Working on A with B on standby
+
+Suppose `rpool/ROOT/be1` on A is primary and `rpool2/ROOT/be1` on B is
+its fenced copy. To refresh B while continuing to work on A:
+
+```sh
+zboot sync rpool/ROOT/be1 --dry-run
+zboot sync rpool/ROOT/be1
+zboot status --snapshots rpool/ROOT/be1 rpool2/ROOT/be1
+```
+
+A normal sync captures the writable source at `@zboot_transfer_<id>`,
+where zboot generates the 32 hexadecimal digits when the transfer runs.
+B receives that snapshot. Writes A makes after the capture can travel on
+the next sync. If the source dataset is read-only, sync uses its newest
+existing snapshot and refuses if there is none.
+
+To **move the work to B**, run `zboot primary rpool2/ROOT/be1` from the
+menu's shell or RAM rescue, with both pools available. In the menu itself,
+type `primary rpool2/ROOT/be1`. For a healthy catch-up, zboot fences A,
+captures its final state at `@zboot_primary_<operation-id>`, transfers
+and verifies that snapshot, then activates B and moves the boot default
+if A held it. A sync beforehand can reduce the data left to copy.
+The final capture still matters: A could accept another write between
+that earlier sync and the handoff. This switches one dataset pair.
+
+To try an earlier OS state, use `fork` on a named snapshot of the working
+BE and select the new BE in the menu. To keep B exactly as it was last
+replicated and use it independently, `unpair` the reachable pair, then use
+`primary` on the former secondary to activate its saved placement. This
+ends replication for that pair and leaves A with its own history. A healthy
+paired handoff always includes the final catch-up.
+
+For a scripted handoff, review `zboot primary rpool2/ROOT/be1 --dry-run
+--json`, then pass its `.token` to `zboot primary rpool2/ROOT/be1
+--confirm TOKEN`. Check the reported mode, peer and loss before approving
+the switch. Each token binds the consent details of its own plan.
+A new write on A can still be included in a lossless final capture.
+
+### Transfer details
+
+A sync copies one dataset as a raw stream into the host's own `zfs receive`;
+no key is loaded or asked for. The stream carries no properties: zboot sets
+them on the copy itself ([How a transfer runs](DESIGN.md#how-a-transfer-runs)).
+
+- Properties the working copy sets (locally or received) are set locally on
+  the copy, so `zfs get` there shows `local`; placement (`mountpoint`,
+  `canmount`, `readonly`, `volmode`), zboot's own records and encryption
+  settings are not copied. A copied property set by hand on the copy is
+  overwritten at the next sync, and a user property the working copy lacks
+  is removed.
+- Space limits (`quota`, `refquota`, `reservation`, ...) the working copy
+  does not set become `none` on the copy. A limit the copy cannot take does
+  not fail the sync: the result lists it as `NOT applied` and the copy keeps
+  its own value. The copy holds a limit when it has the working copy's value
+  set locally, or when neither sets one (`none` and `0` are no limit).
+  `status` and the `primary` plan list every key a copy does not hold, with
+  both values; where only the copy has a limit, `status` says the next sync
+  removes it: set it on the working copy first to keep it.
+- A new copy of an encrypted dataset is its own encryption root with the
+  key location of the working copy's root, and loads its key separately (a
+  `file://` location does it automatically). After a key change on the
+  working copy, a sync into such a copy makes it need the new key too, with
+  no dedicated notice. A copy that takes its key from a root on its own side,
+  as after `primary` into an installer-made dataset, needs the two roots
+  wrapped alike (the same passphrase format, salt and iterations, or a key
+  file that opens both); otherwise the sync refuses before any data: make the
+  copy its own encryption root first (`zfs change-key`). A raw or hex key
+  entered at a prompt cannot be checked and refuses.
+- A child dataset under a paired leaf is not copied. `sync` still copies
+  the leaf and names the child as not mirrored; `sync --all` then exits 4.
+- Snapshots are pruned on the working copy: zsnap retention and `zsnap
+  prune` work there, and skip the newest common snapshot, which is held on
+  both sides. A fenced copy refuses snapshot deletion and follows the
+  working copy through `sync`.
+- An interrupted sync can be abandoned (`zboot abandon ID`) until its data
+  is verified: the copy stays fenced with the snapshots it received, and the
+  next sync continues from them; a new copy stays fenced in its receive
+  container, which the message names. After its data is verified, resume
+  it.
+
+Around the transfer of a pair:
+
+- A snapshot both sides have (same GUID) that the copy names differently is
+  first renamed on the copy to the working copy's name, through a
+  temporary `zboot_rename_GUID` when two names swap.
+- **Pending deletions** are snapshots only on the copy, older than the
+  newest common snapshot: the working copy no longer has them, so after
+  deletion they exist nowhere. The plan lists each with its creation time
+  and the space it frees, and its token binds them. They are deleted before
+  the transfer, and only when you type the summary the plan prints
+  (`2 snapshots on bpool/data`) or pass `--confirm TOKEN` from
+  `sync ... --dry-run`; Enter keeps them, and the transfer runs either way.
+  `sync --all` asks once for every pair, and its `--confirm` takes the token
+  of `sync --all --dry-run`. Without a terminal and a token (a
+  timer) nothing is deleted: the transfer runs, the result lists the pending
+  deletions with the command to review them, and the exit status is the
+  transfer's. A reviewed snapshot is deleted only while it is still exactly
+  that snapshot, absent from the working copy and older than the anchored
+  newest common snapshot; a held one is kept and reported.
+- A pending deletion whose name a newer snapshot from the working copy
+  needs stops that pair before anything changes, unless it was reviewed;
+  then it is deleted first. `sync --all` goes on with the other pairs.
+- After a verified transfer, zboot deletes its own older boundary snapshots
+  (`@zboot_transfer_*`, `@zboot_primary_*`, those with zboot's capture
+  marker) on both sides without review, keeping the newest and any that are
+  held.
+
+`primary` makes DATASET's side the working copy:
+
+| DATASET is | Its peer is | What happens | Typed |
+|---|---|---|---|
+| already the working copy, or unpaired | any | Nothing switches. A dataset still fenced from an earlier pairing is activated again, and a boot default left on the other side moves here. | no |
+| the fenced copy, level with or behind the peer | reachable | The peer is fenced, snapshotted once more and transferred; then the roles swap. Nothing is lost. | no |
+| ahead of the peer, or the two have diverged | reachable | The peer is rolled back to the newest common snapshot and becomes the fenced copy. The plan lists the peer's snapshots and unsaved changes that are lost. | † the peer |
+| either | gone | DATASET's pair record is removed, its holds are kept, and DATASET is activated alone. You are stating that the peer is offline. | † DATASET |
+
+- A peer is *gone* when its pool is not imported, the dataset is absent, or
+  it no longer names this side.
+- When the pair's dataset is the boot default, `primary` moves the default
+  to the new working copy.
+- A switch between pair members refuses while either side has a child
+  dataset, which would mount over the live copy's path at the next boot.
+- With a reachable peer, the plan lists the space limits the fenced side
+  does not hold (`space_differences` with `--json`); they do not make
+  `primary` typed and are not in its token, so a lossless switch shows them
+  only with `--dry-run`. Afterwards the activated side's limits are the
+  pair's, and the next sync gives them to the peer; a catch-up first applies
+  the working copy's where the activated side can take them.
+- Snapshots only on the fenced copy that `sync` has not deleted after review
+  make `primary` typed: afterwards they exist only on the new working copy,
+  whose own retention may delete them.
+- A `volmode` set by hand on a volume, any value but `none`, is saved when
+  zboot fences the volume and set again when it is activated; the new
+  working copy gets the value the old one had. Without one, activation
+  inherits `volmode`. A volume hidden by hand with `volmode=none` stays
+  hidden, but after `primary` the new working copy inherits.
+
+`unpair` removes both pair records and keeps data, roles and the holds on
+the common snapshots. The former secondary stays fenced; `primary` on it
+activates it.
+
+- `--release-anchors` also releases those holds on both sides, also after an
+  earlier plain `unpair`. A deferred destroy or a retention job may then
+  delete the snapshots, so it is †.
+- With a gone peer, `unpair` removes only this side's record and keeps its
+  holds. It is †.
+
+## Install
+
+```
+zboot factory TAR [--packages PKG,...] [--suite NAME]
+              [--mirror URL] [--snapshot TIME]
+zboot deploy DISK (--tar TAR [--overlay OVERLAY]... [--be NAME] [--hostname NAME] | --empty)
+             [--pool NAME] [--hostid HOSTID] [--esp SIZE | --esp-partition PART]
+             [--swap SIZE] [--efi FILE]                                       †
+zboot deploy --image FILE (--tar TAR [--overlay OVERLAY]... [--be NAME] [--hostname NAME] | --empty)
+             [--pool NAME] [--hostid HOSTID] [--esp SIZE] [--swap SIZE] [--efi FILE]
+zboot deploy (DISK | --image FILE) --portable --tar TAR [--overlay OVERLAY]...
+             [--be NAME] [--hostname NAME] [--pool NAME] [--esp SIZE] [--efi FILE]  † with DISK
+zboot deploy into POOL --tar TAR [--overlay OVERLAY]... [--be NAME] [--hostname NAME]
+zboot esp [--efi FILE]
+zboot esp PART... [--efi FILE]              † when it replaces a loader that is not zboot's
+zboot wipe DISK                                                               †
+```
+
+### factory
+
+`factory` writes a Debian root tar that boots from ZFS and belongs to no
+host, with `TAR.packages` (the installed packages) beside it. Neither file
+may exist. It needs no root and no VM ([BUILD.md](BUILD.md#root-tars) lists
+what it needs). The tar is zstd-compressed whatever its name; `deploy --tar`
+and `boot --tar` tell by its content.
+
+- `--packages` adds packages. `--suite` defaults to `forky`. `--mirror` is
+  the archive the root updates from.
+- `--snapshot YYYYMMDDTHHMMSSZ` takes every archive from snapshot.debian.org
+  at that time. When the live suite cannot build, for example when its
+  kernel and OpenZFS disagree and DKMS fails, `--snapshot` pins an archive
+  state that still worked.
+- The base system includes the kernel and its headers, OpenZFS with
+  initramfs support, systemd, the tools zboot runs and the zboot it runs
+  from, as the package `zboot`. It has no network manager, firmware set or
+  listening daemon; added packages may install daemons. Root's password is
+  locked. A role or machine gets its network and access policy from
+  overlays. A host normally adds `--packages network-manager` (or configures
+  networkd in an overlay) and `firmware-*` packages for its hardware; the
+  factory has `main contrib non-free-firmware`.
+- The finish step removes build-machine identity and SSH host keys and
+  regenerates every initrd. It removes a regular `/etc/resolv.conf` but
+  preserves a symlink into `/run`, as `systemd-resolved` installs. With
+  `openssh-server` installed, factory adds zboot's missing-host-key
+  generator, ordered before SSH; it runs at any boot where the keys are
+  missing, and overlay-supplied host keys stay.
+- There is no rescue preset or mmdebstrap pass-through. For a rescue, add
+  packages and use `builtin:rescue` as
+  [RECOVERY.md](RECOVERY.md#rescue-sticks) shows. Roots built by other means
+  can go straight to `deploy --tar`.
+
+### deploy
+
+`deploy` installs a boot environment from a root tar, or prepares an empty
+pool for a second copy, on a whole disk or a new image file;
+[`deploy into`](#deploy-into) adds one to an imported pool. Anything but
+`--dry-run` needs root. Choose one target and one content option:
+
+| Target | What happens | Confirmation |
+|---|---|---|
+| `DISK` | Erases DISK as `wipe` does, partitions it (ESP, optional swap, pool), creates the pool, installs the content, writes `zboot.efi` to the ESP, sets the new pool's `bootfs` and exports the pool. | typed disk serial |
+| `--image FILE` | The same onto a new file through a loop device. FILE must not exist. It is sized to the ESP plus swap plus the unpacked tar with headroom, rounded up to a whole GiB. | none, and no `--confirm` |
+
+| Content | What is installed |
+|---|---|
+| `--tar TAR` | TAR unpacked as the boot environment `POOL/ROOT/NAME`, then each `--overlay` in order, then with `--portable` zboot's portable overlay. |
+| `--empty` | Only `POOL` and `POOL/ROOT`, with no boot default. It prepares the second disk of a pair. |
+
+The synopsis lines are the accepted combinations; any other is a usage
+error. The defaults: `--pool rpool` (`stick` with `--portable`), `--be
+default`, the tar's hostname, the running host's hostid (else a random one),
+`--esp 1G`, no swap and the shipped `zboot.efi`.
+
+- `--tar` takes a root tar (plain or zstd) with matching
+  `boot/vmlinuz-RELEASE`, `boot/initrd.img-RELEASE` and a ZFS module for that
+  kernel, normally one `zboot factory` wrote. Debian roots are the tested
+  input; other roots may pass the file checks without their boot arguments,
+  mounting or initrd tools being qualified.
+- `--overlay OVERLAY` adds files and may run a hook in the new root; see
+  [Overlays](#overlays).
+- An existing pool name is refused. `deploy` sets only the new pool's
+  `bootfs`, never clearing another pool's; if another imported pool also has
+  a default, the plan says so, and the menu does not count down until
+  `zboot default` picks one.
+- `--hostid`: the new system's `/etc/hostid`, and the hostid the pool is
+  created under. A random one is reported in the result. Related deployments
+  (a disk and its pair) must use the same. `deploy` refuses while
+  `ZFS_HOSTID` is set in its environment, which would override it.
+- `--esp-partition` puts the loader on an existing ESP on another disk
+  instead of making one; the plan names that partition. It writes
+  `EFI/zboot/zboot.efi` there, never the fallback `EFI/BOOT/BOOTX64.EFI`, and
+  is refused when another system's file is at either path: run
+  `zboot esp PART` first, which replaces it after a typed answer. Where
+  zboot's loader is already installed beside another system's fallback, that
+  fallback stays: choose another ESP, or remove the fallback yourself.
+- `--efi FILE` is the `zboot.efi` to install. The default is
+  `../lib/zboot/zboot.efi` from the binary's directory
+  (`/usr/lib/zboot/zboot.efi` when installed). The zboot UKI ships none:
+  give `--efi FILE` there.
+- With DISK, `deploy` plans again on the erased disk, which must still be
+  bare and unused, and goes on only if that plan binds what you confirmed.
+- An interrupted or failed deploy is not resumed and keeps no operation
+  record. Run it again; it plans and confirms afresh. A failed overlay or
+  hook rolls the unfinished boot environment back to `@factory`. Each
+  `post-install` hook's output goes only to a log (mode 0600),
+  `deploy-ID-post-install-N.log` in a new directory under `/run/zboot/deploy/`;
+  ID is the run ID a failure message names.
+- While it builds, deploy marks the pool, `POOL/ROOT` and the boot
+  environment `zboot:pending=ID`. A deploy interrupted after it created the
+  pool (the disk vanished, say) leaves marks, and `status` then says a
+  dataset is left from an interrupted deploy: run the deploy again, which
+  erases the disk, or `zboot drop` the marked dataset; a mark on the pool's
+  root needs `zpool destroy POOL` or the deploy run again.
+- A failed image deployment removes its file after verifying that its loop
+  device has detached. A busy or unverified attachment keeps the image and
+  reports its path: inspect it before removing the file or reusing its name.
+
+`--portable` makes a system that belongs to no machine, which is how a
+rescue stick is made ([why and how](DESIGN.md#deploy---portable)). It refuses
+`--hostid`, `--swap` and `--esp-partition`.
+
+- It gets no hostid, no swap and no boot default. After all overlays and
+  hooks zboot removes `/etc/hostid` from the new root and configures portable
+  boot: the root pool is imported read-only and a RAM layer takes all
+  writes. `deploy` checks that every regenerated initrd does both. It needs
+  an initramfs-tools root (`update-initramfs`, `unmkinitramfs`,
+  `lsinitramfs`) and is tested with Debian roots.
+- zboot's own environments (the UKI and the system on the stick) import the
+  pool only read-only, so they record no host in it. Other systems may not: a
+  host that imports pools by scanning at boot (`zfs-import-scan.service`)
+  imports the stick writable and records its hostid in its labels; another
+  machine then needs a forced import, and a zboot menu that adopted another
+  host keeps the pool closed. Export the stick there (`zpool export stick`)
+  before you move it, and disable scan import on hosts it is plugged into, or
+  make the stick again.
+- A factory root with SSH regenerates missing host keys at every portable
+  boot; overlay-supplied keys pin them. Other root tars use their own setup.
+- The menu lists the result like any boot environment and never counts it
+  down. With `--image` the result is a stick image to copy with `dd`. Sticks
+  copied from one image share a pool identity: plug in one at a time (the
+  menu says so when it sees two).
+
+### deploy into
+
+`deploy into POOL` adds a boot environment `POOL/ROOT/NAME` (`--be`, default
+`default`) to an imported pool from a root tar, as `deploy --tar` does. It
+erases nothing, writes no ESP and changes no boot default; `zboot default`
+selects the new boot environment. It loses nothing, so it takes `--dry-run`
+but no `--confirm`. Anything but `--dry-run` needs root.
+
+- POOL's root dataset must be unpaired, and `POOL/ROOT`, when it exists, an
+  unmounted container (`canmount=off`, `mountpoint=none`); `deploy into`
+  creates it otherwise. An existing boot environment name is refused.
+- The new system gets the hostid of the pool's host, which must be this
+  host; in the zboot UKI, the hostid the menu adopted for that pool.
+- An interrupted or failed `deploy into` is not resumed and keeps no
+  operation record. Its boot environment stays fenced (`canmount=off`,
+  `mountpoint=none`, `zboot:pending=ID`) and is never a boot candidate:
+  `zboot drop` it, then run `deploy into` again. Each `post-install` hook's
+  output goes only to `/run/zboot-deploy-into-ID-post-install-N.log` (mode
+  0600).
+
+### Overlays
+
+`OVERLAY` is `DIR`, `TAR` or `builtin:NAME`. A directory or tar holds
+`rootfs/`, copied over the new root, and an optional executable
+`post-install`, run once in the new root's chroot. A tar keeps owners and
+modes; a directory is installed `root:root` with its modes. Existing
+directories keep their owner and mode. Unknown top-level entries and a
+non-executable `post-install` are refused. A path that starts with
+`builtin:` is never a file (write `./builtin:x` for one).
+
+- Overlays apply left to right: one overlay's files, then its
+  `post-install`, then the next. A later file replaces an earlier one at the
+  same path; nothing is merged. The portable overlay comes after all of
+  them and cannot be selected with `--overlay`. Every regenerated initrd is
+  checked.
+- `deploy` options (disk, pool, BE, ESP, swap, hostid, hostname, portable
+  mode) win after all overlays and hooks: deploy then enforces `/etc/hostid`
+  and an explicit `--hostname`, or removes `/etc/hostid` in portable mode. It
+  leaves overlay-supplied SSH host keys alone.
+- The plan lists every overlay's entries and digests in order, never
+  contents, and a `deploy DISK` token binds their order and contents,
+  built-ins included.
+- `boot --tar` takes overlays too, but only their files
+  ([Menu and remote access](#menu-and-remote-access)).
+- zboot has one named overlay, `builtin:rescue`, files only, built into the
+  binary and the UKI; an unknown name is refused with the list of names. It
+  holds exactly:
+
+  ```
+  etc/systemd/system/getty@.service.d/zboot-rescue.conf         root autologin on the consoles
+  etc/systemd/system/serial-getty@.service.d/zboot-rescue.conf  and on serial consoles
+  etc/systemd/network/89-zboot-rescue.network                    DHCP on every ethernet link,
+                                                                 client id from the MAC
+  etc/systemd/system/multi-user.target.wants/systemd-networkd.service  enables networkd
+  etc/ssh/sshd_config.d/zboot-rescue.conf                        PermitRootLogin yes
+  etc/issue                                                      console banner with the IPv4 address
+  ```
+
+  It installs no package and sets no password; `systemd-networkd-wait-online`
+  is not enabled, so an unplugged cable does not hold up the boot.
+  [RECOVERY.md](RECOVERY.md#rescue-sticks) has the rescue recipe and what
+  the rescue system provides.
+
+### esp
+
+`esp` writes zboot's loader to EFI system partitions. zboot writes exactly
+two paths on an ESP: `EFI/zboot/zboot.efi`, which firmware entries point at,
+and the firmware fallback `EFI/BOOT/BOOTX64.EFI`. A file is *zboot's* when it
+is a UKI whose `.osrel` section has `ID=zboot`; any other file, or one that
+cannot be read as a UKI, belongs to another system. Nothing else on an ESP is
+written ([why](DESIGN.md#esp)).
+
+- `esp` without PART refreshes after a zboot update. It takes every ESP
+  that holds one of zboot's loaders on a disk that also holds an imported
+  pool, which covers the second disk of a pair. It also takes the ESP this
+  boot was loaded from (systemd-stub's `LoaderDevicePartUUID`) when the host
+  itself is running, with its root on a writable pool, and that ESP is
+  directly on a fixed NVMe or SATA disk. A stick you booted from stays the
+  untouched fallback; in a stick system or a rescue in RAM this second rule
+  adds nothing. When the booted ESP is left alone, for any of these reasons
+  or because two partitions carry its PARTUUID, `esp` names it and still
+  refreshes the rest. Any other ESP, such as a rescue stick, is left alone,
+  and `status --devices` shows it as older until you name it.
+- On each ESP it refreshes, `esp` writes each of the two paths that holds
+  zboot's loader or nothing. Another system's file at either stays in place,
+  and the result names it (`left_in_place` with `--json`). It needs no
+  confirmation.
+- `esp PART...` installs. Where `EFI/zboot/zboot.efi` is not zboot's, it
+  writes both paths; replacing another system's file at either is †. The
+  fallback is written first, so running it again after a failure finishes
+  the install. Where zboot is installed, it refreshes as `esp` does. A zboot
+  fallback alone does not count as installed.
+- A *stale* loader is one of zboot's own UKIs directly in `EFI/zboot/` under
+  another name, such as `zboot-recovery.efi`, which earlier builds wrote and
+  refreshed. `esp` no longer refreshes it, so a firmware entry that still
+  points at it boots an old loader. `esp` (plan and result, `stale_loaders`
+  with `--json`) and `status --devices` name each one:
+
+  ```
+  ESP /dev/nvme0n1p1: EFI/zboot/zboot-recovery.efi is a stale zboot loader; zboot no longer refreshes it. Point the firmware boot entry at EFI/zboot/zboot.efi (efibootmgr), then remove EFI/zboot/zboot-recovery.efi.
+  ```
+
+  An ESP that holds only a stale loader still counts as zboot's: `esp` adds
+  `EFI/zboot/zboot.efi` beside it. zboot never removes or rewrites a stale
+  loader.
+- One plan covers all the ESPs; free space is checked when it is made. If
+  one ESP fails after another changed, the result is partial (exit 4) and
+  names what remains. `esp` writes no firmware boot entry and keeps no
+  operation record: run it again.
+- A zboot UKI elsewhere on an ESP, such as `EFI/Linux/` or a subdirectory of
+  `EFI/zboot/`, is neither refreshed nor reported. Files that earlier builds
+  left in `EFI/zboot/operations/` are inert; remove them by hand if you like.
+- `--efi FILE` as for `deploy`.
+
+### wipe
+
+`wipe` erases a whole disk by one of two methods. The plan names the method,
+why it was chosen and everything it touches, and confirmation covers that
+method; `status --devices` shows the method beforehand. A disk that holds an
+imported pool or a mounted filesystem is refused.
+
+- **NVMe sanitize** of the disk's whole NVM subsystem, chosen only when that
+  subsystem is the disk alone: crypto erase when the controller supports it,
+  else block erase. A sanitize cannot be aborted and resumes after power
+  loss; one already running is waited out first, and the result says what
+  the controller reported.
+- **Metadata clearing** for every other disk: ZFS labels, signatures and
+  partition tables are cleared, and the data itself stays in place. The plan
+  says so and names the reason (not NVMe, NVMe over a fabric, a subsystem
+  that may have other controllers or namespaces, or no usable sanitize).
+
+A failed query, a rejected or failed sanitize or an uncertain outcome stops
+the operation and never falls back to metadata clearing. A controller left in
+sanitize failure mode is refused until you resolve it with
+`nvme sanitize --sanact=exit-failure`. Either way a fresh probe then checks
+that the disk shows no partitions, signatures, ZFS labels or GPT; this checks
+what is visible and does not by itself prove secure erasure
+([Wiping a disk](DESIGN.md#wiping-a-disk)).
+
+## Recover
+
+```
+zboot restore SOURCE DISK [--keep DATASET]... [--pool NAME] [--esp SIZE]
+              [--swap SIZE]                                                   †
+zboot resume [ID]                       † when an erase is still ahead or the loss changed
+zboot abandon [ID]                                                            †
+```
+
+- `restore` rebuilds DISK from SOURCE on another disk. SOURCE is `BE@SNAP`,
+  recursive over the BE, or a bare BE. A bare BE must be the running one,
+  and it is snapshotted now; in the zboot UKI no BE is running, so name the
+  snapshot (`status BE --snapshots` lists them). It keeps each `--keep`
+  dataset of DISK with its descendants (none without `--keep`) and refuses
+  while anything on DISK is in use. The new pool keeps DISK's current pool
+  name, ESP size and swap size when they can be read, else the `deploy`
+  defaults; the flags override (`--swap 0` for none). The restored boot
+  environment ends unpaired and is the boot default. A kept dataset that is
+  paired comes back unpaired in its role (a fenced copy fenced, a working
+  copy active); the plan names each peer whose pair record restore ends
+  after the erase, and `pair` joins the two again without a full copy.
+- Data moves dataset by dataset as raw streams into the host's own
+  `zfs receive`; no key is loaded or asked for. A kept tree with a clone, or
+  a raw or hex key entered at a prompt, is refused. A dataset made under the
+  source BE after the plan stops restore before the BE is snapshotted, with
+  nothing erased; one made afterwards is left out and reported.
+- The new ESP gets the `zboot.efi` SOURCE ships (`/usr/lib/zboot/zboot.efi`
+  in it). The plan shows its SHA-256; a SOURCE without one, or without a
+  kernel and initrd to boot, is refused.
+- `resume` continues an interrupted operation; `status` lists them.
+  Continuing inside the recorded consent needs no new confirmation. An erase
+  still ahead, or a loss that changed, asks again for what the interrupted
+  verb asked for.
+- `abandon` ends an interrupted operation without finishing it. It prints
+  what it leaves behind and destroys nothing.
+- Both take only operations this zboot started; an earlier zboot's record is
+  refused, to be finished or abandoned with the build that started it.
+- Without ID, both take the one interrupted operation. With none they
+  refuse; with several, or with an orphaned attachment listed beside it, they
+  refuse and list them.
+
+## Menu and remote access
+
+```
+zboot reboot --menu [--key FILE] [--esp PART]  on a running system
+zboot boot [BE] [--kernel NAME]              in the zboot UKI
+zboot boot --tar FILE|- [--overlay OVERLAY]...  in the zboot UKI
+zboot menu [--no-autoboot]                   the UKI's own start-up
+```
+
+- `reboot --menu` restarts into the menu and holds it there once: it writes
+  `zboot/authorized_keys` on one ESP, then reboots. The menu reads it only
+  from the ESP the next boot loads zboot from. That is the ESP this system
+  booted from, unless that ESP is not directly on a fixed NVMe or SATA disk,
+  as after a one-time boot from a stick: the next ordinary boot follows the
+  firmware's boot order and is unlikely to load it, so `reboot --menu`
+  refuses and lists every zboot ESP on this host's fixed disks, with the
+  disk's model. `--esp PART` writes to PART instead, which must be an ESP
+  holding zboot's loader; name the stick's ESP to keep using the stick. A
+  system booted from the network has no such ESP; name one with `--esp`. The
+  plan names the ESP and says which way it was chosen. With `--key FILE` the
+  menu also starts SSH for those keys. Run the command at the target console
+  or in an existing SSH session on the target. Both read FILE on the target
+  itself. After reboot, verify the menu's host fingerprint at the console
+  and connect from the controller as `root` at the displayed wired address
+  (see [Getting in remotely](RECOVERY.md#getting-in-remotely)).
+  FILE must hold at least one OpenSSH
+  public key and no key options. Without `--key` the menu waits, with no SSH.
+  `--menu` is required; a plain restart is `systemctl reboot`.
+- `boot` hands over to a boot environment with `kexec`. With no BE it takes
+  the boot default, and refuses when there is none or more than one.
+  `--kernel NAME` picks another installed kernel by the name `status BE`
+  lists (its version, such as `7.2.15+deb14-amd64`).
+- `boot --tar` boots a root tar in RAM: zboot builds a small initramfs
+  containing the tar and the `rootfs/` of each `--overlay` in order, then
+  starts the tar's kernel. Nothing is written to a disk; `-` reads the tar
+  from stdin. The tar needs exactly one kernel, that kernel's modules and an
+  init. An overlay with a `post-install` is refused before staging. Access
+  to the booted system is whatever the tar and overlays set up, normally
+  `builtin:rescue` and an overlay with SSH keys
+  ([A rescue in RAM](RECOVERY.md#a-rescue-in-ram)). It refuses before staging
+  when the available RAM is less than 256 MiB plus the larger of the tar with
+  its unpacked size (the booted system) and three copies of the tar (staging
+  and `kexec`). Uploaded bytes are freed before `kexec` loads them.
+- `menu` is what the UKI runs at start-up. `--no-autoboot` disables the
+  countdown. `menu -v` makes every command typed in it verbose.
+
+### In the menu
+
+The prompt is `zboot> `. The menu takes the same verbs with the same
+arguments and options; a leading `zboot` is accepted and ignored.
+Differences:
+
+- A target may be a boot environment's number `N` as the menu and `status`
+  show it there, or `N@SNAP`; other datasets take their full names. Each
+  number is bound to the boot environment's native identity when it is
+  shown, so a number that no longer names the same dataset is refused.
+- The UKI keeps every pool imported read-only. Any zboot command there (a
+  menu line, the shell, an SSH session) plans on the read-only pools and
+  reopens the pools its plan names writable only after the answer, returning
+  them to read-only when done ([why](DESIGN.md#command-line)). A pool the
+  command exported stays exported; `rescan` imports it again. A pool already
+  imported writable (from the shell) is refused after the preview.
+
+Menu-only commands:
+
+| Command | Does |
+|---|---|
+| `N`, `N.M` | Boot environment N; `.M` picks its M-th kernel. Same as `boot N`. Options need the long form: `boot N -v`. |
+| `connect`, `connect --new` | Show the active SSH connection details, or start wired DHCP and SSH when inactive. `connect --new` closes existing sessions and issues fresh password credentials. On new password access, print the address, the host key fingerprint and its six words ([RECOVERY](RECOVERY.md#getting-in-remotely)), and a one-time password, valid until its first login or the end of that session. It needs exactly one wired interface with a link ([RECOVERY](RECOVERY.md#getting-in-remotely)), and a UKI built with the SSH tools; the shipped one has them. |
+| `rescan` | Look for pools again and import new ones read-only, then list. |
+| `list`, Enter | Show the whole listing again. |
+| `ls` | Same as `status`. |
+| `shell` | A root shell; `exit` returns. |
+| `reboot`, `poweroff` | Restart or power off. |
+| `help` | List the commands. `help COMMAND` prints that command's options. |
+
+A BE row shows `blocked: REASON` when a boot check fails. Otherwise the
+menu admits the dataset and has found a usable kernel/initrd pair. A numbered kernel can be chosen explicitly if there is
+no unique default pair. The OS can still fail after handoff. A plain Enter
+or `list` redraws the menu and public SSH verification details.
+A key during the five-second countdown pauses it for this menu visit.
+The one-time selection precedes the persistent default for that countdown
+and for bare `boot`. Manually booting another BE spends the visible request
+as well. Booting a rescue tar in RAM leaves the request in place.
+
+### Getting in remotely
+
+One-boot keys on the ESP (`reboot --menu --key`), `zboot.ssh_key=` from a
+network loader, or `connect` at the console:
+[RECOVERY.md](RECOVERY.md#getting-in-remotely) says what each does and how
+long the menu waits.

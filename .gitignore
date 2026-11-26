@@ -1,0 +1,13 @@
+/target/
+/out/
+/artifacts/
+*.qcow2
+*.raw
+*.img
+__pycache__/
+
+# Local development evidence is retained separately from published sources.
+/docs/archive/
+
+# Local VM and CI diagnostics.
+/results/

@@ -1,0 +1,50 @@
+I: running apt-get install...
+Setting up linux-image-7.3.4+deb14-amd64 (7.3.4-1) ...
+I: /vmlinuz is now a symlink to boot/vmlinuz-7.3.4+deb14-amd64
+/etc/kernel/postinst.d/dkms:
+Sign command: /nonexistent/zboot-factory-unsigned
+Autoinstall of module zfs/2.4.4 for kernel 7.3.4+deb14-amd64 (x86_64)
+Error! Bad return status for module build on kernel: 7.3.4+deb14-amd64 (x86_64)
+Consult /var/lib/dkms/zfs/2.4.4/build/make.log for more information.
+Error! One or more modules failed to install during autoinstall.
+Refer to previous errors for more information.
+run-parts: /etc/kernel/postinst.d/dkms exited with return code 1
+dpkg: error processing package linux-image-7.3.4+deb14-amd64 (--configure):
+ installed linux-image-7.3.4+deb14-amd64 package post-installation script subprocess returned error exit status 1
+Setting up zfs-dkms (2.4.4-1) ...
+Loading new zfs/2.4.4 DKMS files...
+Building for 7.3.4+deb14-amd64
+Building initial module zfs/2.4.4 for 7.3.4+deb14-amd64
+configure: error:
+	*** None of the expected "bops->release()" interfaces were detected.
+	*** This may be because your kernel version is newer than what is
+	*** supported, or you are using a patched custom kernel with
+	*** incompatible modifications.
+Error! Bad return status for module build on kernel: 7.3.4+deb14-amd64 (x86_64)
+Consult /var/lib/dkms/zfs/2.4.4/build/make.log for more information.
+Error! One or more modules failed to install during autoinstall.
+dpkg: error processing package zfs-dkms (--configure):
+ installed zfs-dkms package post-installation script subprocess returned error exit status 10
+dpkg: dependency problems prevent configuration of linux-image-amd64:
+ linux-image-amd64 depends on linux-image-7.3.4+deb14-amd64 (= 7.3.4-1); however:
+  Package linux-image-7.3.4+deb14-amd64 is not configured yet.
+
+dpkg: error processing package linux-image-amd64 (--configure):
+ dependency problems - leaving unconfigured
+dpkg: dependency problems prevent configuration of zfs-initramfs:
+ zfs-initramfs depends on zfs-dkms (>= 2.4.4-1) | zfs-modules; however:
+  Package zfs-dkms is not configured yet.
+
+dpkg: error processing package zfs-initramfs (--configure):
+ dependency problems - leaving unconfigured
+Processing triggers for libc-bin (2.42-4) ...
+Errors were encountered while processing:
+ linux-image-7.3.4+deb14-amd64
+ zfs-dkms
+ linux-image-amd64
+ zfs-initramfs
+E: Sub-process /usr/bin/dpkg returned an error code (1)
+E: apt-get --yes -oApt::Get::Download-Only=false -oDPkg::Chroot-Directory=/var/tmp/mmdebstrap.a1b2c3 install linux-image-amd64 linux-headers-amd64 zfs-dkms zfs-initramfs systemd-sysv failed: process exited with 100 and error in console output
+I: removing tempdir /var/tmp/zboot-factory-0d9f/mmdebstrap.a1b2c3...
+E: setup failed: E: apt-get --yes -oApt::Get::Download-Only=false install failed
+I: main() received signal PIPE: waiting for setup...
